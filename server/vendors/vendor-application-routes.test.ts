@@ -1,0 +1,188 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import { registerVendorApplicationRoutes } from './vendor-application-routes.ts';
+import { hashPassword } from '../auth/auth.ts';
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vap-api-'));
+}
+
+function listen(app: express.Express): Promise<{ url: string; close: () => Promise<void> }> {
+  return new Promise((resolve) => {
+    const server = app.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+function fakeAuth(role: 'admin' | 'vendor' | null) {
+  const created: Array<{ id: string; email: string; role: string; name?: string; phone?: string }> = [];
+  return {
+    created,
+    userFromRequest: () => (role === 'admin' ? { id: 'usr-admin', name: 'إدارة', email: 'admin@usil.app', phone: '0503333333', role: 'admin' } : null),
+    requireRole: (roles: string[]) => (req: Request, res: Response, next: NextFunction) => {
+      if (!role) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+      if (!roles.includes(role)) return res.status(403).json({ success: false, error: 'ليست لديك صلاحية هذا الإجراء.' });
+      next();
+    },
+    addVendorUser: (input: { name: string; email: string; phone: string; passwordHash: string }) => {
+      const existing = created.find((row) => row.email === input.email);
+      if (existing) {
+        existing.role = 'vendor';
+        existing.name = input.name;
+        return existing;
+      }
+      const user = { id: 'usr-new', name: input.name, email: input.email, phone: input.phone, role: 'vendor' as const };
+      created.push(user);
+      return user;
+    },
+    ensureApplicantUser: (input: { name: string; email: string; phone: string; passwordHash: string }) => {
+      const user = { id: 'usr-applicant', name: input.name, email: input.email, phone: input.phone, role: 'client' as const };
+      created.push(user);
+      return user;
+    },
+    findUserByEmail: (email: string) => created.find((row) => row.email === email) || null,
+    startSession: () => 'sess-test',
+  };
+}
+
+const TINY_PNG =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+const payload = {
+  firstName: 'نواف',
+  fatherName: 'محمد',
+  familyName: 'المهيع',
+  projectName: 'إرث الضيافة',
+  nationalId: '1088123456',
+  email: 'apply@usil.app',
+  phone: '0504444000',
+  projectType: 'ضيافة قهوة وشاي',
+  bankName: 'مصرف الراجحي',
+  iban: 'SA0380000000608010167519',
+  accountHolderName: 'نواف محمد المهيع',
+  password: 'Secret1',
+  fulfillment: ['hour', 'same_day'],
+  instagram: '@usil.vendor',
+  confirmedOwn: true,
+  listing: {
+    title: 'قهوة نجدية',
+    category: 'hospitality',
+    price: 850,
+    fulfillment: ['hour', 'same_day'],
+    images: [TINY_PNG, TINY_PNG],
+  },
+};
+
+describe('vendor-application-routes', () => {
+  it('accepts a public vendor application', async () => {
+    const app = express();
+    app.use(express.json());
+    const auth = fakeAuth('admin');
+    registerVendorApplicationRoutes(app, auth as any, tmpDir());
+    const { url, close } = await listen(app);
+    const res = await fetch(`${url}/api/vendor-applications`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 201);
+    const json = await res.json();
+    assert.equal(json.success, true);
+    assert.equal(json.application.status, 'pending');
+    assert.equal(json.application.passwordHash, undefined);
+    assert.equal(json.application.socials.links[0].network, 'instagram');
+    assert.equal(json.profile.projectName, 'إرث الضيافة');
+    assert.equal(json.profile.personName, 'نواف محمد المهيع');
+    assert.equal(json.user.email, 'apply@usil.app');
+    assert.equal(json.user.role, 'client');
+    assert.equal(json.listing.title, 'قهوة نجدية');
+    assert.equal(json.listing.price, 850);
+    assert.ok(String(json.listing.image).startsWith('/uploads/listing-'));
+    await close();
+  });
+
+  it('rejects a new application without product photos and a price', async () => {
+    const app = express();
+    app.use(express.json({ limit: '2mb' }));
+    registerVendorApplicationRoutes(app, fakeAuth('admin') as any, tmpDir());
+    const { url, close } = await listen(app);
+    const { listing: _listing, ...noListing } = payload;
+    const res = await fetch(`${url}/api/vendor-applications`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(noListing),
+    });
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.match(json.error, /صورتين/);
+    await close();
+  });
+
+  it('rejects a new application without any social account', async () => {
+    const app = express();
+    app.use(express.json());
+    registerVendorApplicationRoutes(app, fakeAuth('admin') as any, tmpDir());
+    const { url, close } = await listen(app);
+    const { instagram: _ig, confirmedOwn: _own, ...noSocial } = payload;
+    const res = await fetch(`${url}/api/vendor-applications`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(noSocial),
+    });
+    assert.equal(res.status, 400);
+    const json = await res.json();
+    assert.match(json.error, /حساب تواصل واحد/);
+    await close();
+  });
+
+  it('lets admin approve and create a vendor login', async () => {
+    const app = express();
+    app.use(express.json());
+    const auth = fakeAuth('admin');
+    registerVendorApplicationRoutes(app, auth as any, tmpDir());
+    const { url, close } = await listen(app);
+    const created = await fetch(`${url}/api/vendor-applications`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const id = (await created.json()).application.id;
+    const approved = await fetch(`${url}/api/admin/vendor-applications/${id}/approve`, { method: 'POST' });
+    assert.equal(approved.status, 200);
+    const body = await approved.json();
+    assert.equal(auth.created.some((row) => row.email === 'apply@usil.app' && row.role === 'vendor'), true);
+    assert.equal(body.profile.projectName, 'إرث الضيافة');
+    assert.equal(body.workspace.listings.length, 1);
+    assert.equal(body.workspace.listings[0].title, 'قهوة نجدية');
+    assert.equal(body.workspace.listings[0].price, 850);
+    assert.ok(String(body.workspace.listings[0].image).startsWith('/uploads/listing-'));
+    assert.equal(body.workspace.profile.projectName, 'إرث الضيافة');
+    await close();
+  });
+
+  it('rejects guests from the admin list', async () => {
+    const app = express();
+    app.use(express.json());
+    registerVendorApplicationRoutes(app, fakeAuth(null) as any, tmpDir());
+    const { url, close } = await listen(app);
+    const res = await fetch(`${url}/api/admin/vendor-applications`);
+    assert.equal(res.status, 401);
+    await close();
+  });
+
+  it('hashes passwords with the same scrypt format as login', () => {
+    const hashed = hashPassword('Secret1');
+    assert.match(hashed, /^[a-f0-9]+:[a-f0-9]+$/);
+  });
+});

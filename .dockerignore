@@ -1,0 +1,9 @@
+node_modules
+.git
+data
+dist
+.env
+.env.production.local
+**/*.test.ts
+**/*.md
+!README.md

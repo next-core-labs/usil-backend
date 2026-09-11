@@ -1,0 +1,34 @@
+{
+  "name": "usil-backend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server/index.ts",
+    "build": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit",
+    "test": "node --import tsx --test $(find server core -name '*.test.ts' | sort)",
+    "sync:web": "node scripts/sync-web-build.mjs",
+    "db:clear-catalog": "tsx scripts/db-clear-catalog.ts",
+    "wipe:vendors": "tsx scripts/wipe-vendors.ts",
+    "check:core-sync": "node scripts/check-core-sync.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2"
+  },
+  "optionalDependencies": {
+    "nodemailer": "^6.9.0",
+    "postgres": "^3.4.9"
+  }
+}

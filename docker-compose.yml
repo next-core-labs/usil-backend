@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    image: usil-backend:latest
+    container_name: usil-app
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - .env.production.local
+    environment:
+      PUBLIC_SITE_URL: https://usil.app
+      APP_URL: https://usil.app
+      # ويبهوك ميسر على hooks.usil.app (DNS only / grey cloud) لأن Bot Fight يصد api.moyasar على usil.app
+      MOYASAR_WEBHOOK_URL: https://hooks.usil.app/api/payments/webhook
+      # MOYASAR_SECRET_KEY يُقرأ من env_file (sk_live_ أو sk_test_ فقط)
+    volumes:
+      - /var/www/midyaf/data:/app/data
+    working_dir: /app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

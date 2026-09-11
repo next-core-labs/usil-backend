@@ -1,0 +1,48 @@
+{
+  "name": "يوصل · Usil",
+  "short_name": "يوصل",
+  "description": "متجر يوصل (Usil) لتوريد المناسبات في السعودية: اطلب الضيافة والقاعات والتصوير والديكور من مزودين موثّقين بسعر نهائي شامل الضريبة.",
+  "start_url": "/",
+  "scope": "/",
+  "id": "/?source=pwa",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui", "browser"],
+  "orientation": "portrait-primary",
+  "theme_color": "#0A1A33",
+  "background_color": "#0A1A33",
+  "lang": "ar",
+  "dir": "rtl",
+  "categories": ["lifestyle", "business", "events", "shopping"],
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

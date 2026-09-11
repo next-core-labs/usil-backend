@@ -1,0 +1,6 @@
+# ويبهوك ميسر — يُضاف بجانب كتلة usil.app الحالية، بدون استبدالها.
+# سجل DNS في Cloudflare يجب أن يكون DNS only (سحابة رمادية)، لا Proxied.
+# Bot Fight Mode على النطاق المبروкси usil.app يصد طلبات ميسر بـ 403 challenge.
+hooks.usil.app {
+	reverse_proxy 127.0.0.1:3000
+}
