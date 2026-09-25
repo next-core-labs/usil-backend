@@ -276,7 +276,7 @@ describe('email verification API', () => {
     await close();
   });
 
-  it('registers the founder email as the live admin without a verification gate', async () => {
+  it('never mints an admin from public sign-up with the founder email', async () => {
     const dir = tmpDir();
     const { app } = mount(dir);
     const { url, close } = await listen(app);
@@ -285,20 +285,17 @@ describe('email verification API', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: 'نواف المهيع',
-        email: 'nawafalmuhayya@gmail.com',
+        email: 'NawafAlmuhayya@gmail.com',
         phone: '0504111222',
         password: 'secret12',
       }),
     });
     const json = await res.json();
-    assert.equal(res.status, 201);
-    assert.equal(json.user.role, 'admin');
-    assert.equal(json.user.id, 'usr-nawaf-admin');
-    assert.equal(json.needsEmailVerification, false);
-    const users = JSON.parse(fs.readFileSync(path.join(dir, 'users.json'), 'utf-8'));
-    assert.equal(users.length, 1);
-    assert.equal(users[0].role, 'admin');
-    assert.equal(users[0].emailVerified, true);
+    assert.equal(res.status, 409);
+    assert.equal(json.success, false);
+    assert.equal(res.headers.get('set-cookie'), null);
+    const users = JSON.parse(fs.existsSync(path.join(dir, 'users.json')) ? fs.readFileSync(path.join(dir, 'users.json'), 'utf-8') : '[]');
+    assert.equal(users.some((user: { role?: string }) => user.role === 'admin'), false);
     await close();
   });
 });

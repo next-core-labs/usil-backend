@@ -9,7 +9,11 @@ import { registerVendorRoutes } from './vendor-routes.ts';
 import { roleAllowed } from '../auth/roles.ts';
 
 function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vendor-api-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vendor-api-'));
+  // Listing photos must exist under data/uploads.
+  fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
+  for (const name of ['listing-a.jpg', 'listing-b.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+  return dir;
 }
 
 function listen(app: express.Express): Promise<{ url: string; close: () => Promise<void> }> {
@@ -400,5 +404,222 @@ describe('vendor-routes', () => {
     const missing = await fetch(`${url}/api/vendors/usr-nobody`);
     assert.equal(missing.status, 404);
     await close();
+  });
+});
+
+describe('vendor-routes QA fixes', () => {
+  const IMAGES = ['/uploads/listing-a.jpg', '/uploads/listing-b.jpg'];
+  const listing = (extra: Record<string, unknown> = {}) => ({
+    title: 'قهوة',
+    category: 'hospitality',
+    price: 70,
+    fulfillment: ['hour'],
+    images: IMAGES,
+    ...extra,
+  });
+
+  async function serve(auth: unknown, dir: string) {
+    const app = express();
+    app.use(express.json({ limit: '2mb' }));
+    registerVendorRoutes(app, auth as any, dir);
+    const server = await listen(app);
+    const send = (method: string, route: string, body?: unknown) =>
+      fetch(`${server.url}${route}`, {
+        method,
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    return { ...server, send };
+  }
+
+  it('rejects forged social verification and javascript links on PUT /api/vendor/socials', async () => {
+    const { send, close } = await serve(fakeAuth('vendor'), tmpDir());
+    try {
+      const forged = await send('PUT', '/api/vendor/socials', {
+        confirmedOwn: true,
+        links: [{ network: 'instagram', url: 'https://instagram.com/usil', status: 'verified', verifiedBy: 'أنا', verifiedAt: 'x' }],
+      });
+      assert.equal(forged.status, 200);
+      const link = (await forged.json()).data.links[0];
+      assert.equal(link.status, 'linked');
+      assert.equal(link.verifiedBy, undefined);
+
+      const bad = await send('PUT', '/api/vendor/socials', { links: [{ network: 'x', url: 'javascript:alert(1)' }] });
+      assert.equal(bad.status, 400);
+      const badWs = await send('PUT', '/api/vendor/workspace', { socials: { youtube: 'javascript:alert(1)' } });
+      assert.equal(badWs.status, 400);
+    } finally {
+      await close();
+    }
+  });
+
+  it('forces workspace listings onto the vendor and refuses another vendor listing id', async () => {
+    const dir = tmpDir();
+    const other = await serve(fakeAuth('vendor', 'usr-other'), dir);
+    let theirId = '';
+    try {
+      const created = await other.send('POST', '/api/vendor/listings', listing({ title: 'منتج الآخر' }));
+      assert.equal(created.status, 201);
+      theirId = (await created.json()).listing.id;
+    } finally {
+      await other.close();
+    }
+
+    const { send, close } = await serve(fakeAuth('vendor'), dir);
+    try {
+      const stolen = await send('PUT', '/api/vendor/workspace', { listings: [listing({ id: theirId, vendorId: 'usr-other' })] });
+      assert.equal(stolen.status, 403);
+      const spoofed = await send('PUT', '/api/vendor/workspace', { listings: [listing({ vendorId: 'usr-other' })] });
+      assert.equal(spoofed.status, 200);
+      const saved = (await spoofed.json()).data.listings;
+      assert.equal(saved[0].vendorId, 'usr-vendor');
+      const oneImage = await send('PUT', '/api/vendor/workspace', { listings: [listing({ images: [IMAGES[0]] })] });
+      assert.equal(oneImage.status, 400);
+      const traversal = await send('POST', '/api/vendor/listings', listing({ images: [IMAGES[0], '/uploads/../vendor-workspaces.json'] }));
+      assert.equal(traversal.status, 400);
+      const remote = await send('PUT', '/api/vendor/workspace', { listings: [listing({ images: [IMAGES[0], 'https://cdn.example.com/a.jpg'] })] });
+      assert.equal(remote.status, 400);
+    } finally {
+      await close();
+    }
+  });
+
+  it('validates vendor bookings, blocked dates and revenue', async () => {
+    const { send, close } = await serve(fakeAuth('vendor'), tmpDir());
+    try {
+      const base = { customerName: 'سارة', customerPhone: '0501234567', date: '2099-05-01' };
+      const past = await send('POST', '/api/vendor/bookings', { ...base, date: '2020-01-01' });
+      assert.equal(past.status, 400);
+      const badStatus = await send('POST', '/api/vendor/bookings', { ...base, status: 'free-money' });
+      assert.equal(badStatus.status, 400);
+      const foreign = await send('POST', '/api/vendor/bookings', { ...base, serviceId: 'lst-someone-else' });
+      assert.equal(foreign.status, 400);
+
+      const created = await send('POST', '/api/vendor/bookings', { ...base, id: 'bk-mine', totalAmount: 1000 });
+      assert.equal(created.status, 201);
+      const booking = (await created.json()).booking;
+      assert.notEqual(booking.id, 'bk-mine');
+
+      const patched = await send('PATCH', `/api/vendor/bookings/${booking.id}`, { status: 'ملغي', totalAmount: 5, customerPhone: '0500000000' });
+      assert.equal(patched.status, 200);
+      const patchedJson = (await patched.json()).booking;
+      assert.equal(patchedJson.totalAmount, 1000);
+      assert.equal(patchedJson.customerPhone, '0501234567');
+      const badPatch = await send('PATCH', `/api/vendor/bookings/${booking.id}`, { status: 'nope' });
+      assert.equal(badPatch.status, 400);
+
+      await send('POST', '/api/vendor/bookings', { ...base, totalAmount: 400, status: 'مؤكد' });
+      const summary = await (await send('GET', '/api/vendor/summary')).json();
+      assert.equal(summary.data.revenue, 400);
+
+      const garbage = await send('POST', '/api/vendor/blocked-dates', { date: 'not-a-date' });
+      assert.equal(garbage.status, 400);
+      const first = await send('POST', '/api/vendor/blocked-dates', { date: '2099-06-01', type: 'holiday' });
+      assert.equal(first.status, 201);
+      const again = await send('POST', '/api/vendor/blocked-dates', { date: '2099-06-01', type: 'holiday' });
+      assert.equal(again.status, 200);
+      assert.equal((await again.json()).blockedDate.id, (await first.json()).blockedDate.id);
+      const onBlocked = await send('POST', '/api/vendor/bookings', { ...base, date: '2099-06-01' });
+      assert.equal(onBlocked.status, 400);
+    } finally {
+      await close();
+    }
+  });
+
+  it('shows the edited workspace profile and socials on the public vendor page', async () => {
+    const dir = tmpDir();
+    fs.writeFileSync(
+      path.join(dir, 'vendor-applications.json'),
+      JSON.stringify([
+        {
+          id: 'vap-ok',
+          firstName: 'نواف',
+          familyName: 'المهيع',
+          projectName: 'اسم الطلب',
+          email: 'usr-vendor@usil.sa',
+          status: 'approved',
+          socials: {
+            confirmedOwn: true,
+            links: [{ network: 'x', handle: 'app', url: 'https://x.com/app', status: 'linked', confirmedOwn: true, updatedAt: '' }],
+          },
+        },
+      ]),
+      'utf-8',
+    );
+    const { send, close } = await serve(fakeAuth('vendor'), dir);
+    try {
+      const before = await (await send('GET', '/api/vendors/usr-vendor/socials')).json();
+      assert.equal(before.data[0].url, 'https://x.com/app');
+
+      const saved = await send('PUT', '/api/vendor/workspace', { profile: { projectName: 'الاسم الجديد', projectType: 'قهوة' } });
+      assert.equal(saved.status, 200);
+      await send('PUT', '/api/vendor/socials', { instagram: '@new.brand', confirmedOwn: true });
+
+      const page = await send('GET', '/api/vendors/usr-vendor');
+      assert.equal(page.status, 200);
+      const pageJson = (await page.json()).data;
+      assert.equal(pageJson.projectName, 'الاسم الجديد');
+      assert.equal(pageJson.projectType, 'قهوة');
+      assert.deepEqual(pageJson.socials.map((link: { network: string }) => link.network), ['instagram']);
+      const socials = await (await send('GET', '/api/vendors/usr-vendor/socials')).json();
+      assert.equal(socials.data[0].url, 'https://www.instagram.com/new.brand');
+    } finally {
+      await close();
+    }
+  });
+
+  it('hides socials of an account that is not an approved vendor', async () => {
+    const dir = tmpDir();
+    const vendor = await serve(fakeAuth('vendor', 'usr-rej'), dir);
+    try {
+      await vendor.send('PUT', '/api/vendor/socials', { instagram: '@rejected.brand', confirmedOwn: true });
+      const listed = await (await vendor.send('GET', '/api/vendors/usr-rej/socials')).json();
+      assert.equal(listed.data.length, 1);
+    } finally {
+      await vendor.close();
+    }
+    // Same stored socials, but the account is no longer in the vendor list.
+    const guest = await serve(fakeAuth(null, 'usr-rej', { vendors: [] }), dir);
+    try {
+      const page = await guest.send('GET', '/api/vendors/usr-rej');
+      assert.equal(page.status, 404);
+      const socials = await (await guest.send('GET', '/api/vendors/usr-rej/socials')).json();
+      assert.deepEqual(socials.data, []);
+    } finally {
+      await guest.close();
+    }
+  });
+
+  it('keeps the admin listing PATCH working, including a listing with broken photos', async () => {
+    const dir = tmpDir();
+    const vendor = await serve(fakeAuth('vendor'), dir);
+    let id = '';
+    try {
+      id = (await (await vendor.send('POST', '/api/vendor/listings', listing())).json()).listing.id;
+    } finally {
+      await vendor.close();
+    }
+    fs.rmSync(path.join(dir, 'uploads', 'listing-a.jpg'));
+    fs.writeFileSync(path.join(dir, 'uploads', 'listing-c.jpg'), 'x');
+
+    const admin = await serve(fakeAuth('admin', 'usr-admin'), dir);
+    try {
+      const lanes = await admin.send('PATCH', `/api/admin/listings/${id}`, { fulfillment: ['tomorrow'] });
+      assert.equal(lanes.status, 200);
+      assert.deepEqual((await lanes.json()).listing.fulfillment, ['tomorrow']);
+      const stillBroken = await admin.send('PATCH', `/api/admin/listings/${id}`, { images: ['/uploads/listing-a.jpg', IMAGES[1]] });
+      assert.equal(stillBroken.status, 400);
+      const fixed = await admin.send('PATCH', `/api/admin/listings/${id}`, {
+        images: ['/uploads/listing-c.jpg', IMAGES[1]],
+        price: 90,
+      });
+      assert.equal(fixed.status, 200);
+      const fixedJson = (await fixed.json()).listing;
+      assert.deepEqual(fixedJson.images, ['/uploads/listing-c.jpg', IMAGES[1]]);
+      assert.equal(fixedJson.price, 90);
+      assert.equal(fixedJson.vendorId, 'usr-vendor');
+    } finally {
+      await admin.close();
+    }
   });
 });

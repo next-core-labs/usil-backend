@@ -6,7 +6,7 @@ import fs from 'fs';
 
 import { createAuth } from './auth/auth.ts';
 import { registerAuthRoutes } from './auth/auth-routes.ts';
-import { brandedAvatarSvg, uploadsDir } from './auth/avatar.ts';
+import { brandedAvatarSvg, setUploadsHeaders, uploadsDir } from './auth/avatar.ts';
 import { registerGeminiRoutes } from './ai/gemini-routes.ts';
 import { registerIntegrationsRoutes } from './ai/integrations-routes.ts';
 import { registerBookingRoutes } from './bookings/booking-routes.ts';
@@ -22,7 +22,7 @@ import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
 import { registerVendorRoutes } from './vendors/vendor-routes.ts';
 import { SERVICES as CATALOG_SERVICES } from '../core/data/services.ts';
-import { isPublicMarketplaceListing } from '../core/utils/catalogMedia.ts';
+import { listApprovedCatalogServices, serviceSeoFrom } from './shared/approved-catalog.ts';
 import { isKnownSpaPath } from '../core/utils/siteRoutes.ts';
 
 /**
@@ -58,7 +58,7 @@ registerAuthRoutes(app, auth, DATA_DIR);
 
 const { ai: aiRouter } = registerIntegrationsRoutes(app, auth, DATA_DIR);
 registerMoyasarAdminRoutes(app, auth, DATA_DIR);
-registerGeminiRoutes(app, { ai: aiRouter, dataDir: DATA_DIR });
+registerGeminiRoutes(app, { ai: aiRouter, dataDir: DATA_DIR, listVendorUsers: () => auth.listVendorUsers() });
 
 registerSupportRoutes(app, auth, DATA_DIR);
 registerCityRequestRoutes(app, auth, DATA_DIR);
@@ -85,9 +85,11 @@ registerExternalBookingRoutes(app, auth, DATA_DIR, {
       name: user.name,
       source: 'account' as const,
     }));
+    const accountIds = new Set(accounts.map((row) => row.id));
     const approved = courierStore
       .list()
-      .filter((row) => row.status === 'approved')
+      // An application already linked to a listed courier account is the same person.
+      .filter((row) => row.status === 'approved' && !(row.applicantUserId && accountIds.has(row.applicantUserId)))
       .map((row) => ({
         id: row.id,
         name: `${row.firstName} ${row.familyName}`.trim(),
@@ -97,7 +99,7 @@ registerExternalBookingRoutes(app, auth, DATA_DIR, {
   },
 });
 
-registerLegacyRoutes(app);
+registerLegacyRoutes(app, { aiAvailable: () => Boolean(aiRouter.activeProvider()) });
 
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
@@ -115,11 +117,12 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // itself is built in the web project and copied here by `npm run sync:web`.
 const { sendSpa } = registerSeoRoutes(app, auth, DATA_DIR, {
   indexHtmlPath: path.join(rootDir, 'dist', 'index.html'),
+  // Same approved-vendor-only source as GET /api/catalog/listings.
   getServiceEntries: () => {
-    const live = vendorStore
-      .listAllListings()
-      .filter(isPublicMarketplaceListing)
-      .map((item) => ({ id: item.id, title: item.title }));
+    const live = listApprovedCatalogServices(vendorStore, () => auth.listVendorUsers()).map((item) => ({
+      id: item.id,
+      title: item.title,
+    }));
     if (live.length > 0) return live;
     return Array.isArray(CATALOG_SERVICES)
       ? CATALOG_SERVICES.map((item: { id?: string | number; title?: string; name?: string }) => ({
@@ -128,6 +131,10 @@ const { sendSpa } = registerSeoRoutes(app, auth, DATA_DIR, {
         }))
       : [];
   },
+  getServiceSeo: (id) =>
+    serviceSeoFrom(
+      listApprovedCatalogServices(vendorStore, () => auth.listVendorUsers()).find((item) => String(item.id) === id),
+    ),
 });
 
 // ─── Frontend Static Files ───
@@ -137,7 +144,10 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use('/uploads', express.static(path.join(DATA_DIR, 'uploads'), { fallthrough: false }));
+app.use(
+  '/uploads',
+  express.static(path.join(DATA_DIR, 'uploads'), { fallthrough: false, setHeaders: setUploadsHeaders }),
+);
 app.use(express.static(path.join(rootDir, 'dist'), { etag: false, lastModified: false, index: false }));
 app.use(express.static(path.join(rootDir, 'public')));
 

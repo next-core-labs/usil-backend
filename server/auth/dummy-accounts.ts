@@ -61,15 +61,25 @@ export function isProtectedAccount(input: { email?: string; name?: string }): bo
   return false;
 }
 
+/**
+ * True only for addresses we know are ours to delete: the explicit seed list and
+ * the reserved test domains. This feeds the purge that runs on every restart, so
+ * it must never guess from the local part — `photo.studio@gmail.com` or
+ * `test.family@outlook.com` are real people.
+ */
 export function isDummyEmail(email: string): boolean {
   const normalized = normalizeAccountEmail(email);
   if (!normalized) return false;
   if (DUMMY_EMAILS.has(normalized)) return true;
   if (/@(example\.com|mithyaf\.sa|usil-qa\.invalid)$/i.test(normalized)) return true;
-  const local = normalized.split('@')[0] || '';
-  if (/^(demo|test|launch|photo|qa|verify)([+._-]|$)/i.test(local)) return true;
-  if (!normalized.includes('@') || /[\[\]\\]/.test(normalized)) return true;
   return false;
+}
+
+/** Not an address at all (no `@`, or bracket/backslash junk from form fuzzing). */
+function isGarbageEmail(email: string): boolean {
+  const normalized = normalizeAccountEmail(email);
+  if (!normalized) return false;
+  return !normalized.includes('@') || /[\[\]\\]/.test(normalized);
 }
 
 export function isDummyUser(user: { id?: string; email?: string; name?: string }): boolean {
@@ -105,7 +115,7 @@ export function isDummyVendorApplication(row: {
   const email = normalizeAccountEmail(row.email || '');
   const name = `${row.firstName || ''} ${row.familyName || ''} ${row.projectName || ''}`.trim();
   if (isProtectedAccount({ email, name })) return false;
-  if (isDummyEmail(email)) return true;
+  if (isDummyEmail(email) || isGarbageEmail(email)) return true;
   const firstName = String(row.firstName || '').trim();
   if (firstName.length <= 2 && /[A-Z]/.test(firstName) && !/[\u0600-\u06FF]/.test(firstName)) return true;
   return false;

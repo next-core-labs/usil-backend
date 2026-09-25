@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from 'express';
-import { dataUrlProblem, saveUpload, UPLOAD_MAX_BYTES } from './avatar.ts';
+import { dataUrlProblem, saveUpload, uploadPrefixForPurpose, UPLOAD_MAX_BYTES } from './avatar.ts';
 
 /**
  * HTTP surface for identity. The handlers themselves live in `auth.ts` — this
@@ -14,6 +14,7 @@ type AuthApi = {
   loginHandler: RouteHandler;
   registerHandler: RouteHandler;
   forgotPasswordHandler: RouteHandler;
+  resetPasswordHandler: RouteHandler;
   verifyEmailHandler: RouteHandler;
   verifyEmailTokenHandler: RouteHandler;
   resendVerificationHandler: RouteHandler;
@@ -34,16 +35,12 @@ type AuthApi = {
 const UPLOAD_TOO_LARGE = 'حجم الصورة كبير — الحد الأقصى 5 ميغابايت.';
 const UPLOAD_BAD_FORMAT = 'الصيغة غير مدعومة — ارفع صورة jpg أو png أو webp.';
 
-/** Filename prefixes are caller-supplied, so strip them to a safe slug. */
-const MAX_PREFIX_LEN = 24;
-function safePrefix(raw: unknown): string {
-  return String(raw || 'file').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, MAX_PREFIX_LEN) || 'file';
-}
 
 export function registerAuthRoutes(app: Express, auth: AuthApi, dataDir: string) {
   app.post('/api/auth/login', (req, res) => auth.loginHandler(req, res));
   app.post('/api/auth/register', (req, res) => auth.registerHandler(req, res));
   app.post('/api/auth/forgot-password', (req, res) => auth.forgotPasswordHandler(req, res));
+  app.post('/api/auth/reset-password', (req, res) => auth.resetPasswordHandler(req, res));
   app.post('/api/auth/verify-email', (req, res) => auth.verifyEmailHandler(req, res));
   app.get('/api/auth/verify-email', (req, res) => auth.verifyEmailTokenHandler(req, res));
   app.post('/api/auth/resend-verification', (req, res) => auth.resendVerificationHandler(req, res));
@@ -61,7 +58,9 @@ export function registerAuthRoutes(app: Express, auth: AuthApi, dataDir: string)
     auth.requireRole(['client', 'vendor', 'admin']),
     (req: Request, res: Response) => {
       const dataUrl = String(req.body?.dataUrl || '');
-      const saved = saveUpload(dataDir, safePrefix(req.body?.prefix), dataUrl, UPLOAD_MAX_BYTES);
+      // `purpose` (or the older `prefix` field) only selects from a fixed allowlist.
+      const prefix = uploadPrefixForPurpose(req.body?.purpose ?? req.body?.prefix);
+      const saved = saveUpload(dataDir, prefix, dataUrl, UPLOAD_MAX_BYTES);
       if (!saved) {
         const problem = dataUrlProblem(dataUrl, UPLOAD_MAX_BYTES);
         return res.status(400).json({

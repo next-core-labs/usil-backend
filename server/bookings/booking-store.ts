@@ -1,5 +1,10 @@
 import path from 'path';
 import { readJsonArray, writeJsonFile } from '../shared/json-file.ts';
+import {
+  BOOKING_NEW_STATUS,
+  BOOKING_PENDING_APPROVAL_STATUS,
+  BOOKING_REJECTED_STATUS,
+} from '../vendors/vendor-listings.ts';
 
 /**
  * حجوزات المنصة — الطلبات القادمة من متجر يوصل نفسه.
@@ -8,8 +13,31 @@ import { readJsonArray, writeJsonFile } from '../shared/json-file.ts';
  * files by hand. These rows are created by guest or signed-in checkout and are
  * the records Moyasar webhooks settle against.
  */
+export type PlatformBookingItem = {
+  id: string;
+  title: string;
+  quantity: number;
+  /** Unit price in riyals, copied from the listing at checkout — never from the client. */
+  price: number;
+  vendorId: string;
+};
+
+export type BookingCancellation = {
+  cancelledAt: string;
+  cancelledBy: 'client';
+  /** Percent of the paid amount owed back, from `refund-policy.ts`. */
+  refundPercent: 100 | 50 | 0;
+  /** Owed back in halalas. Moyasar's confirmed refund stays the amount of record. */
+  refundHalalas: number;
+  /** `pending` = owed, not yet sent through Moyasar. Nothing here moves money. */
+  refundStatus: 'pending' | 'none' | 'not_applicable';
+  note: string;
+};
+
 export type PlatformBooking = {
   id: string;
+  /** Session account that placed the order; absent for guest checkout. */
+  userId?: string;
   name: string;
   phone: string;
   email: string;
@@ -21,6 +49,8 @@ export type PlatformBooking = {
   paymentMethod: string;
   settlement: string;
   items: unknown[];
+  /** Vendors whose listings are on this order — the vendor ownership key. */
+  vendorIds?: string[];
   totalAmount: number;
   bookingMode: 'instant' | 'approval';
   status: string;
@@ -29,6 +59,7 @@ export type PlatformBooking = {
   moyasarInvoiceId?: string;
   moyasarPaymentId?: string;
   paymentUrl?: string;
+  cancellation?: BookingCancellation;
 };
 
 /** Identifiers a Moyasar callback or webhook can arrive with. */
@@ -37,9 +68,140 @@ export type MoyasarSettlement = {
   invoiceId?: string;
   bookingId?: string;
   status: string;
+  /**
+   * Amount Moyasar itself reports (halalas), read from the verified provider
+   * record. A booking is only marked paid when this covers its total.
+   */
+  amountHalalas?: number;
+  currency?: string;
 };
 
+export const BOOKING_CONFIRMED_STATUS = 'مؤكد';
+export const BOOKING_IN_PROGRESS_STATUS = 'قيد التنفيذ';
+export const BOOKING_COMPLETED_STATUS = 'مكتمل';
+export const BOOKING_CANCELLED_STATUS = 'ملغي';
+
+/**
+ * The only statuses a platform order can hold — the same list the admin
+ * dashboard offers (`STATUS_OPTIONS` in AdminDashboard.tsx).
+ */
+export const PLATFORM_BOOKING_STATUSES = [
+  BOOKING_NEW_STATUS,
+  BOOKING_PENDING_APPROVAL_STATUS,
+  BOOKING_CONFIRMED_STATUS,
+  BOOKING_REJECTED_STATUS,
+  BOOKING_IN_PROGRESS_STATUS,
+  BOOKING_COMPLETED_STATUS,
+  BOOKING_CANCELLED_STATUS,
+] as const;
+
+export type PlatformBookingStatus = (typeof PLATFORM_BOOKING_STATUSES)[number];
+
+export function isPlatformBookingStatus(value: unknown): value is PlatformBookingStatus {
+  return typeof value === 'string' && (PLATFORM_BOOKING_STATUSES as readonly string[]).includes(value);
+}
+
+/** Statuses after which nothing is left to cancel. */
+export const CLOSED_BOOKING_STATUSES: readonly string[] = [
+  BOOKING_CANCELLED_STATUS,
+  BOOKING_REJECTED_STATUS,
+  BOOKING_COMPLETED_STATUS,
+];
+
 const PAID_SETTLEMENT_LABEL = 'ميسر — دفع إلكتروني';
+
+/** Riyals → halalas without a float drift. */
+export function bookingTotalHalalas(booking: Pick<PlatformBooking, 'totalAmount'>): number {
+  const n = Number(booking.totalAmount);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.round(n * 100);
+}
+
+/** Listing ids on a booking: the headline service plus every cart line. */
+export function bookedListingIds(booking: Pick<PlatformBooking, 'serviceId' | 'items'>): string[] {
+  const ids = [
+    String(booking.serviceId ?? ''),
+    ...(Array.isArray(booking.items) ? booking.items.map((row) => String((row as { id?: unknown })?.id ?? '')) : []),
+  ].filter(Boolean);
+  return Array.from(new Set(ids));
+}
+
+/** `createdAt` is stored as UTC `YYYY-MM-DD HH:mm`. */
+export function bookingCreatedAtMs(createdAt: string): number {
+  const ms = Date.parse(`${String(createdAt || '').replace(' ', 'T')}:00Z`);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+export type ClientIdentity = { id?: string; email?: string; emailVerified?: boolean };
+
+/**
+ * A client owns an order placed from their session, or one checked out with
+ * their email once that email is verified. Phone numbers never grant access —
+ * anyone can type someone else's number at checkout or on their profile.
+ */
+export function clientOwnsBooking(identity: ClientIdentity, row: PlatformBooking): boolean {
+  if (identity.id && row.userId && row.userId === identity.id) return true;
+  const email = String(identity.email || '').trim().toLowerCase();
+  if (identity.emailVerified === true && email && String(row.email || '').trim().toLowerCase() === email) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Vendor ownership: the vendor's id is stamped on the row, or (for rows from
+ * before stamping) one of the booked listings is theirs.
+ */
+export function vendorHasBooking(vendorId: string, ownListingIds: ReadonlySet<string>, row: PlatformBooking): boolean {
+  if (!vendorId) return false;
+  if (Array.isArray(row.vendorIds) && row.vendorIds.includes(vendorId)) return true;
+  return bookedListingIds(row).some((id) => ownListingIds.has(id));
+}
+
+/** Every line on the order is this vendor's — the bar for changing its status. */
+export function vendorOwnsWholeBooking(
+  vendorId: string,
+  ownListingIds: ReadonlySet<string>,
+  row: PlatformBooking,
+): boolean {
+  if (!vendorId) return false;
+  if (Array.isArray(row.vendorIds) && row.vendorIds.length) {
+    return row.vendorIds.every((id) => id === vendorId);
+  }
+  const ids = bookedListingIds(row);
+  return ids.length > 0 && ids.every((id) => ownListingIds.has(id));
+}
+
+/**
+ * What one vendor may see of an order. A mixed-vendor order is trimmed to this
+ * vendor's own lines and subtotal, so it never exposes another vendor's items,
+ * prices or payment references.
+ */
+export function vendorViewOfBooking(
+  vendorId: string,
+  ownListingIds: ReadonlySet<string>,
+  row: PlatformBooking,
+): PlatformBooking {
+  if (vendorOwnsWholeBooking(vendorId, ownListingIds, row)) return row;
+  const items = (Array.isArray(row.items) ? row.items : []).filter((line) => {
+    const item = line as Partial<PlatformBookingItem> | null;
+    return item?.vendorId === vendorId || ownListingIds.has(String(item?.id ?? ''));
+  });
+  const subtotal = items.reduce<number>((sum, line) => {
+    const item = line as Partial<PlatformBookingItem>;
+    const amount = Number(item.price) * Number(item.quantity || 1);
+    return Number.isFinite(amount) ? sum + amount : sum;
+  }, 0);
+  const { moyasarInvoiceId: _invoice, moyasarPaymentId: _payment, ...rest } = row;
+  const headlineIsOwn = ownListingIds.has(String(row.serviceId ?? ''));
+  return {
+    ...rest,
+    items,
+    vendorIds: [vendorId],
+    totalAmount: subtotal,
+    ...(headlineIsOwn ? {} : { serviceId: undefined, serviceName: '' }),
+  };
+}
 
 export function createBookingStore(dataDir: string) {
   const file = path.join(dataDir, 'bookings.json');
@@ -52,17 +214,20 @@ export function createBookingStore(dataDir: string) {
     writeJsonFile(file, rows);
   }
 
-  /**
-   * A client sees only their own orders, matched on either identifier because
-   * a guest checkout may supply a phone without an email. Blank identifiers
-   * never match, so an empty stored email cannot become a wildcard.
-   */
-  function listForClient(identity: { email?: string; phone?: string }): PlatformBooking[] {
-    return list().filter(
-      (row) =>
-        (Boolean(identity.email) && row.email === identity.email) ||
-        (Boolean(identity.phone) && row.phone === identity.phone),
-    );
+  function findById(id: string): PlatformBooking | null {
+    const key = String(id || '').trim();
+    if (!key) return null;
+    return list().find((row) => row.id === key) || null;
+  }
+
+  /** See `clientOwnsBooking`: session id, or verified email. Never phone. */
+  function listForClient(identity: ClientIdentity): PlatformBooking[] {
+    return list().filter((row) => clientOwnsBooking(identity, row));
+  }
+
+  function listForVendor(vendorId: string, ownListingIds: Iterable<string>): PlatformBooking[] {
+    const own = new Set(ownListingIds);
+    return list().filter((row) => vendorHasBooking(vendorId, own, row));
   }
 
   function count(): number {
@@ -77,7 +242,41 @@ export function createBookingStore(dataDir: string) {
     return booking;
   }
 
+  /**
+   * An unpaid, uncancelled order for the same buyer, listings and date placed
+   * within `windowMs` — a double-tapped checkout, not a second order.
+   */
+  function findRecentDuplicate(input: {
+    userId?: string;
+    email?: string;
+    phone?: string;
+    listingIds: string[];
+    eventDate: string;
+    windowMs: number;
+    now?: number;
+  }): PlatformBooking | null {
+    const now = input.now ?? Date.now();
+    const wanted = [...input.listingIds].sort().join('|');
+    const email = String(input.email || '').trim().toLowerCase();
+    return (
+      list().find((row) => {
+        if (row.paymentStatus !== 'unpaid') return false;
+        if (CLOSED_BOOKING_STATUSES.includes(row.status)) return false;
+        if (row.eventDate !== input.eventDate) return false;
+        if (bookedListingIds(row).sort().join('|') !== wanted) return false;
+        const age = now - bookingCreatedAtMs(row.createdAt);
+        if (age < 0 || age > input.windowMs) return false;
+        const sameUser = Boolean(input.userId) && row.userId === input.userId;
+        const sameEmail = Boolean(email) && String(row.email || '').trim().toLowerCase() === email;
+        const samePhone = Boolean(input.phone) && row.phone === input.phone;
+        return sameUser || sameEmail || samePhone;
+      }) || null
+    );
+  }
+
+  /** Callers validate `status` with `isPlatformBookingStatus`; a bad one is refused here too. */
   function updateStatus(id: string, status: string): PlatformBooking | null {
+    if (!isPlatformBookingStatus(status)) return null;
     const rows = list();
     const item = rows.find((row) => row.id === id);
     if (!item) return null;
@@ -86,14 +285,46 @@ export function createBookingStore(dataDir: string) {
     return item;
   }
 
-  function remove(id: string): void {
-    save(list().filter((row) => row.id !== id));
+  /** Records a customer cancellation; the route decides whether policy allows it. */
+  function cancel(id: string, cancellation: BookingCancellation): PlatformBooking | null {
+    const rows = list();
+    const item = rows.find((row) => row.id === id);
+    if (!item) return null;
+    item.status = BOOKING_CANCELLED_STATUS;
+    item.cancellation = cancellation;
+    save(rows);
+    return item;
+  }
+
+  /** `false` when no row had that id. */
+  function remove(id: string): boolean {
+    const rows = list();
+    const next = rows.filter((row) => row.id !== id);
+    if (next.length === rows.length) return false;
+    save(next);
+    return true;
+  }
+
+  /** Links a freshly raised invoice to a booking without touching its payment state. */
+  function attachInvoice(id: string, invoice: { id: string; url: string }): PlatformBooking | null {
+    const rows = list();
+    const item = rows.find((row) => row.id === id);
+    if (!item) return null;
+    item.moyasarInvoiceId = invoice.id;
+    item.paymentUrl = invoice.url;
+    save(rows);
+    return item;
   }
 
   /**
    * Settle a booking from a Moyasar payment, invoice, or booking id — a
-   * webhook, an invoice creation, and a browser callback each carry a
-   * different subset, so all three are accepted.
+   * webhook and a browser callback each carry a different subset, so all
+   * three are accepted for lookup.
+   *
+   * Only ever called with fields read back from Moyasar's API. Even so, the
+   * booking id comes from invoice metadata that a caller could once choose,
+   * so a row is marked paid only when Moyasar's own amount covers the stored
+   * total in SAR.
    *
    * Returns `null` when no row matches, which is normal: invoices are also
    * raised for things that are not platform bookings.
@@ -104,25 +335,57 @@ export function createBookingStore(dataDir: string) {
     const invoiceId = String(input.invoiceId || '').trim();
 
     const rows = list();
-    const item = rows.find((row) => {
-      if (bookingId && row.id === bookingId) return true;
-      if (paymentId && (row.moyasarInvoiceId === paymentId || row.moyasarPaymentId === paymentId)) return true;
-      if (invoiceId && row.moyasarInvoiceId === invoiceId) return true;
-      return false;
-    });
+    const item =
+      (invoiceId && rows.find((row) => row.moyasarInvoiceId === invoiceId)) ||
+      (paymentId && rows.find((row) => row.moyasarInvoiceId === paymentId || row.moyasarPaymentId === paymentId)) ||
+      (bookingId && rows.find((row) => row.id === bookingId)) ||
+      null;
     if (!item) return null;
 
+    const amount = Number(input.amountHalalas);
+    const currency = String(input.currency || 'SAR').toUpperCase();
+    const covers =
+      Number.isFinite(amount) && amount > 0 && currency === 'SAR' && amount >= bookingTotalHalalas(item);
+    if (input.status !== 'paid' || !covers) {
+      if (input.status === 'paid') {
+        console.warn('[moyasar] paid amount does not cover booking', item.id, amount, bookingTotalHalalas(item));
+      }
+      return item;
+    }
+
     if (paymentId) item.moyasarPaymentId = paymentId;
-    if (invoiceId) item.moyasarInvoiceId = invoiceId;
-    if (input.status === 'paid') {
-      item.paymentStatus = 'paid';
-      item.settlement = PAID_SETTLEMENT_LABEL;
+    if (invoiceId && !item.moyasarInvoiceId) item.moyasarInvoiceId = invoiceId;
+    item.paymentStatus = 'paid';
+    item.settlement = PAID_SETTLEMENT_LABEL;
+    // Paid after the customer had already cancelled an unpaid order: the whole
+    // payment is owed back, whatever tier the date falls in.
+    if (item.status === BOOKING_CANCELLED_STATUS && item.cancellation?.refundStatus === 'not_applicable') {
+      item.cancellation = {
+        ...item.cancellation,
+        refundPercent: 100,
+        refundHalalas: Math.round(amount),
+        refundStatus: 'pending',
+        note: 'وصل الدفع بعد إلغاء الطلب — يُسترجع كامل المبلغ.',
+      };
     }
     save(rows);
     return item;
   }
 
-  return { list, listForClient, count, add, updateStatus, remove, markPaidFromMoyasar };
+  return {
+    list,
+    findById,
+    listForClient,
+    listForVendor,
+    count,
+    add,
+    findRecentDuplicate,
+    updateStatus,
+    cancel,
+    remove,
+    attachInvoice,
+    markPaidFromMoyasar,
+  };
 }
 
 export type BookingStore = ReturnType<typeof createBookingStore>;

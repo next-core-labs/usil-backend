@@ -139,6 +139,27 @@ describe('external-booking-routes', () => {
     await close();
   });
 
+  it('rejects an unknown status with 400 and leaves the booking unchanged', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    const created = await post(url, 'admin', { ...payload, courierId: 'crr-1', status: 'مؤكد' });
+    const id = (await created.json()).booking.id;
+    const before = fs.readFileSync(path.join(dir, 'external-bookings.json'), 'utf-8');
+    for (const status of ['done', 'ملغى تماماً', '', null, 42]) {
+      const res = await fetch(`${url}/api/external-bookings/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'x-test-actor': 'admin' },
+        body: JSON.stringify({ status, notes: 'تعديل' }),
+      });
+      assert.equal(res.status, 400, `status ${JSON.stringify(status)}`);
+      assert.match((await res.json()).error, /حالة الحجز غير صحيحة/);
+    }
+    assert.equal(fs.readFileSync(path.join(dir, 'external-bookings.json'), 'utf-8'), before);
+    const badCreate = await post(url, 'admin', { ...payload, courierId: 'crr-1', status: 'pending' });
+    assert.equal(badCreate.status, 400);
+    await close();
+  });
+
   it('rejects an invalid Saudi mobile', async () => {
     const { url, close } = await listen(buildApp(tmpDir()));
     const res = await post(url, 'courier', { ...payload, phone: '0121234567' });

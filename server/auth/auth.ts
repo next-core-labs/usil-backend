@@ -2,11 +2,11 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
-import { resolveUserAvatar, saveUpload } from './avatar';
+import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from './avatar';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
 import { FOUNDER_ADMIN_EMAIL, purgeLiveDummyData, wipeAllVendorsAndDummyMedia } from './dummy-accounts';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
-import { notifyPasswordChanged, sendVerificationEmail } from '../shared/optional-mail';
+import { notifyPasswordChanged, sendPasswordResetEmail, sendVerificationEmail } from '../shared/optional-mail';
 import { emptyVendorSocials, type VendorSocials } from '../vendors/vendor-socials';
 import { isAccountRole, isVendorSupervisor, roleAllowed, type AccountRole } from './roles';
 export type { AccountRole } from './roles';
@@ -55,6 +55,10 @@ type StoredUser = Omit<PublicUser, 'emailVerified'> & {
   emailVerifyCodeHash?: string;
   emailVerifyExpiresAt?: number;
   emailVerifyTokenHash?: string;
+  /** Password-reset code: only its scrypt hash is stored, never the code. */
+  passwordResetCodeHash?: string;
+  passwordResetExpiresAt?: number;
+  passwordResetAttempts?: number;
 };
 
 const COOKIE = 'midyaf_sid';
@@ -99,10 +103,28 @@ function writeJson(file: string, value: unknown) {
   writeJsonFile(file, value);
 }
 
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production';
+}
+
 function cookieSecure(): boolean {
   if (process.env.COOKIE_SECURE === '0') return false;
   if (process.env.COOKIE_SECURE === '1') return true;
-  return process.env.NODE_ENV === 'production';
+  return isProduction();
+}
+
+/** `usr-<timestamp>` alone collided when two accounts were created in the same millisecond. */
+export function newUserId(): string {
+  return `usr-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function isFounderEmail(email: string | undefined): boolean {
+  return normalizeEmail(email || '') === FOUNDER_ADMIN_EMAIL;
+}
+
+/** Roles that manage other accounts. Only `admin` may grant, revoke or edit them. */
+function isPrivilegedRole(role: string | undefined): boolean {
+  return role === 'admin' || role === 'accounts_manager';
 }
 
 function cookieDomain(): string | undefined {
@@ -162,13 +184,43 @@ const FORGOT_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_LIMIT = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_RATE_LIMIT = 'حدّ محاولات الدخول. انتظر 15 دقيقة ثم أعد المحاولة.';
-const GENERIC_RESET_MISMATCH = 'حساب غير موجود أو الجوال لا يطابق البريد.';
+/** One answer for unknown email, wrong phone and wrong password — no account probing. */
+const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والجوال والرقم السري.';
 const WEAK_PASSWORD = 'الرقم السري ضعيف. استخدم 8 خانات على الأقل.';
 const RESET_RATE_LIMIT = 'حدّ المحاولات. انتظر 15 دقيقة ثم أعد المحاولة.';
 const RESET_SUCCESS = 'تم تغيير الرقم السري. ادخل الآن.';
+const RESET_CODE_TTL_MS = 15 * 60 * 1000;
+const RESET_MAX_ATTEMPTS = 5;
+const RESET_EMAIL_REQUIRED = 'أدخل بريداً إلكترونياً صحيحاً.';
+/** Same wording whether or not the account exists. */
+const RESET_REQUEST_SENT = 'إن كان البريد مسجّلاً لدينا فسيصلك رمز استعادة من 6 أرقام، صالح لمدة 15 دقيقة.';
+const RESET_REQUEST_FALLBACK = 'البريد غير مفعّل على الخادم المحلي، فالرمز يظهر هنا مرة واحدة للتجربة.';
+const RESET_FIELDS_REQUIRED = 'البريد الإلكتروني ورمز الاستعادة والرقم السري الجديد مطلوبة.';
+const RESET_CODE_INVALID = 'رمز الاستعادة غير صحيح أو انتهت صلاحيته. اطلب رمزاً جديداً.';
+const RESERVED_EMAIL = 'هذا البريد محجوز لإدارة يوصل.';
+const ADMIN_CONTACT_INVALID = 'اكتب بريداً إلكترونياً صحيحاً ورقم جوال صحيحاً (9 أرقام على الأقل).';
+
+/** Shape check for contacts an admin types in; register already requires the same. */
+function isPlausibleContact(email: string, phone: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && phone.replace(/\D/g, '').length >= 9;
+}
+
+const FOUNDER_LOCKED = 'لا يمكن تعديل البريد أو الجوال أو الصلاحية أو الرقم السري لحساب الإدارة الرئيسي.';
+const PRIVILEGED_ONLY = 'إدارة حسابات المدراء متاحة لمدير كل الحسابات فقط.';
+const SELF_ROLE_LOCKED = 'لا يمكنك تغيير صلاحية حسابك.';
+export const APPLICANT_LOGIN_REQUIRED = 'البريد أو رقم الجوال مسجّل لحساب موجود. سجّل الدخول بذلك الحساب أولاً ثم أرسل الطلب.';
+
+/** Thrown when a vendor application names someone else's account. */
+export class ApplicantAccountConflictError extends Error {
+  readonly status = 409;
+  constructor() {
+    super(APPLICANT_LOGIN_REQUIRED);
+  }
+}
 
 export function createAuth(dataDir: string) {
   const forgotLimiter = createSlidingWindowLimiter(FORGOT_LIMIT, FORGOT_WINDOW_MS);
+  const resetLimiter = createSlidingWindowLimiter(FORGOT_LIMIT * 2, FORGOT_WINDOW_MS);
   const loginLimiter = createSlidingWindowLimiter(LOGIN_LIMIT, LOGIN_WINDOW_MS);
   const resendLimiter = createSlidingWindowLimiter(EMAIL_RESEND_LIMIT, EMAIL_RESEND_WINDOW_MS);
   const verifyAttemptLimiter = createSlidingWindowLimiter(EMAIL_VERIFY_ATTEMPT_LIMIT, EMAIL_VERIFY_ATTEMPT_WINDOW_MS);
@@ -202,6 +254,12 @@ export function createAuth(dataDir: string) {
     delete user.emailVerifyCodeHash;
     delete user.emailVerifyExpiresAt;
     delete user.emailVerifyTokenHash;
+  }
+
+  function clearPasswordReset(user: StoredUser) {
+    delete user.passwordResetCodeHash;
+    delete user.passwordResetExpiresAt;
+    delete user.passwordResetAttempts;
   }
 
   function verificationPayload(emailSent: boolean, code: string) {
@@ -261,6 +319,12 @@ export function createAuth(dataDir: string) {
         delete user.emailVerifyCodeHash;
         delete user.emailVerifyTokenHash;
         delete user.emailVerifyExpiresAt;
+        usersChanged = true;
+      }
+    }
+    for (const user of users) {
+      if (user.passwordResetCodeHash && isEmailVerificationExpired(user.passwordResetExpiresAt)) {
+        clearPasswordReset(user);
         usersChanged = true;
       }
     }
@@ -334,10 +398,13 @@ export function createAuth(dataDir: string) {
 
       const user = loadUsers().find((item) => item.email === email);
       if (!user) {
-        const pending = readJson<{ status?: string; email?: string }[]>(
+        const application = readJson<{ status?: string; email?: string; passwordHash?: string }[]>(
           path.join(dataDir, 'vendor-applications.json'),
           [],
         ).find((row) => row.email === email);
+        // The application status is only revealed to someone who knows its password.
+        const pending =
+          application?.passwordHash && verifyPassword(password, application.passwordHash) ? application : null;
         if (pending?.status === 'pending') {
           return res.status(403).json({
             success: false,
@@ -350,13 +417,11 @@ export function createAuth(dataDir: string) {
             error: 'طلب انضمامك كمورّد رُفض. تواصل مع إدارة يوصل.',
           });
         }
-        return res.status(401).json({ success: false, error: 'لا يوجد حساب بهذا البريد الإلكتروني.' });
+        return res.status(401).json({ success: false, error: LOGIN_INVALID });
       }
-      if (phone && normalizePhone(user.phone) !== phone) {
-        return res.status(401).json({ success: false, error: 'رقم الجوال لا يطابق هذا البريد.' });
-      }
-      if (!verifyPassword(password, user.passwordHash)) {
-        return res.status(401).json({ success: false, error: 'الرقم السري غير صحيح.' });
+      const passwordOk = verifyPassword(password, user.passwordHash);
+      if (!passwordOk || (phone && normalizePhone(user.phone) !== phone)) {
+        return res.status(401).json({ success: false, error: LOGIN_INVALID });
       }
 
       startSession(res, user.id, parseRemember(req.body?.remember));
@@ -387,6 +452,12 @@ export function createAuth(dataDir: string) {
         return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
       }
 
+      // Public sign-up never creates an admin. The founder address is reserved:
+      // registering it used to mint the platform's top admin for whoever got there first.
+      if (isFounderEmail(email)) {
+        return res.status(409).json({ success: false, error: RESERVED_EMAIL });
+      }
+
       const users = loadUsers();
       if (users.some((item) => item.email === email)) {
         return res.status(409).json({ success: false, error: 'هذا البريد مسجّل مسبقاً.' });
@@ -395,19 +466,18 @@ export function createAuth(dataDir: string) {
         return res.status(409).json({ success: false, error: 'رقم الجوال مسجّل مسبقاً.' });
       }
 
-      const isFounder = email === FOUNDER_ADMIN_EMAIL;
       const user: StoredUser = {
-        id: isFounder ? 'usr-nawaf-admin' : `usr-${Date.now()}`,
+        id: newUserId(),
         name,
         email,
         phone,
-        role: isFounder ? 'admin' : 'client',
+        role: 'client',
         passwordHash: hashPassword(password),
         avatarUrl: '',
-        emailVerified: isFounder,
+        emailVerified: false,
       };
       attachAvatarFromBody(user, req.body);
-      const issued = isFounder ? null : issueEmailVerification(user);
+      const issued = issueEmailVerification(user);
       users.push(user);
       saveUsers(users);
 
@@ -416,14 +486,6 @@ export function createAuth(dataDir: string) {
       sessions[token] = user.id;
       saveSessions(sessions);
       setSessionCookie(res, token);
-      if (!issued) {
-        return res.status(201).json({
-          success: true,
-          user: publicUser(user),
-          needsEmailVerification: false,
-          message: 'تم إنشاء حساب الإدارة.',
-        });
-      }
       const emailSent = await sendVerificationEmail(user.email, issued.code, issued.token);
       res.status(201).json({
         success: true,
@@ -468,13 +530,23 @@ export function createAuth(dataDir: string) {
     return actor;
   }
 
+  /**
+   * `accounts_manager` runs client/vendor/courier accounts only. Anything that
+   * touches an admin/accounts_manager account — or grants one of those roles —
+   * is reserved for `admin`.
+   */
+  function actorMayTouchRole(actor: PublicUser, role: string | undefined): boolean {
+    return !isPrivilegedRole(role) || actor.role === 'admin';
+  }
+
   function listUsersHandler(req: Request, res: Response) {
     if (!requireAdmin(req, res)) return;
     res.json({ success: true, data: loadUsers().map(publicUser) });
   }
 
   function createUserHandler(req: Request, res: Response) {
-    if (!requireAdmin(req, res)) return;
+    const actor = requireAdmin(req, res);
+    if (!actor) return;
     const email = normalizeEmail(req.body?.email);
     const phone = normalizePhone(req.body?.phone);
     const password = String(req.body?.password || '');
@@ -483,8 +555,17 @@ export function createAuth(dataDir: string) {
     if (!email || !phone || !password || !name) {
       return res.status(400).json({ success: false, error: 'الاسم والبريد والجوال والرقم السري مطلوبة.' });
     }
+    if (!isPlausibleContact(email, phone)) {
+      return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
+    }
     if (!isAccountRole(role)) {
       return res.status(400).json({ success: false, error: 'نوع الحساب غير صالح.' });
+    }
+    if (!actorMayTouchRole(actor, role)) {
+      return res.status(403).json({ success: false, error: PRIVILEGED_ONLY });
+    }
+    if (isFounderEmail(email)) {
+      return res.status(409).json({ success: false, error: RESERVED_EMAIL });
     }
     if (password.length < 6) {
       return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
@@ -499,7 +580,7 @@ export function createAuth(dataDir: string) {
     }
 
     const user: StoredUser = {
-      id: `usr-${Date.now()}`,
+      id: newUserId(),
       name,
       email,
       phone,
@@ -526,38 +607,67 @@ export function createAuth(dataDir: string) {
     if (req.body?.role && !isAccountRole(nextRole)) {
       return res.status(400).json({ success: false, error: 'نوع الحساب غير صالح.' });
     }
+    if (!actorMayTouchRole(actor, user.role) || !actorMayTouchRole(actor, nextRole)) {
+      return res.status(403).json({ success: false, error: PRIVILEGED_ONLY });
+    }
+    const isSelf = user.id === actor.id;
+    if (isSelf && nextRole !== user.role) {
+      return res.status(403).json({ success: false, error: SELF_ROLE_LOCKED });
+    }
+
+    const nextEmail = req.body?.email ? normalizeEmail(req.body.email) : user.email;
+    const emailChanges = nextEmail !== user.email;
+    const founder = isFounderEmail(user.email);
+    // The founder's email is frozen for everyone: changing it first and then
+    // demoting the account was the way around the role lock.
+    if (founder && emailChanges) {
+      return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
+    }
+    // Phone is a login factor, so changing it would lock the founder out too.
+    if (founder && !isSelf && (nextRole !== user.role || req.body?.password || req.body?.phone)) {
+      return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
+    }
+    if (!founder && emailChanges && isFounderEmail(nextEmail)) {
+      return res.status(409).json({ success: false, error: RESERVED_EMAIL });
+    }
 
     const adminCount = users.filter((item) => item.role === 'admin').length;
     if (user.role === 'admin' && nextRole !== 'admin' && adminCount <= 1) {
       return res.status(400).json({ success: false, error: 'لا يمكن إزالة آخر مدير لكل الحسابات.' });
     }
-    if (normalizeEmail(user.email) === FOUNDER_ADMIN_EMAIL && nextRole !== 'admin') {
-      return res.status(400).json({ success: false, error: 'لا يمكن تغيير صلاحية حساب الإدارة الرئيسي.' });
+
+    // Check only what changes, so legacy rows stay editable.
+    const badEmail = emailChanges && !isPlausibleContact(nextEmail, '000000000');
+    const badPhone = Boolean(req.body?.phone) && !isPlausibleContact('a@b.co', normalizePhone(req.body.phone));
+    if (badEmail || badPhone) {
+      return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
     }
 
-    if (req.body?.name) user.name = String(req.body.name).trim() || user.name;
+    let nextPhone = user.phone;
     if (req.body?.phone) {
-      const phone = normalizePhone(req.body.phone);
-      if (users.some((item) => item.id !== user.id && normalizePhone(item.phone) === phone)) {
+      nextPhone = normalizePhone(req.body.phone);
+      if (users.some((item) => item.id !== user.id && normalizePhone(item.phone) === nextPhone)) {
         return res.status(409).json({ success: false, error: 'رقم الجوال مسجّل مسبقاً.' });
       }
-      user.phone = phone;
     }
-    if (req.body?.email) {
-      const email = normalizeEmail(req.body.email);
-      if (users.some((item) => item.id !== user.id && item.email === email)) {
-        return res.status(409).json({ success: false, error: 'هذا البريد مسجّل مسبقاً.' });
-      }
-      user.email = email;
+    if (emailChanges && users.some((item) => item.id !== user.id && item.email === nextEmail)) {
+      return res.status(409).json({ success: false, error: 'هذا البريد مسجّل مسبقاً.' });
     }
-    user.role = nextRole;
+    let nextPasswordHash = user.passwordHash;
     if (req.body?.password) {
       const password = String(req.body.password);
       if (password.length < 6) {
         return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
       }
-      user.passwordHash = hashPassword(password);
+      nextPasswordHash = hashPassword(password);
     }
+
+    // Every check has passed — only now touch the stored row.
+    if (req.body?.name) user.name = String(req.body.name).trim() || user.name;
+    user.phone = nextPhone;
+    user.email = nextEmail;
+    user.role = nextRole;
+    user.passwordHash = nextPasswordHash;
     if (req.body?.avatarDataUrl || req.body?.avatarUrl) {
       attachAvatarFromBody(user, req.body);
     }
@@ -567,6 +677,7 @@ export function createAuth(dataDir: string) {
       user.emailVerified = false;
     }
     saveUsers(users);
+    if (req.body?.password && !isSelf) invalidateUserSessions(user.id);
     res.json({ success: true, user: publicUser(user) });
   }
 
@@ -579,36 +690,52 @@ export function createAuth(dataDir: string) {
     return token;
   }
 
-  function ensureApplicantUser(input: {
-    name: string;
-    email: string;
-    phone: string;
-    passwordHash: string;
-    avatarUrl?: string;
-  }): PublicUser {
+  /**
+   * Whose account does a vendor application name? `new` when neither the email
+   * nor the phone is registered, `self` when both point at the signed-in
+   * requester, `conflict` otherwise — an application must never take over an
+   * account the requester has not logged into.
+   */
+  function checkApplicantAccount(
+    input: { email: string; phone: string },
+    actorId: string | null | undefined,
+  ): 'new' | 'self' | 'conflict' {
     const users = loadUsers();
     const email = normalizeEmail(input.email);
     const phone = normalizePhone(input.phone);
-    const existing = users.find((item) => item.email === email);
-    if (existing) {
-      if (existing.email === FOUNDER_ADMIN_EMAIL || existing.role === 'admin') {
-        return publicUser(existing);
-      }
-      existing.name = input.name || existing.name;
-      existing.phone = phone || existing.phone;
-      existing.passwordHash = input.passwordHash || existing.passwordHash;
-      if (input.avatarUrl) existing.avatarUrl = input.avatarUrl;
-      else existing.avatarUrl = resolveUserAvatar(dataDir, existing);
-      if (existing.role !== 'vendor') existing.role = 'client';
-      existing.emailVerified = true;
-      saveUsers(users);
-      return publicUser(existing);
+    const matches = users.filter(
+      (item) => (email && item.email === email) || (phone && normalizePhone(item.phone) === phone),
+    );
+    if (matches.length === 0) return 'new';
+    if (actorId && matches.every((item) => item.id === actorId)) return 'self';
+    return 'conflict';
+  }
+
+  function ensureApplicantUser(
+    input: {
+      name: string;
+      email: string;
+      phone: string;
+      passwordHash: string;
+      avatarUrl?: string;
+    },
+    actorId?: string | null,
+  ): PublicUser {
+    const ownership = checkApplicantAccount(input, actorId);
+    if (ownership === 'conflict') throw new ApplicantAccountConflictError();
+    const users = loadUsers();
+    if (ownership === 'self') {
+      // The requester's own account: an application never rewrites its
+      // password, name, phone, role or verification state.
+      const own = users.find((item) => item.id === actorId);
+      if (own) return publicUser(own);
+      throw new ApplicantAccountConflictError();
     }
     const user: StoredUser = {
-      id: `usr-${Date.now()}`,
+      id: newUserId(),
       name: input.name,
-      email,
-      phone,
+      email: normalizeEmail(input.email),
+      phone: normalizePhone(input.phone),
       role: 'client',
       passwordHash: input.passwordHash,
       avatarUrl: input.avatarUrl || '',
@@ -634,10 +761,9 @@ export function createAuth(dataDir: string) {
     const phone = normalizePhone(input.phone);
     const existing = users.find((item) => item.email === email);
     if (existing) {
-      existing.role = 'vendor';
-      existing.name = input.name || existing.name;
-      existing.phone = phone || existing.phone;
-      existing.passwordHash = input.passwordHash || existing.passwordHash;
+      // Approval grants the vendor role; it never rewrites the account's
+      // password, name or phone from the application, and never demotes staff.
+      if (!isPrivilegedRole(existing.role)) existing.role = 'vendor';
       if (input.avatarUrl) existing.avatarUrl = input.avatarUrl;
       if (input.avatarDataUrl) attachAvatarFromBody(existing, input);
       else existing.avatarUrl = resolveUserAvatar(dataDir, existing);
@@ -646,7 +772,7 @@ export function createAuth(dataDir: string) {
       return publicUser(existing);
     }
     const user: StoredUser = {
-      id: `usr-${Date.now()}`,
+      id: newUserId(),
       name: input.name,
       email,
       phone,
@@ -694,8 +820,11 @@ export function createAuth(dataDir: string) {
     const users = loadUsers();
     const user = users.find((item) => item.id === id);
     if (!user) return res.status(404).json({ success: false, error: 'الحساب غير موجود.' });
-    if (normalizeEmail(user.email) === FOUNDER_ADMIN_EMAIL) {
+    if (isFounderEmail(user.email)) {
       return res.status(400).json({ success: false, error: 'لا يمكن حذف حساب الإدارة الرئيسي.' });
+    }
+    if (!actorMayTouchRole(actor, user.role)) {
+      return res.status(403).json({ success: false, error: PRIVILEGED_ONLY });
     }
     if (user.role === 'admin' && users.filter((item) => item.role === 'admin').length <= 1) {
       return res.status(400).json({ success: false, error: 'لا يمكن حذف آخر مدير لكل الحسابات.' });
@@ -723,39 +852,92 @@ export function createAuth(dataDir: string) {
     if (changed) saveSessions(sessions);
   }
 
-  function forgotPasswordHandler(req: Request, res: Response) {
+  /**
+   * Step 1 of the reset: mail a 6-digit code. The answer is identical whether
+   * or not the email is registered, so this cannot be used to probe accounts.
+   */
+  async function forgotPasswordHandler(req: Request, res: Response) {
     try {
       const ip = clientIp(req);
-      if (!forgotLimiter.allow(ip)) {
+      const email = normalizeEmail(req.body?.email);
+      if (!forgotLimiter.allow(ip) || (email && !forgotLimiter.allow(`email:${email}`))) {
         return res.status(429).json({ success: false, error: RESET_RATE_LIMIT });
       }
-
-      const email = normalizeEmail(req.body?.email);
-      const phone = normalizePhone(req.body?.phone);
-      const newPassword = String(req.body?.newPassword || '');
-
-      if (!email || !phone || !newPassword) {
-        return res.status(400).json({
-          success: false,
-          error: 'البريد الإلكتروني ورقم الجوال والرقم السري الجديد مطلوبة.',
-        });
+      if (!email || !email.includes('@')) {
+        return res.status(400).json({ success: false, error: RESET_EMAIL_REQUIRED });
       }
-      if (!email.includes('@')) {
-        return res.status(400).json({ success: false, error: GENERIC_RESET_MISMATCH });
+
+      const users = loadUsers();
+      const user = users.find((item) => item.email === email);
+      const code = generateSixDigitCode();
+      // Hash even for unknown emails so both paths cost the same.
+      const codeHash = hashPassword(`reset:${code}`);
+      let resetCode: string | undefined;
+      if (user) {
+        user.passwordResetCodeHash = codeHash;
+        user.passwordResetExpiresAt = Date.now() + RESET_CODE_TTL_MS;
+        user.passwordResetAttempts = 0;
+        saveUsers(users);
+        if (isProduction()) {
+          // Do not let SMTP latency tell registered and unknown emails apart.
+          void sendPasswordResetEmail(user.email, code).catch(() => undefined);
+        } else if (!(await sendPasswordResetEmail(user.email, code))) {
+          // Local runs without SMTP, mirroring register's `verificationCode`.
+          resetCode = code;
+        }
+      }
+      res.json({
+        success: true,
+        message: resetCode ? RESET_REQUEST_FALLBACK : RESET_REQUEST_SENT,
+        ...(resetCode ? { resetCode } : {}),
+      });
+    } catch {
+      res.status(500).json({ success: false, error: 'تعذر استعادة الحساب. حاول مرة أخرى.' });
+    }
+  }
+
+  /** Step 2: the mailed code plus a new password. Five wrong codes burn the code. */
+  function resetPasswordHandler(req: Request, res: Response) {
+    try {
+      const ip = clientIp(req);
+      if (!resetLimiter.allow(ip)) {
+        return res.status(429).json({ success: false, error: RESET_RATE_LIMIT });
+      }
+      const email = normalizeEmail(req.body?.email);
+      const code = String(req.body?.code || '').replace(/\D/g, '');
+      const newPassword = String(req.body?.newPassword || '');
+      if (!email || !code || !newPassword) {
+        return res.status(400).json({ success: false, error: RESET_FIELDS_REQUIRED });
       }
       if (newPassword.length < 8) {
         return res.status(400).json({ success: false, error: WEAK_PASSWORD });
       }
 
       const users = loadUsers();
-      const user = users.find(
-        (item) => item.email === email && normalizePhone(item.phone) === phone,
-      );
-      if (!user) {
-        return res.status(400).json({ success: false, error: GENERIC_RESET_MISMATCH });
+      const user = users.find((item) => item.email === email);
+      if (!user?.passwordResetCodeHash) {
+        return res.status(400).json({ success: false, error: RESET_CODE_INVALID });
+      }
+      if (
+        isEmailVerificationExpired(user.passwordResetExpiresAt) ||
+        (user.passwordResetAttempts || 0) >= RESET_MAX_ATTEMPTS
+      ) {
+        clearPasswordReset(user);
+        saveUsers(users);
+        return res.status(400).json({ success: false, error: RESET_CODE_INVALID });
+      }
+      // scrypt + timingSafeEqual: constant-time compare of the stored hash.
+      if (!isSixDigitCode(code) || !verifyPassword(`reset:${code}`, user.passwordResetCodeHash)) {
+        user.passwordResetAttempts = (user.passwordResetAttempts || 0) + 1;
+        if (user.passwordResetAttempts >= RESET_MAX_ATTEMPTS) clearPasswordReset(user);
+        saveUsers(users);
+        return res.status(400).json({ success: false, error: RESET_CODE_INVALID });
       }
 
       user.passwordHash = hashPassword(newPassword);
+      clearPasswordReset(user);
+      // The code arrived by email, so the mailbox is proven.
+      if (isProduction() && !isStoredEmailVerified(user)) clearEmailVerificationSecrets(user);
       saveUsers(users);
       invalidateUserSessions(user.id);
       notifyPasswordChanged(user.email);
@@ -769,6 +951,17 @@ export function createAuth(dataDir: string) {
   function avatarHandler(req: Request, res: Response) {
     const actor = userFromRequest(req);
     if (!actor) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    const dataUrl = String(req.body?.avatarDataUrl || req.body?.avatarUrl || '');
+    const problem = dataUrlProblem(dataUrl, AVATAR_MAX_BYTES);
+    if (problem) {
+      return res.status(400).json({
+        success: false,
+        error:
+          problem === 'size'
+            ? 'حجم الصورة كبير — الحد الأقصى 2 ميغابايت.'
+            : 'الصيغة غير مدعومة — ارفع صورة jpg أو png أو webp.',
+      });
+    }
     const users = loadUsers();
     const user = users.find((item) => item.id === actor.id);
     if (!user) return res.status(404).json({ success: false, error: 'الحساب غير موجود.' });
@@ -861,11 +1054,22 @@ export function createAuth(dataDir: string) {
     }
   }
 
+  /**
+   * The emailed link. A browser lands back on the SPA with `?emailVerified=1`
+   * (or `0` plus a reason); API callers asking for JSON still get JSON.
+   */
   function verifyEmailTokenHandler(req: Request, res: Response) {
+    const wantsHtml = req.method === 'GET' && req.accepts(['json', 'html']) === 'html';
+    const done = (status: number, body: Record<string, unknown>, reason?: 'invalid' | 'expired' | 'error') => {
+      if (wantsHtml) {
+        return res.redirect(302, reason ? `/?emailVerified=0&reason=${reason}` : '/?emailVerified=1');
+      }
+      return res.status(status).json(body);
+    };
     try {
       const token = String(req.query?.token || req.body?.token || '').trim();
       if (!token || token.length < 16) {
-        return res.status(400).json({ success: false, error: EMAIL_VERIFY_INVALID });
+        return done(400, { success: false, error: EMAIL_VERIFY_INVALID }, 'invalid');
       }
       const users = loadUsers();
       const user = users.find(
@@ -873,15 +1077,15 @@ export function createAuth(dataDir: string) {
           item.emailVerifyTokenHash && verifyValueMatches(token, item.emailVerifyTokenHash, item.email),
       );
       if (!user) {
-        return res.status(400).json({ success: false, error: EMAIL_VERIFY_INVALID });
+        return done(400, { success: false, error: EMAIL_VERIFY_INVALID }, 'invalid');
       }
       if (isEmailVerificationExpired(user.emailVerifyExpiresAt) && user.emailVerified === false) {
-        return res.status(400).json({ success: false, error: EMAIL_VERIFY_EXPIRED });
+        return done(400, { success: false, error: EMAIL_VERIFY_EXPIRED }, 'expired');
       }
       const published = markVerified(user, users);
-      res.json({ success: true, user: published, message: EMAIL_VERIFY_SUCCESS });
+      return done(200, { success: true, user: published, message: EMAIL_VERIFY_SUCCESS });
     } catch {
-      res.status(500).json({ success: false, error: 'تعذر تأكيد البريد. حاول مرة أخرى.' });
+      return done(500, { success: false, error: 'تعذر تأكيد البريد. حاول مرة أخرى.' }, 'error');
     }
   }
 
@@ -897,6 +1101,7 @@ export function createAuth(dataDir: string) {
     updateUserHandler,
     deleteUserHandler,
     addVendorUser,
+    checkApplicantAccount,
     ensureApplicantUser,
     startSession,
     saveUserSocials,
@@ -905,19 +1110,25 @@ export function createAuth(dataDir: string) {
     listUsersByRole,
     avatarHandler,
     forgotPasswordHandler,
+    resetPasswordHandler,
     verifyEmailHandler,
     resendVerificationHandler,
     verifyEmailTokenHandler,
   };
 }
 
-function parseCookies(req: Request): Record<string, string> {
+export function parseCookies(req: { headers: { cookie?: string } }): Record<string, string> {
   const header = req.headers.cookie || '';
   const out: Record<string, string> = {};
   for (const part of header.split(';')) {
     const idx = part.indexOf('=');
     if (idx === -1) continue;
-    out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    const raw = part.slice(idx + 1).trim();
+    try {
+      out[part.slice(0, idx).trim()] = decodeURIComponent(raw);
+    } catch {
+      // A malformed value (e.g. a stray `%`) is skipped, not a 500.
+    }
   }
   return out;
 }

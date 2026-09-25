@@ -58,9 +58,47 @@ export function emptyVendorSocials(): VendorSocials {
   return { confirmedOwn: false, links: [] };
 }
 
+/** True only for an http(s) URL whose host belongs to that network — never `javascript:` or a look-alike. */
+export function isSafeSocialUrl(network: SocialNetwork, raw: unknown): boolean {
+  const url = asUrl(String(raw || '').trim());
+  if (!url) return false;
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+  if (url.username || url.password) return false;
+  return isAllowedHost(network, hostOf(url));
+}
+
+/**
+ * Repairs stored socials before they leave the server: drops unknown networks
+ * and unsafe URLs, and only keeps «verified» when an admin stamp is present.
+ */
+export function sanitizeSocials(socials?: VendorSocials | null): VendorSocials {
+  if (!socials || !Array.isArray(socials.links)) return emptyVendorSocials();
+  const seen = new Set<SocialNetwork>();
+  const links: VendorSocialLink[] = [];
+  for (const raw of socials.links) {
+    const link = raw as Partial<VendorSocialLink> | null;
+    if (!link || !SOCIAL_NETWORKS.includes(link.network as SocialNetwork)) continue;
+    const network = link.network as SocialNetwork;
+    if (seen.has(network) || !isSafeSocialUrl(network, link.url)) continue;
+    seen.add(network);
+    const confirmedOwn = Boolean(link.confirmedOwn);
+    const adminStamped = link.status === 'verified' && Boolean(link.verifiedAt) && Boolean(link.verifiedBy);
+    links.push({
+      network,
+      handle: String(link.handle || ''),
+      url: String(link.url).trim(),
+      status: adminStamped ? 'verified' : confirmedOwn ? 'linked' : 'pending',
+      confirmedOwn,
+      updatedAt: String(link.updatedAt || ''),
+      verifiedAt: adminStamped ? String(link.verifiedAt) : undefined,
+      verifiedBy: adminStamped ? String(link.verifiedBy) : undefined,
+    });
+  }
+  return { confirmedOwn: Boolean(socials.confirmedOwn), links };
+}
+
 export function publicSocials(socials?: VendorSocials | null): VendorSocialLink[] {
-  if (!socials?.links?.length) return [];
-  return socials.links.filter((link) => link.url && (link.status === 'linked' || link.status === 'verified' || link.status === 'pending'));
+  return sanitizeSocials(socials).links;
 }
 
 export function hasLinkedSocials(socials?: VendorSocials | null): boolean {
@@ -109,7 +147,7 @@ function parseProfile(network: SocialNetwork, raw: string): { handle: string; ur
     const fromPhone = normalizeSaudiWhatsApp(value);
     if (fromPhone) return fromPhone;
     const url = asUrl(value.startsWith('http') ? value : `https://${value}`);
-    if (!url || !isAllowedHost('whatsapp', hostOf(url))) {
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || !isAllowedHost('whatsapp', hostOf(url))) {
       throw new Error('واتساب الأعمال لازم يكون رقم 05xxxxxxxx أو رابط wa.me');
     }
     const parsed = normalizeSaudiWhatsApp(url.pathname);
@@ -120,7 +158,9 @@ function parseProfile(network: SocialNetwork, raw: string): { handle: string; ur
   const maybeUrl = !value.startsWith('@') && (value.startsWith('http') || value.includes('/'));
   if (maybeUrl) {
     const url = asUrl(value.startsWith('http') ? value : `https://${value.replace(/^\/+/, '')}`);
-    if (!url) throw new Error(`رابط ${SOCIAL_LABELS[network]} غير صالح`);
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
+      throw new Error(`رابط ${SOCIAL_LABELS[network]} غير صالح`);
+    }
     if (!isAllowedHost(network, hostOf(url))) {
       throw new Error(`رابط ${SOCIAL_LABELS[network]} لازم يكون من موقع ${HOSTS[network][0]}`);
     }

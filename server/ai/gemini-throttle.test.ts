@@ -8,7 +8,7 @@ import { registerGeminiRoutes } from './gemini-routes.ts';
  *
  * These routes are open to anonymous visitors on purpose, so the throttle is
  * the only guard on a paid provider key. Without a provider configured the
- * handlers return their canned fallbacks, which is exactly what we want here —
+ * handlers answer 503 (they never fabricate a result), which is fine here —
  * we are asserting the limiter, not the model.
  */
 
