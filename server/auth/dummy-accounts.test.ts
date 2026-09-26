@@ -39,16 +39,61 @@ describe('dummy-accounts', () => {
     assert.equal(isDummyUser({ id: 'usr-client', name: 'عميل مِضياف', email: 'client@usil.app' }), true);
     assert.equal(isDummyUser({ id: 'usr-vendor', name: 'مورد الضيافة', email: 'vendor@usil.app' }), true);
     assert.equal(isDummyUser({ id: 'usr-admin', name: 'إدارة الموقع', email: 'admin@usil.app' }), true);
-    assert.equal(isDummyEmail('launch.1788390040060@usil.app'), true);
-    assert.equal(isDummyEmail('photo.1788390055096@usil.app'), true);
     assert.equal(isDummyEmail('faisal@mithyaf.sa'), true);
+    assert.equal(isDummyEmail('someone@example.com'), true);
     assert.equal(isDummyUser({ name: 'نواف الإطلاق', email: 'launch.1@usil.app' }), true);
     assert.equal(isDummyEmail('qa.live.1788433107@usil-qa.invalid'), true);
-    assert.equal(isDummyEmail('verify.live.906@usil.sa'), true);
     assert.equal(isDummyEmail('usil.ksa@gmail.com'), true);
     assert.equal(isDummyUser({ name: 'يوصل - Usil', email: 'usil.ksa@gmail.com' }), true);
     assert.equal(isDummyUser({ name: 'نورة عبدالعزيز اليوسف', email: 'nalyousef7@gmail.com' }), false);
     assert.equal(isDummyUser({ name: 'نواف خالد ال', email: 'n.almuhayya@gmail.com' }), false);
+  });
+
+  it('never guesses from the local part of an email', () => {
+    for (const email of [
+      'photo.studio@gmail.com',
+      'test.family@outlook.com',
+      'demo-events@hotmail.com',
+      'qa_ahmed@yahoo.com',
+      'verify.me@icloud.com',
+      'launch.1788390040060@usil.app',
+    ]) {
+      assert.equal(isDummyEmail(email), false, email);
+      assert.equal(isDummyUser({ id: 'usr-real', name: 'عميل حقيقي', email }), false, email);
+    }
+  });
+
+  it('keeps real users, bookings and support messages on a restart purge', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usil-purge-real-'));
+    fs.writeFileSync(
+      path.join(dir, 'users.json'),
+      JSON.stringify([
+        { id: 'usr-photo', email: 'photo.studio@gmail.com', name: 'استوديو تصوير', role: 'client' },
+        { id: 'usr-test', email: 'test.family@outlook.com', name: 'عائلة', role: 'client' },
+        { id: 'usr-client', email: 'client@usil.app', name: 'عميل مِضياف', role: 'client' },
+        { id: 'usr-qa', email: 'qa.live.1@usil-qa.invalid', name: 'QA', role: 'client' },
+      ]),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'bookings.json'),
+      JSON.stringify([
+        { id: 'bk-1', email: 'photo.studio@gmail.com', name: 'استوديو تصوير' },
+        { id: 'bk-2', email: 'guest-without-email', name: 'ضيف' },
+        { id: 'bk-3', email: 'a@example.com', name: 'x' },
+      ]),
+    );
+    fs.writeFileSync(
+      path.join(dir, 'support-messages.json'),
+      JSON.stringify([{ id: 'sm-1', email: 'demo.events@gmail.com', name: 'فعاليات' }]),
+    );
+    const result = purgeLiveDummyData(dir);
+    assert.deepEqual(result.removedUsers.sort(), ['client@usil.app', 'qa.live.1@usil-qa.invalid']);
+    const users = JSON.parse(fs.readFileSync(path.join(dir, 'users.json'), 'utf-8'));
+    assert.deepEqual(users.map((row: { id: string }) => row.id), ['usr-photo', 'usr-test']);
+    const bookings = JSON.parse(fs.readFileSync(path.join(dir, 'bookings.json'), 'utf-8'));
+    assert.deepEqual(bookings.map((row: { id: string }) => row.id), ['bk-1', 'bk-2']);
+    const support = JSON.parse(fs.readFileSync(path.join(dir, 'support-messages.json'), 'utf-8'));
+    assert.equal(support.length, 1);
   });
 
   it('flags planted courier seeds without blocking later real namesakes', () => {

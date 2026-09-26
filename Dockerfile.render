@@ -1,0 +1,34 @@
+# Render image: builds the frontend and the backend into one container.
+# The VPS keeps using ./Dockerfile, which expects `npm run sync:web` to have run on the host.
+# Render can only connect one repo, so the frontend is cloned here. Render passes the
+# service's environment variables in as build args (GITHUB_TOKEN, FRONTEND_REF, ...).
+
+FROM node:22-alpine AS web
+RUN apk add --no-cache git
+ARG FRONTEND_REPO=github.com/next-core-labs/usil-frontend.git
+ARG FRONTEND_REF=main
+ARG GITHUB_TOKEN
+WORKDIR /web
+RUN test -n "$GITHUB_TOKEN" || (echo "GITHUB_TOKEN is not set: it needs read access to $FRONTEND_REPO" && exit 1)
+RUN git clone --depth 1 --branch "$FRONTEND_REF" "https://x-access-token:${GITHUB_TOKEN}@${FRONTEND_REPO}" . \
+  && git log -1 --format='frontend %h %s' \
+  && rm -rf .git
+RUN npm ci && npm run build
+
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+COPY --from=web /web/dist /web-dist
+RUN WEB_DIST=/web-dist npm run sync:web && npm run build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/public ./public
+# data/ is the Render persistent disk, mounted at /app/data. Render sets PORT.
+CMD ["node", "dist/server.cjs"]

@@ -1,12 +1,47 @@
+import fs from 'fs';
+import path from 'path';
 import type { Express, Request, Response } from 'express';
-import { createVendorApplicationStore, publicApplication } from './vendor-applications';
-import { hashPassword, type PublicUser } from '../auth/auth';
-import { saveUpload } from '../auth/avatar';
+import {
+  createVendorApplicationStore,
+  parseVendorFulfillment,
+  publicApplication,
+  validateVendorApplication,
+} from './vendor-applications';
+import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
+import { parseDataUrl, saveUpload, UPLOAD_MAX_BYTES, uploadsDir } from '../auth/avatar';
 import { createVendorStore } from './vendor-store';
 import { persistListingImages } from './listing-media';
 import { personNameFromParts, profileFromApplication, publicVendorFile } from './vendor-profile';
-import type { VendorSocials } from './vendor-socials';
+import { parseVendorSocials, type VendorSocials } from './vendor-socials';
 import { LISTING_MIN_IMAGES, validateVendorListing } from './vendor-listings';
+import { isStockMediaUrl } from '../../core/utils/catalogMedia';
+
+const LISTING_PHOTOS_REQUIRED = 'أضف صورتين حقيقيتين للمنتج من جهازك — ما نعرض صور وهمية';
+
+/** Photos that would survive `persistListingImages`, counted without writing anything. */
+function countUsableListingImages(images: unknown, legacyImage?: unknown): number {
+  const raw = [...(Array.isArray(images) ? images : []), legacyImage].map((item) => String(item || '').trim());
+  const existing = new Set<string>();
+  let fresh = 0;
+  for (const value of raw) {
+    if (!value || isStockMediaUrl(value)) continue;
+    if (value.startsWith('/uploads/')) existing.add(value);
+    // Each data URL becomes its own file, so identical ones still count separately.
+    else if (value.startsWith('data:image/') && parseDataUrl(value, UPLOAD_MAX_BYTES)) fresh += 1;
+  }
+  return existing.size + fresh;
+}
+
+function removeUploads(dataDir: string, urls: string[]) {
+  for (const url of urls) {
+    if (!url.startsWith('/uploads/')) continue;
+    try {
+      fs.unlinkSync(path.join(uploadsDir(dataDir), path.basename(url)));
+    } catch {
+      /* already gone */
+    }
+  }
+}
 
 type AuthApi = {
   userFromRequest: (req: Request) => PublicUser | null;
@@ -23,13 +58,20 @@ type AuthApi = {
     avatarUrl?: string;
     socials?: VendorSocials;
   }) => PublicUser;
-  ensureApplicantUser?: (input: {
-    name: string;
-    email: string;
-    phone: string;
-    passwordHash: string;
-    avatarUrl?: string;
-  }) => PublicUser;
+  checkApplicantAccount: (
+    input: { email: string; phone: string },
+    actorId: string | null | undefined,
+  ) => 'new' | 'self' | 'conflict';
+  ensureApplicantUser?: (
+    input: {
+      name: string;
+      email: string;
+      phone: string;
+      passwordHash: string;
+      avatarUrl?: string;
+    },
+    actorId?: string | null,
+  ) => PublicUser;
   startSession?: (res: Response, userId: string, remember?: boolean) => string;
   findUserByEmail?: (email: string) => { id: string; email: string; role?: string } | null;
 };
@@ -40,21 +82,13 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   const adminOnly = auth.requireRole(['admin']);
 
   app.post('/api/vendor-applications', (req: Request, res: Response) => {
+    // Uploads written during this request, removed again if it fails.
+    const written: string[] = [];
     try {
       const body = { ...(req.body || {}) };
-      if (body.logoDataUrl) {
-        const logoUrl = saveUpload(dataDir, 'vendor-logo', String(body.logoDataUrl));
-        if (logoUrl) body.logoUrl = logoUrl;
-      }
+      delete body.logoUrl;
       const listingBody = body.listing && typeof body.listing === 'object' ? body.listing : body;
-      const listingImages = persistListingImages(
-        dataDir,
-        listingBody.images || listingBody.listingImages || body.listingImageDataUrls,
-        listingBody.image,
-      );
-      if (listingImages.length < LISTING_MIN_IMAGES) {
-        throw new Error('أضف صورتين حقيقيتين للمنتج من جهازك — ما نعرض صور وهمية');
-      }
+      const rawImages = listingBody.images || listingBody.listingImages || body.listingImageDataUrls;
       const listingDraft = {
         title: listingBody.title || listingBody.listingTitle,
         category: listingBody.category || listingBody.listingCategory,
@@ -62,23 +96,70 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
         price: listingBody.price ?? listingBody.listingPrice,
         priceUnit: listingBody.priceUnit || listingBody.listingPriceUnit,
         cities: listingBody.cities || listingBody.listingCities,
-        images: listingImages,
+        images: [] as string[],
         fulfillment: listingBody.fulfillment || body.fulfillment,
         bookingMode: listingBody.bookingMode || listingBody.listingBookingMode,
         vendorName: String(body.projectName || ''),
       };
+
+      // ─── Validate everything before a single byte is written ───
+      if (countUsableListingImages(rawImages, listingBody.image) < LISTING_MIN_IMAGES) {
+        throw new Error(LISTING_PHOTOS_REQUIRED);
+      }
+      validateVendorListing(listingDraft);
+      validateVendorApplication(body);
+      parseVendorFulfillment(body.fulfillment);
+      parseVendorSocials(body, { requireAtLeastOne: true });
+      const existingApplication = store.findByEmail(String(body.email || ''));
+      if (existingApplication?.status === 'pending') {
+        throw new Error('هذا البريد عليه طلب مورّد بانتظار موافقة إدارة يوصل');
+      }
+      if (existingApplication?.status === 'approved') {
+        throw new Error('هذا البريد مسجّل كمورّد معتمد. استخدم تسجيل الدخول');
+      }
+
+      // An application may only name the requester's own account (or a new one).
+      const actor = auth.userFromRequest(req);
+      const ownership = auth.checkApplicantAccount(
+        { email: String(body.email || ''), phone: String(body.phone || '') },
+        actor?.id,
+      );
+      if (ownership === 'conflict') {
+        return res.status(409).json({ success: false, error: APPLICANT_LOGIN_REQUIRED });
+      }
+
+      // ─── Persist ───
+      if (body.logoDataUrl) {
+        const logoUrl = saveUpload(dataDir, 'vendor-logo', String(body.logoDataUrl));
+        if (logoUrl) {
+          body.logoUrl = logoUrl;
+          written.push(logoUrl);
+        }
+      }
+      const listingImages = persistListingImages(dataDir, rawImages, listingBody.image);
+      for (const url of listingImages) {
+        if (!(Array.isArray(rawImages) ? rawImages : []).includes(url) && url !== listingBody.image) written.push(url);
+      }
+      if (listingImages.length < LISTING_MIN_IMAGES) {
+        throw new Error(LISTING_PHOTOS_REQUIRED);
+      }
+      listingDraft.images = listingImages;
       validateVendorListing(listingDraft, { requireImages: true });
       const passwordHash = hashPassword(String(req.body?.password || ''));
       const created = store.submit(body, passwordHash);
+      written.length = 0;
       const personName = personNameFromParts(created);
-      const user = auth.ensureApplicantUser?.({
-        name: personName || created.projectName,
-        email: created.email,
-        phone: created.phone,
-        passwordHash,
-        avatarUrl: created.logoUrl,
-      });
-      if (user && auth.startSession) auth.startSession(res, user.id);
+      const user = auth.ensureApplicantUser?.(
+        {
+          name: personName || created.projectName,
+          email: created.email,
+          phone: created.phone,
+          passwordHash,
+          avatarUrl: created.logoUrl,
+        },
+        actor?.id,
+      );
+      if (user && auth.startSession && ownership === 'new') auth.startSession(res, user.id);
       const vendorId = user?.id || created.id;
       workspaces.seedWorkspaceFromApplication(vendorId, created);
       const listing = workspaces.addListing(vendorId, listingDraft, created.projectName);
@@ -93,7 +174,9 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
         message: 'وصل طلبك مع صور المنتج والسعر. يظهر في السوق بعد موافقة الإدارة.',
       });
     } catch (error) {
-      res.status(400).json({
+      removeUploads(dataDir, written);
+      const status = (error as { status?: number })?.status === 409 ? 409 : 400;
+      res.status(status).json({
         success: false,
         error: error instanceof Error ? error.message : 'تعذر إرسال طلب المورّد',
       });

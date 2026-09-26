@@ -4,6 +4,34 @@ import { normalizeSeoPath, seoMetaForPath } from './seo-meta';
 import { jsonLdForPath, jsonLdScript } from './seo-jsonld';
 import { staticLegalRootHtml } from './legal-static';
 
+/**
+ * Share metadata for an approved vendor listing rendered at `/service/<id>`.
+ * Callers look it up in the approved public catalog; an unknown ID passes null
+ * and the page falls back to the built-in map or the site default.
+ */
+export type ServicePageSeo = { title: string; description?: string; image?: string };
+
+const SERVICE_TITLE_SUFFIX = ' | يوصل';
+const SERVICE_DESCRIPTION_MAX = 300;
+
+function absoluteShareImage(image: string | undefined, baseUrl: string): string {
+  const raw = String(image || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith('/') && !raw.startsWith('//')) return `${baseUrl}${raw}`;
+  return '';
+}
+
+function serviceTitle(title: string): string {
+  const clean = title.replace(/\s+/g, ' ').trim();
+  return clean.endsWith(SERVICE_TITLE_SUFFIX.trim()) ? clean : `${clean}${SERVICE_TITLE_SUFFIX}`;
+}
+
+function clipText(value: string, max: number): string {
+  const clean = value.replace(/\s+/g, ' ').trim();
+  return clean.length <= max ? clean : `${clean.slice(0, max - 1).trimEnd()}…`;
+}
+
 export function escapeAttr(value: string): string {
   return String(value || '')
     .replace(/&/g, '&amp;')
@@ -47,22 +75,31 @@ export function adminOverrideApplies(pathname: string, pageKey: SeoPageKey): boo
   return path === `/${pageKey}`;
 }
 
-export function resolvePageSeo(settings: SeoSettings, pathname: string): ResolvedPageSeo {
+export function resolvePageSeo(
+  settings: SeoSettings,
+  pathname: string,
+  service?: ServicePageSeo | null,
+): ResolvedPageSeo {
   const normalized = normalizeSeoPath(pathname);
   const pageKey = pathToPageKey(normalized);
   const page = settings.pages[pageKey];
   const builtIn = defaultSeoSettings().pages[pageKey];
   // خريطة الميتا تُطابق المسار الكامل، فتغطي صفحات الخدمات التي لا مفتاح أدمن لها
   const meta = seoMetaForPath(normalized);
+  // منتج مورّد معتمد على /service/<id>: عنوانه ووصفه وصورته هو، لا عنوان الرئيسية
+  const listing = normalized.startsWith('/service/') && service?.title?.trim() ? service : null;
 
   const useAdmin = adminOverrideApplies(normalized, pageKey);
-  const title =
-    (useAdmin ? adminEdit(page?.title, builtIn?.title) : '') || meta?.title || page?.title || settings.title;
+  const title = listing
+    ? serviceTitle(listing.title)
+    : (useAdmin ? adminEdit(page?.title, builtIn?.title) : '') || meta?.title || page?.title || settings.title;
   const description =
+    (listing?.description?.trim() ? clipText(listing.description, SERVICE_DESCRIPTION_MAX) : '') ||
     (useAdmin ? adminEdit(page?.description, builtIn?.description) : '') ||
     meta?.description ||
     page?.description ||
     settings.description;
+  const listingImage = listing ? absoluteShareImage(listing.image, settings.canonicalBaseUrl) : '';
 
   const canonicalPath = normalized === '/' ? '/' : normalized;
   // مشاركة واتساب/جوجل لازم تطابق عنوان الصفحة، مو عنوان الرئيسية العام
@@ -73,11 +110,11 @@ export function resolvePageSeo(settings: SeoSettings, pathname: string): Resolve
     pageKey,
     title,
     description,
-    h1: meta?.h1 || '',
+    h1: listing ? listing.title.trim() : meta?.h1 || '',
     keywords: settings.keywords,
     ogTitle,
     ogDescription,
-    ogImage: settings.ogImage,
+    ogImage: listingImage || settings.ogImage,
     ogSiteName: settings.ogSiteName,
     twitterCard: settings.twitterCard,
     twitterTitle:
@@ -86,7 +123,7 @@ export function resolvePageSeo(settings: SeoSettings, pathname: string): Resolve
       useAdmin && settings.twitterDescription && settings.twitterDescription !== settings.description
         ? settings.twitterDescription
         : description,
-    twitterImage: settings.twitterImage || settings.ogImage,
+    twitterImage: listingImage || settings.twitterImage || settings.ogImage,
     canonical: `${settings.canonicalBaseUrl}${canonicalPath}`,
     googleSiteVerification: settings.googleSiteVerification,
     analyticsId: settings.analyticsId.trim(),
@@ -143,8 +180,13 @@ function analyticsSnippet(id: string): string {
   return '';
 }
 
-export function injectSeoIntoHtml(html: string, settings: SeoSettings, pathname: string): string {
-  const page = resolvePageSeo(settings, pathname);
+export function injectSeoIntoHtml(
+  html: string,
+  settings: SeoSettings,
+  pathname: string,
+  service?: ServicePageSeo | null,
+): string {
+  const page = resolvePageSeo(settings, pathname, service);
   let next = stripManagedScripts(html);
   next = upsertTitle(next, page.title);
   next = upsertMeta(next, 'name', 'description', page.description);

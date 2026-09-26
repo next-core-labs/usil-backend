@@ -1,6 +1,8 @@
 import type { Express, Request, Response } from 'express';
 import { createCourierApplicationStore, publicCourierApplication } from './courier-applications';
 import type { PublicUser } from '../auth/auth';
+import { clientIp, normalizeSaudiMobile } from '../shared/booking-guards';
+import { courierAccountNote, grantCourierRole, type CourierAccountOutcome } from './courier-role';
 
 type AuthApi = {
   userFromRequest: (req: Request) => PublicUser | null;
@@ -19,15 +21,8 @@ export function resetCourierApplyLimiter() {
   applyHits.clear();
 }
 
-function clientKey(req: Request): string {
-  const forwarded = String(req.headers['x-forwarded-for'] || '')
-    .split(',')[0]
-    .trim();
-  return forwarded || req.ip || req.socket.remoteAddress || 'unknown';
-}
-
 function allowApply(req: Request): boolean {
-  const key = clientKey(req);
+  const key = clientIp(req);
   const now = Date.now();
   const recent = (applyHits.get(key) || []).filter((stamp) => now - stamp < APPLY_WINDOW_MS);
   if (recent.length >= APPLY_MAX) {
@@ -51,7 +46,19 @@ export function registerCourierApplicationRoutes(app: Express, auth: AuthApi, da
       });
     }
     try {
-      const created = store.submit(req.body || {});
+      // Only a signed-in applicant is linked to an account (by id), so the
+      // approval can hand that account the courier role. A guest's typed email
+      // or phone is kept as contact info and never selects an account.
+      const applicant = auth.userFromRequest(req);
+      const body = req.body || {};
+      const created = store.submit(
+        {
+          ...body,
+          email: applicant?.email || body.email,
+          phone: (applicant?.phone && normalizeSaudiMobile(applicant.phone)) || body.phone,
+        },
+        { applicantUserId: applicant?.id },
+      );
       res.status(201).json({
         success: true,
         application: publicCourierApplication(created),
@@ -77,7 +84,27 @@ export function registerCourierApplicationRoutes(app: Express, auth: AuthApi, da
       const actor = auth.userFromRequest(req);
       const row = store.decide(req.params.id, 'approved', actor?.name || 'إدارة يوصل');
       if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
-      res.json({ success: true, application: publicCourierApplication(row, { revealId: true }) });
+      let account: CourierAccountOutcome;
+      try {
+        account = grantCourierRole(dataDir, row.applicantUserId);
+      } catch (roleError) {
+        // The approval is already saved; report the role step instead of failing it.
+        console.warn('[couriers] approved but could not update the account role', roleError);
+        return res.json({
+          success: true,
+          application: publicCourierApplication(row, { revealId: true }),
+          account: null,
+          accountLinked: false,
+          message: 'تم اعتماد الطلب، لكن تعذر تحديث دور الحساب. غيّر الدور يدوياً من إدارة الحسابات.',
+        });
+      }
+      res.json({
+        success: true,
+        application: publicCourierApplication(row, { revealId: true }),
+        account,
+        accountLinked: account.status === 'promoted' || account.status === 'already_courier',
+        message: courierAccountNote(account),
+      });
     } catch (error) {
       res.status(400).json({
         success: false,

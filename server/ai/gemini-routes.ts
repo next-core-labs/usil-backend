@@ -13,22 +13,40 @@ import type { AiRouter } from './ai-providers';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
 import { effectiveKey } from './integrations-store';
 import { createVendorStore } from '../vendors/vendor-store';
-import { isPublicMarketplaceListing } from '../../core/utils/catalogMedia';
+import { listApprovedCatalogServices, vendorUsersFromDataDir } from '../shared/approved-catalog';
 
 export type GeminiRouteDeps = {
   /** موجّه المزودين (Gemini / Claude / OpenAI) القادم من لوحة التكاملات. */
   ai?: AiRouter;
   dataDir?: string;
+  /**
+   * Approved vendor accounts (`auth.listVendorUsers`). The AI catalog only shows
+   * their listings, like `/api/catalog/listings`. Defaults to reading users.json.
+   */
+  listVendorUsers?: () => Array<{ id: string }>;
 };
 
-function marketplaceCards(dataDir?: string): CatalogCard[] {
+/** رسالة موحّدة حين لا يوجد مزود ذكاء مُعد — لا نختلق نتيجة بديلة. */
+export const AI_NOT_CONFIGURED =
+  'المساعد الذكي غير مفعّل حالياً — لم يُضبط مزود ذكاء (Gemini أو Claude أو OpenAI) على الخادم. أضف المفتاح من لوحة الإدارة › تكاملات ومفاتيح API.';
+/** مسارات قدرات جوجل (صوت، موسيقى، بحث، خرائط) تحتاج مفتاح Gemini تحديداً. */
+export const GEMINI_NOT_CONFIGURED =
+  'هذه الميزة تحتاج مفتاح Gemini على الخادم وهو غير مضبوط حالياً. أضفه من لوحة الإدارة › تكاملات ومفاتيح API.';
+export const AI_PROVIDER_FAILED = 'تعذر الاتصال بمزود الذكاء الآن. أعد المحاولة بعد قليل.';
+
+function notConfigured(res: import('express').Response, message = AI_NOT_CONFIGURED) {
+  return res.status(503).json({ success: false, aiAvailable: false, aiGenerated: false, error: message });
+}
+
+function providerFailed(res: import('express').Response, message = AI_PROVIDER_FAILED) {
+  return res.status(502).json({ success: false, aiAvailable: true, aiGenerated: false, error: message });
+}
+
+function marketplaceCards(dataDir?: string, listVendorUsers?: () => Array<{ id: string }>): CatalogCard[] {
   if (!dataDir) return liveCatalog();
   try {
     const store = createVendorStore(dataDir);
-    return store
-      .listAllListings()
-      .map((listing) => store.listingToPublicService(listing))
-      .filter(isPublicMarketplaceListing)
+    return listApprovedCatalogServices(store, listVendorUsers || vendorUsersFromDataDir(dataDir))
       .map((item) => ({
         id: String(item.id),
         title: String(item.title || ''),
@@ -106,51 +124,12 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
 
   const activeTextProvider = () => (deps.ai ? deps.ai.activeProvider() : geminiKey() ? 'gemini' : null);
 
-  function generateFallbackReview(
-    role: string,
-    partyName: string,
-    serviceTitle: string,
-    rating: number,
-    highlights?: string,
-    tone?: string
-  ): { review: string; tags: string[] } {
-    if (role === 'client') {
-      if (rating >= 4.5) {
-        return {
-          review: `تجربة استثنائية مع ${partyName || 'مزود الخدمة'} في خدمة (${serviceTitle || 'المناسبة'}). التزام دقيق بالمواعيد وجودة تقديم فندقية بيضت وجيهنا أمام الضيوف. الطاقم كان في قمة اللباقة والاحترافية. أنصح بالتعامل معهم بشدة!`,
-          tags: ['دقة المواعيد ⏱️', 'كرم وضيافة ملكية ☕', 'طاقم محترف ولبق 👔'],
-        };
-      } else {
-        return {
-          review: `تم تنفيذ الخدمة (${serviceTitle}) من قِبل ${partyName || 'المزود'} بشكل جيد ومقبول، مع تمنياتنا بمزيد من سرعة التنسيق وتطوير تفاصيل التقديم في المرات القادمة.`,
-          tags: ['خدمة مقبولة', 'تنسيق جيد', 'مجال للتحسين'],
-        };
-      }
-    } else {
-      // Provider rating client
-      if (rating >= 4.5) {
-        return {
-          review: `سعدنا جداً بخدمة العميل الكريم ${partyName || 'العميل'} في مناسبته. تواصل راقٍ وسلس، وضوح تام في المتطلبات والموقع، والتزام مثالي بمواعيد الاستقبال وسداد المستحقات. نتشرف بخدمتكم دائماً!`,
-          tags: ['عميل راقي ومثالي 💎', 'التزام فوري بالسداد 💳', 'جاهزية الموقع وسرعة التنسيق 📍'],
-        };
-      } else {
-        return {
-          review: `نشكر ${partyName || 'العميل'} على التعامل، مناسبة جيدة ونتطلع لمزيد من التنسيق المسبق وتوضيح أوقات الدخول لتسهيل عمل الطاقم.`,
-          tags: ['تعامل طيب', 'تنسيق متوسط'],
-        };
-      }
-    }
-  }
-
   app.post('/api/gemini/generate-review', async (req, res) => {
     try {
       const { role, partyName, serviceTitle, rating = 5, highlights = '', tone = 'friendly' } = req.body;
       const ai = getTextClient();
 
-      if (!ai) {
-        const fallback = generateFallbackReview(role, partyName, serviceTitle, rating, highlights, tone);
-        return res.json({ ...fallback, aiGenerated: false });
-      }
+      if (!ai) return notConfigured(res);
 
       const prompt = `أنت خبير ذكاء اصطناعي لمنصة يوصل السعودية (Usil) — سوق توريد المناسبات. لا تقل أصيل أو مضياف أو Aseel أبداً.
   اكتب تقييماً احترافياً بنظام التقييم المزدوج الأعمى (Blind Reviews).
@@ -181,22 +160,17 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
 
       const parsed = JSON.parse(response.text || '{}');
+      if (typeof parsed.review !== 'string' || !parsed.review.trim()) {
+        return providerFailed(res, 'لم يرجع مزود الذكاء نص تقييم. اكتب التقييم بنفسك أو أعد المحاولة.');
+      }
       res.json({
-        review: parsed.review || generateFallbackReview(role, partyName, serviceTitle, rating).review,
-        tags: parsed.tags || ['التزام بالمواعيد', 'جودة فائقة', 'تعامل راقي'],
+        review: parsed.review,
+        tags: Array.isArray(parsed.tags) ? parsed.tags : [],
         aiGenerated: true,
       });
     } catch (error: any) {
       console.error('Error generating review with Gemini:', error);
-      const fallback = generateFallbackReview(
-        req.body.role,
-        req.body.partyName,
-        req.body.serviceTitle,
-        req.body.rating || 5,
-        req.body.highlights,
-        req.body.tone
-      );
-      res.json({ ...fallback, aiGenerated: false });
+      return providerFailed(res);
     }
   });
 
@@ -206,14 +180,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       const { targetName, targetType, reviews } = req.body;
       const ai = getTextClient();
 
-      if (!ai) {
-        return res.json({
-          summary: `حصل ${targetName || 'المزود'} على تقييمات استثنائية بنسبة رضا 99% مع إشادة خاصة بسرعة الاستجابة ودقة المواعيد الفندقية وكرم الضيافة.`,
-          strengths: ['الالتزام التام بالمواعيد (99.4%)', 'سرعة الاستجابة والرد (خلال دقائق)', 'جودة التقديم ولطف الطاقم الميداني'],
-          aiTrustScore: 98,
-          aiGenerated: false,
-        });
-      }
+      if (!ai) return notConfigured(res);
 
       const prompt = `قم بتحليل مراجعات التقييم المزدوج للطرف (${targetType === 'vendor' ? 'مزود الخدمة' : 'العميل'}) باسم "${targetName}".
   التقييمات:
@@ -240,20 +207,20 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
 
       const parsed = JSON.parse(response.text || '{}');
+      if (typeof parsed.summary !== 'string' || !parsed.summary.trim()) {
+        return providerFailed(res, 'لم يرجع مزود الذكاء تحليلاً للتقييمات. أعد المحاولة بعد قليل.');
+      }
+      const score = Number(parsed.aiTrustScore);
       res.json({
-        summary: parsed.summary || 'سجل حافل بالتقييمات الإيجابية وسرعة الرد.',
-        strengths: parsed.strengths || ['سرعة الاستجابة', 'دقة المواعيد', 'احترافية التقديم'],
-        aiTrustScore: parsed.aiTrustScore || 98,
+        summary: parsed.summary,
+        strengths: Array.isArray(parsed.strengths) ? parsed.strengths : [],
+        // لا نخترع نسبة موثوقية إن لم يرجعها المزود
+        aiTrustScore: Number.isFinite(score) && score >= 0 && score <= 100 ? score : null,
         aiGenerated: true,
       });
     } catch (error: any) {
       console.error('Error analyzing reviews with Gemini:', error);
-      res.json({
-        summary: `معدل رضا عالٍ جداً وأداء موثوق مبني على تقييمات العملاء المعتمدة.`,
-        strengths: ['دقة المواعيد الفندقية', 'كرم الضيافة واللباقة', 'سرعة الرد والمتابعة'],
-        aiTrustScore: 98,
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -265,19 +232,14 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
     try {
       const { userSpeech, conversationHistory = [], currentCity = 'الرياض', guestCount = 50 } = req.body;
       const ai = getTextClient();
+      const cards = marketplaceCards(deps.dataDir, deps.listVendorUsers);
 
       const systemPrompt = `أنت "وكيل يوصل الصوتي الذكي" (Usil Voice AI Concierge) — مساعد صوتي لمنصة يوصل (Usil)، سوق توريد المناسبات السعودي. لا تقل أصيل أو مضياف أو Aseel أو Midyaf أبداً. اسمك يوصل بالعربية وUsil بالإنجليزية.
   صوتك وشخصيتك: دافئة، مرحبة بالأسلوب السعودي والخليجي الراقي ("أهلاً وسهلاً بك في يوصل"، "يا هلا"، "سمّ طال عمرك"، "أبشر بعزك").
   تحدث بجمل قصيرة وواضحة وطبيعية جداً تناسب النطق الصوتي البشري المسموع (Voice Speech Synthesis).
 
-  الخدمات المتوفرة في المنصة:
-  1. ركن الضيافة النجدية الملكية (قهوة سعودية، دلال رسلان ذهبية، بخور وعود، تمر سكري ومباشرين) - 1,200 ر.س (تكفي 50 ضيف)
-  2. استوديو لمسات التنسيق (كوشة ومداخل ورد طبيعي وإضاءات) - 3,500 ر.س
-  3. مطابخ قصر الضيافة (بوفيه عشاء عربي وإنترناشونال وسخانات فضية) - 4,800 ر.س (تكفي 50 شخص)
-  4. عدسة الملوك للإنتاج (تصوير فوتوغرافي وفيديو احترافي ودرون) - 2,200 ر.س
-  5. باريستا إكسبريس للضيافة (بار قهوة مختصة، v60، كورتادو، سبانش لاتيه وماتشا) - 1,450 ر.س (تكفي 70 شخص)
-  6. دار الفخامة لتنسيق القاعات (طاولات استقبال فندقية ومفارش فاخرة) - 2,800 ر.س
-  7. فريق الفرح الترفيهي (عرضة سعودية وموسيقى حية) - 1,800 ر.س
+  الخدمات المتوفرة في المنصة (منتجات مورّدين معتمدين فقط — المعرّف | العنوان | الفئة | السعر | المدن). لا تقترح أي خدمة أو سعر خارج هذه القائمة:
+${compactCatalogForPrompt(cards) || 'لا توجد منتجات معتمدة في السوق حالياً — لا تقترح خدمات ولا أسعاراً.'}
 
   المطلوب:
   1. الرد بصوت طبيعي كأنك تتحدث هاتفياً أو عبر مكالمة صوتية حية (سطرين إلى 3 أسطر كحد أقصى لتكون مريحة للمستمع).
@@ -300,7 +262,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
   }`;
 
       if (!ai) {
-        const cards = marketplaceCards(deps.dataDir);
+        // بلا مزود ذكاء: مطابقة كلمات على منتجات المورّدين المعتمدين فقط، بلا نص مختلق
         const text = (userSpeech || '').toLowerCase();
         const liveIds = cards.slice(0, 2).map((row) => row.id);
         let spoken =
@@ -370,38 +332,29 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         parsed = {};
       }
 
-      if (parsed.suggestedServiceIds) {
+      if (parsed.suggestedServiceIds && typeof parsed.spokenResponse === 'string' && parsed.spokenResponse.trim()) {
+        // لا نمرّر معرّفاً أو ميزانية لا وجود لهما في الكتالوج المعتمد
+        const knownIds = (Array.isArray(parsed.suggestedServiceIds) ? parsed.suggestedServiceIds : [])
+          .map((id: unknown) => String(id))
+          .filter((id: string) => cards.some((row) => row.id === id));
         res.json({
-          spokenResponse: parsed.spokenResponse || 'أهلاً بك في يوصل! كيف أقدر أساعدك اليوم في تجهيز مناسبتك؟',
+          spokenResponse: parsed.spokenResponse,
           action: parsed.action || 'recommend_service',
-          suggestedServiceIds: parsed.suggestedServiceIds || [],
-          estimatedBudget: parsed.estimatedBudget || 2500,
-          bundleDiscount: parsed.bundleDiscount || 10,
+          suggestedServiceIds: knownIds,
+          estimatedBudget: knownIds.reduce(
+            (sum: number, id: string) => sum + (cards.find((row) => row.id === id)?.price || 0),
+            0,
+          ),
+          bundleDiscount: 0,
           quickOptions: parsed.quickOptions || ['إضافة للسلة', 'تفاصيل الخدمة'],
           aiGenerated: true,
         });
       } else {
-        res.json({
-          spokenResponse: 'أهلاً بك في يوصل! يسعدنا مساعدتك في تجهيز أرقى خدمات الضيافة لمناسبتك.',
-          action: 'recommend_service',
-          suggestedServiceIds: [],
-          estimatedBudget: 0,
-          bundleDiscount: 0,
-          quickOptions: ['عرض منتجات السوق', 'اترك طلب مدينة'],
-          aiGenerated: false,
-        });
+        return providerFailed(res, 'لم يرجع المساعد رداً مفهوماً. أعد صياغة طلبك أو حاول بعد قليل.');
       }
     } catch (error: any) {
       console.error('Error in Voice AI assistant:', error);
-      res.json({
-        spokenResponse: 'يا هلا بك في يوصل! يسعدني مساعدتك في اختيار أفضل خدمات الضيافة والتنسيق لمناسبتك. تفضل بطلبك.',
-        action: 'recommend_service',
-        suggestedServiceIds: [],
-        estimatedBudget: 0,
-        bundleDiscount: 0,
-        quickOptions: ['عرض منتجات السوق', 'اترك طلب مدينة'],
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -487,15 +440,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       const { prompt = 'موسيقى زفة ودخول ملكية مع إيقاعات العود والدفوف السعودية التراثية الهادئة', base64Image } = req.body;
       const ai = getGeminiClient();
 
-      if (!ai) {
-        return res.json({
-          audioUrl: 'https://assets.mixkit.co/music/preview/mixkit-arabic-mystery-254.mp3',
-          lyrics: 'أهلاً بكم يا ضيوفنا الكرام.. طيب اللقاء وعطر البخور يفوح في مجلس الكرم والجود.',
-          title: 'زفة الدلال والأصالة الملكية',
-          durationSeconds: 30,
-          aiGenerated: false,
-        });
-      }
+      if (!ai) return notConfigured(res, GEMINI_NOT_CONFIGURED);
 
       const contents: any = base64Image
         ? {
@@ -531,6 +476,9 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         }
       }
 
+      if (!audioBase64) {
+        return providerFailed(res, 'لم يرجع مولّد الموسيقى مقطعاً صوتياً. أعد المحاولة بعد قليل.');
+      }
       return res.json({
         audioBase64,
         mimeType,
@@ -541,13 +489,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
     } catch (error: any) {
       console.error('Error generating music with Lyria:', error);
-      return res.json({
-        audioUrl: 'https://assets.mixkit.co/music/preview/mixkit-arabic-mystery-254.mp3',
-        lyrics: 'أهلاً بكم في يوصل.. عطر البخور وكرم الضيافة في ليلة الفرح.',
-        title: 'مقطوعة يوصل التراثية',
-        durationSeconds: 30,
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -557,19 +499,9 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       const { base64Audio, mimeType = 'audio/webm' } = req.body;
       const ai = getGeminiClient();
 
-      if (!ai || !base64Audio) {
-        return res.json({
-          transcription: 'أحتاج ركن قهوة سعودية ملكية مع دلال مذهبة لـ 80 شخص في الرياض يوم الجمعة القادم، مع بار قهوة مختصة وبخور عود فاخر.',
-          structuredEvent: {
-            guestCount: 80,
-            city: 'الرياض',
-            eventDate: 'يوم الجمعة القادم',
-            requestedServices: ['ركن الضيافة النجدية الملكية', 'بار القهوة المختصة', 'بخور العود الملكي'],
-            estimatedBudget: 2800,
-            notes: 'تجهيز مباشرين بالزي التراثي الرسمي',
-          },
-          aiGenerated: false,
-        });
+      if (!ai) return notConfigured(res, GEMINI_NOT_CONFIGURED);
+      if (!base64Audio || typeof base64Audio !== 'string') {
+        return res.status(400).json({ success: false, error: 'أرسل التسجيل الصوتي أولاً.' });
       }
 
       const cleanBase64 = base64Audio.replace(/^data:audio\/[a-z0-9]+;base64,/, '');
@@ -610,28 +542,19 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
 
       const parsed = JSON.parse(response.text || '{}');
+      if (typeof parsed.transcription !== 'string' || !parsed.transcription.trim()) {
+        return providerFailed(res, 'تعذر تفريغ التسجيل. أعد التسجيل بصوت أوضح أو اكتب طلبك.');
+      }
       return res.json({
-        transcription: parsed.transcription || 'تم استلام التسجيل وتفريغه بنجاح.',
-        structuredEvent: parsed.structuredEvent || {
-          guestCount: 50,
-          city: 'الرياض',
-          requestedServices: ['ركن الضيافة الملكية'],
-          estimatedBudget: 2000,
-        },
+        transcription: parsed.transcription,
+        // لا نملأ بيانات مناسبة من عندنا إن لم يستخرجها المزود
+        structuredEvent:
+          parsed.structuredEvent && typeof parsed.structuredEvent === 'object' ? parsed.structuredEvent : null,
         aiGenerated: true,
       });
     } catch (error: any) {
       console.error('Error transcribing audio with Gemini:', error);
-      return res.json({
-        transcription: 'طلب ضيافة متكامل لمناسبة عائلية خاصة تشمل ركن القهوة والبوفيه.',
-        structuredEvent: {
-          guestCount: 60,
-          city: 'الرياض',
-          requestedServices: ['ركن الضيافة النجدية'],
-          estimatedBudget: 2400,
-        },
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -641,19 +564,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       const { query = 'أسعار البن الخولاني والهيل وأسعار خدمات الضيافة والمناسبات في السعودية 2026' } = req.body;
       const ai = getGeminiClient();
 
-      if (!ai) {
-        return res.json({
-          answer: `حسب آخر مؤشرات السوق السعودي لعام 2026:
-  - يتراوح سعر كيلو البن الخولاني السعودي الفاخر من جازان بين 180 إلى 260 ريال للكيلو المختص.
-  - أسعار باقات الضيافة الملكية مع الطاقم تبدأ من 1,200 ريال لـ 50 ضيف وتصل لـ 3,500 ريال للباقات VIP.
-  - تشهد مناسبات الرياض وجدة طلباً متزايداً على بارات القهوة المختصة والماتشا بجانب القهوة السعودية التراثية.`,
-          groundingSources: [
-            { title: 'دليل مؤشرات الضيافة السعودية', uri: 'https://saudievents.sa/hospitality-index' },
-            { title: 'سوق البن الخولاني والتمور الفاخرة', uri: 'https://monshaat.gov.sa' },
-          ],
-          aiGenerated: false,
-        });
-      }
+      if (!ai) return notConfigured(res, GEMINI_NOT_CONFIGURED);
 
       const response = await ai.models.generateContent({
         model: 'gemini-3.5-flash',
@@ -667,7 +578,8 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         },
       });
 
-      const answer = response.text || 'تم استرداد بيانات السوق بنجاح.';
+      const answer = response.text || '';
+      if (!answer.trim()) return providerFailed(res, 'لم يرجع البحث المباشر نتيجة. أعد المحاولة بعد قليل.');
       const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
       const groundingSources = chunks
         .map((c: any) => c.web)
@@ -681,11 +593,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
     } catch (error: any) {
       console.error('Error in search grounding:', error);
-      return res.json({
-        answer: 'تتراوح أسعار باقات الضيافة المتكاملة في المملكة بين 1,200 إلى 4,500 ريال حسب عدد الضيوف ومستوى التقديم.',
-        groundingSources: [],
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -695,20 +603,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       const { query = 'أفضل قاعات المناسبات ومحامص القهوة المختصة الفاخرة في الرياض', latitude, longitude } = req.body;
       const ai = getGeminiClient();
 
-      if (!ai) {
-        return res.json({
-          answer: `أبرز المواقع المعتمدة للضيافة والقاعات في الرياض:
-  1. قاعات فندق الريتز كارلتون وقصر طويق - حي السفارات.
-  2. محامص القهوة المختصة الفاخرة شمال الرياض (العقيق وحطين).
-  3. مزارع واستراحات المناسبات الراقية في الدرعية والعمارية.`,
-          mapsSources: [
-            { title: 'قصر طويق - الرياض', uri: 'https://maps.google.com/?q=Tuwaiq+Palace+Riyadh' },
-            { title: 'حي السفارات - الرياض', uri: 'https://maps.google.com/?q=Diplomatic+Quarter+Riyadh' },
-            { title: 'الدرعية التاريخية', uri: 'https://maps.google.com/?q=Diriyah+Riyadh' },
-          ],
-          aiGenerated: false,
-        });
-      }
+      if (!ai) return notConfigured(res, GEMINI_NOT_CONFIGURED);
 
       const config: any = {
         tools: [{ googleMaps: {} }],
@@ -733,7 +628,8 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         config,
       });
 
-      const answer = response.text || 'تم تحديد المواقع والقاعات القريبة بنجاح.';
+      const answer = response.text || '';
+      if (!answer.trim()) return providerFailed(res, 'لم يرجع بحث الخرائط نتيجة. أعد المحاولة بعد قليل.');
       const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
       const mapsSources = chunks
         .map((c: any) => c.maps)
@@ -747,11 +643,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       });
     } catch (error: any) {
       console.error('Error in maps grounding:', error);
-      return res.json({
-        answer: 'تم العثور على مجموعة من القاعات ومواقع الضيافة الفاخرة القريبة في منطقتك.',
-        mapsSources: [],
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
@@ -760,25 +652,14 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
     try {
       const { messages = [], currentCity = 'الرياض', usePro = false } = req.body;
       const ai = getTextClient();
+      if (!ai) return notConfigured(res);
+      const chatCards = marketplaceCards(deps.dataDir, deps.listVendorUsers);
 
       const systemInstruction = `أنت "مستشار يوصل الذكي لتوريد المناسبات" (Usil AI Event Concierge). أنت يوصل (Usil)، سوق توريد مناسبات سعودي. لا تقل أبداً أصيل أو مضياف أو Aseel أو Midyaf. اسم المنصة بالعربية يوصل وبالإنجليزية Usil.
   خبرتك: توريد ضيافة الأعراس، حفلات التخرج، الاستقبالات الرسمية، والمناسبات العائلية في السعودية.
   أسلوبك: راقٍ ومرحّب، تقدم اقتراحات دقيقة للباقات والميزانيات وإتيكيت الضيافة السعودية.
-  الخدمات المتاحة:
-  - باقة الضيافة النجدية الملكية (دلال رسلان مذهبة، قهوة خولانية، بخور عود، مباشرين بالزي التراثي) - 1,200 ر.س
-  - بار القهوة المختصة والباريستا (V60، سبانش لاتيه، كورتادو، ماتشا يابانية) - 1,450 ر.س
-  - بوفيه الطعام الفندقي الفاخر (سخانات فضية وأطباق شرقية وعالمية) - 4,800 ر.س
-  - تغطية تصوير سينمائي وفيديو درون - 2,200 ر.س
-  - كوش وتنسيق مداخل ورد طبيعي - 3,500 ر.س`;
-
-      if (!ai) {
-        const lastUserMsg = messages[messages.length - 1]?.content || 'مرحبا';
-        return res.json({
-          reply: `يا هلا ومرحباً بك في يوصل! بالنسبة لطلبك (${lastUserMsg})، أنصحك باختيار باقة الضيافة النجدية الملكية المكتملة مع إضافة بار القهوة المختصة لتغطية كافة أذواق ضيوفك الكرام. هل ترغب بأن أجهز لك حسبة الميزانية التقديرية؟`,
-          suggestedActions: ['حساب ميزانية مناسبتي', 'إضافة باقة الضيافة الملكية', 'استعراض قائمة بوفيه العشاء'],
-          aiGenerated: false,
-        });
-      }
+  الخدمات المتاحة (منتجات مورّدين معتمدين فقط — المعرّف | العنوان | الفئة | السعر | المدن). لا تذكر خدمة أو سعراً خارج هذه القائمة:
+${compactCatalogForPrompt(chatCards) || 'لا توجد منتجات معتمدة في السوق حالياً — لا تقترح خدمات ولا أسعاراً.'}`;
 
       const modelName = usePro ? 'gemini-3.6-flash' : 'gemini-3.6-flash';
       const formattedContents = messages.map((m: any) => ({
@@ -795,26 +676,23 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         },
       });
 
-      const reply = response.text || 'أهلاً بك! كيف أقدر أساعدك في تجهيز مناسبتك؟';
+      const reply = response.text || '';
+      if (!reply.trim()) return providerFailed(res, 'لم يرجع مزود الذكاء رداً. أعد المحاولة بعد قليل.');
       return res.json({
         reply,
-        suggestedActions: ['حساب الميزانية التقديرية', 'باقة الضيافة الملكية', 'مواقع القاعات الموصى بها'],
+        suggestedActions: ['حساب الميزانية التقديرية', 'عرض منتجات السوق', 'اترك طلب مدينة'],
         aiGenerated: true,
       });
     } catch (error: any) {
       console.error('Error in Gemini Chatbot:', error);
-      return res.json({
-        reply: 'يا هلا بك في يوصل! نسعد بخدمتك في توريد ضيافة مناسبتك. تفضل بالسؤال عن أي باقة أو ميزانية.',
-        suggestedActions: ['باقات القهوة السعودية', 'بوفيهات العشاء', 'تنسيق القاعات'],
-        aiGenerated: false,
-      });
+      return providerFailed(res);
     }
   });
 
   app.get('/api/gemini/status', (_req, res) => {
     res.json({
       available: Boolean(activeTextProvider()),
-      catalogSize: catalogSize(marketplaceCards(deps.dataDir)),
+      catalogSize: catalogSize(marketplaceCards(deps.dataDir, deps.listVendorUsers)),
       vendor: activeTextProvider() || 'gemini',
       geminiAvailable: Boolean(geminiKey()),
     });
@@ -828,7 +706,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
       budget: Number(req.body?.budget) || 0,
       guests: Number(req.body?.guests) || 0,
     };
-    const cards = marketplaceCards(deps.dataDir);
+    const cards = marketplaceCards(deps.dataDir, deps.listVendorUsers);
     const fallback = matchBundlesFromCatalog(input, cards);
     const keyMissing = !activeTextProvider();
 

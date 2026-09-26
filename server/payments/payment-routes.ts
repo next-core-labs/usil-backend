@@ -1,7 +1,8 @@
 import type { Express, Request, Response } from 'express';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards.ts';
 import { publicSiteUrl } from '../auth/email-verification.ts';
-import type { BookingStore } from '../bookings/booking-store.ts';
+import type { BookingService } from '../bookings/booking-routes.ts';
+import { CLOSED_BOOKING_STATUSES, clientOwnsBooking } from '../bookings/booking-store.ts';
 import {
   createInvoice,
   fetchPayment,
@@ -15,8 +16,8 @@ import {
 } from './moyasar.ts';
 
 type Deps = {
-  /** Platform bookings, settled when the provider confirms a payment. */
-  bookings: BookingStore;
+  /** Platform bookings (with their ownership rule), settled when the provider confirms a payment. */
+  bookings: BookingService;
   /** Port to fall back on when no public site URL is configured. */
   port: string | number;
 };
@@ -31,6 +32,14 @@ const INVOICE_RATE_LIMIT = 'تجاوزت حد طلبات الدفع. انتظر 
 
 /** Moyasar caps metadata values; keep them short and stringy. */
 const METADATA_MAX_LEN = 120;
+
+/** Metadata keys that name a platform booking — see `bookingIdFromMetadata` in moyasar.ts. */
+const BOOKING_METADATA_KEYS = ['bookingId', 'order_id', 'orderId'];
+
+const INVOICE_NEEDS_LOGIN = 'سجّل الدخول بالحساب الذي أنشأ الطلب لإتمام دفعه.';
+const INVOICE_BOOKING_NOT_FOUND = 'الحجز غير موجود';
+const INVOICE_ALREADY_PAID = 'هذا الطلب مدفوع مسبقاً.';
+const INVOICE_BOOKING_CLOSED = 'الطلب ملغي أو منتهٍ، ولا يمكن دفعه.';
 
 export function registerPaymentRoutes(app: Express, deps: Deps) {
   const { bookings } = deps;
@@ -58,12 +67,36 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
       return res.status(429).json({ error: INVOICE_RATE_LIMIT });
     }
 
-    const amount = Number(req.body?.amount);
-    const description = String(req.body?.description || '').trim();
+    let amount = Number(req.body?.amount);
+    let description = String(req.body?.description || '').trim();
     const metadataRaw = req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
     const metadata: Record<string, string> = {};
     for (const [key, value] of Object.entries(metadataRaw as Record<string, unknown>)) {
       if (typeof value === 'string' && value.trim()) metadata[key] = value.trim().slice(0, METADATA_MAX_LEN);
+    }
+
+    // An invoice that names a booking settles that booking, so it is only
+    // raised for the booking's owner (or a supervisor), for an unpaid open
+    // order, and always for the stored amount — never the client's.
+    const requestedBookingId = BOOKING_METADATA_KEYS.map((key) => metadata[key]).find(Boolean) || '';
+    const booking = requestedBookingId ? bookings.findById(requestedBookingId) : null;
+    if (requestedBookingId) {
+      const actor = bookings.actorFromRequest(req);
+      if (!actor) return res.status(401).json({ error: INVOICE_NEEDS_LOGIN });
+      const allowed =
+        actor.role === 'admin' ||
+        actor.role === 'accounts_manager' ||
+        (actor.role === 'client' && Boolean(booking) && clientOwnsBooking(actor, booking!));
+      if (!booking || !allowed) return res.status(404).json({ error: INVOICE_BOOKING_NOT_FOUND });
+      if (booking.paymentStatus === 'paid') return res.status(409).json({ error: INVOICE_ALREADY_PAID });
+      if (CLOSED_BOOKING_STATUSES.includes(booking.status)) {
+        return res.status(409).json({ error: INVOICE_BOOKING_CLOSED });
+      }
+      amount = Number(booking.totalAmount);
+      description = `طلب يوصل ${booking.id} — ${booking.serviceName}`.slice(0, 220);
+      for (const key of BOOKING_METADATA_KEYS) delete metadata[key];
+      metadata.bookingId = booking.id;
+      metadata.order_id = booking.id;
     }
 
     if (!Number.isFinite(amount) || amount < 1) {
@@ -83,10 +116,7 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
         backUrl: `${base}/payment/cancelled`,
         callbackUrl: moyasarWebhookUrl(),
       });
-      const bookingId = metadata.bookingId || metadata.order_id || '';
-      if (bookingId) {
-        bookings.markPaidFromMoyasar({ invoiceId: invoice.id, bookingId, status: invoice.status });
-      }
+      if (booking) bookings.attachInvoice(booking.id, { id: invoice.id, url: invoice.url });
       res.json({ id: invoice.id, url: invoice.url });
     } catch (error) {
       res.status(502).json({ error: (error as Error).message });
@@ -116,6 +146,9 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
           invoiceId: payment.invoice_id || payment.invoiceId,
           bookingId: payment.bookingId || payment.metadata?.order_id || payment.metadata?.bookingId,
           status: payment.status,
+          // Amount and currency as Moyasar reports them, never the event body.
+          amountHalalas: payment.amount,
+          currency: payment.currency,
         });
         console.log('[moyasar] payment paid', payment.id, payment.metadata?.order_id || payment.bookingId || '');
       }
@@ -162,9 +195,16 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
         invoiceId: verified.payment.invoiceId,
         bookingId: verified.payment.bookingId,
         status,
+        amountHalalas: verified.payment.amount,
+        currency: verified.payment.currency,
       });
     } else {
-      bookings.markPaidFromMoyasar({ invoiceId: verified.invoice.id, status });
+      bookings.markPaidFromMoyasar({
+        invoiceId: verified.invoice.id,
+        status,
+        amountHalalas: verified.invoice.amount,
+        currency: verified.invoice.currency,
+      });
     }
 
     const transactionUrl = verified.kind === 'payment' ? verified.payment.transactionUrl : undefined;

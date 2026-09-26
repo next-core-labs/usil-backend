@@ -8,7 +8,14 @@ import type { Request, Response, NextFunction } from 'express';
 import { registerSeoRoutes } from './seo-routes.ts';
 import { buildSitemapXml, injectSeoIntoHtml, mergeRobotsTxt } from './seo-html.ts';
 import { seoMetaPaths } from './seo-meta.ts';
-import { defaultSeoSettings, sanitizeSeoSettings } from './seo-store.ts';
+import { defaultSeoSettings, pickSeoPatch, sanitizeSeoSettings } from './seo-store.ts';
+import { createVendorStore } from '../vendors/vendor-store.ts';
+import {
+  listApprovedCatalogServices,
+  serviceSeoFrom,
+  vendorUsersFromDataDir,
+} from '../shared/approved-catalog.ts';
+import { seedApprovedAndRejected } from '../shared/approved-catalog.fixtures.ts';
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-seo-api-'));
@@ -238,6 +245,109 @@ describe('seo-routes', () => {
     assert.match(service, /<h1>فوتوبوث يطبع لضيوفك فوراً<\/h1>/);
     const home = injectSeoIntoHtml(html, settings, '/');
     assert.match(home, /<title>يوصل<\/title>/);
+  });
+
+  it('rejects an empty or unusable admin SEO update and never resets missing fields', async () => {
+    const dir = tmpDir();
+    const file = path.join(dir, 'seo.json');
+    const stored = {
+      ...defaultSeoSettings(),
+      title: 'عنوان محفوظ | يوصل',
+      ogImage: 'https://usil.app/favicon.svg',
+      twitterImage: 'https://usil.app/favicon.svg',
+      updatedAt: '2026-09-02T22:54:20.840Z',
+    };
+    fs.writeFileSync(file, JSON.stringify(stored));
+    const app = express();
+    app.use(express.json());
+    registerSeoRoutes(app, fakeAuth('admin') as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      for (const body of ['{}', '[]', JSON.stringify({ nonsense: 1, ogImage: 42, pages: { home: { title: 7 } } })]) {
+        const res = await fetch(`${url}/api/admin/seo`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        });
+        assert.equal(res.status, 400, body);
+        assert.match((await res.json()).error, /لا توجد حقول صالحة/);
+      }
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf-8')), stored);
+
+      const partial = await fetch(`${url}/api/admin/seo`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: 'وصف جديد للموقع.', pages: { about: { title: 'عن يوصل الجديد' } } }),
+      });
+      assert.equal(partial.status, 200);
+      const raw = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      assert.equal(raw.description, 'وصف جديد للموقع.');
+      assert.equal(raw.pages.about.title, 'عن يوصل الجديد');
+      assert.equal(raw.pages.privacy.title, stored.pages.privacy.title);
+      assert.equal(raw.title, 'عنوان محفوظ | يوصل');
+      assert.equal(raw.ogImage, 'https://usil.app/favicon.svg');
+      assert.equal(raw.twitterImage, 'https://usil.app/favicon.svg');
+    } finally {
+      await close();
+    }
+    assert.equal(pickSeoPatch({}), null);
+    assert.deepEqual(pickSeoPatch({ title: 'x', junk: 1 }), { title: 'x' });
+  });
+
+  it('renders an approved vendor listing\'s own title, description and image on /service/<id>', () => {
+    const settings = defaultSeoSettings();
+    const html = '<html><head><title>قديم</title></head><body><div id="root"></div></body></html>';
+    const homeTitle = /<title>([\s\S]*?)<\/title>/.exec(injectSeoIntoHtml(html, settings, '/'))?.[1];
+    const page = injectSeoIntoHtml(html, settings, '/service/lst-abc', {
+      title: 'قهوة المورد المعتمد',
+      description: 'ركن قهوة سعودية مع مباشر لخمسين ضيفاً.',
+      image: '/uploads/listing-abc.jpg',
+    });
+    assert.match(page, /<title>قهوة المورد المعتمد \| يوصل<\/title>/);
+    assert.notEqual(/<title>([\s\S]*?)<\/title>/.exec(page)?.[1], homeTitle);
+    assert.match(page, /name="description" content="ركن قهوة سعودية مع مباشر لخمسين ضيفاً."/);
+    assert.match(page, /property="og:title" content="قهوة المورد المعتمد \| يوصل"/);
+    assert.match(page, /property="og:image" content="https:\/\/usil\.app\/uploads\/listing-abc\.jpg"/);
+    assert.match(page, /name="twitter:image" content="https:\/\/usil\.app\/uploads\/listing-abc\.jpg"/);
+    assert.match(page, /<h1>قهوة المورد المعتمد<\/h1>/);
+
+    // Unknown IDs keep the default.
+    const unknown = injectSeoIntoHtml(html, settings, '/service/lst-unknown', null);
+    assert.equal(/<title>([\s\S]*?)<\/title>/.exec(unknown)?.[1], settings.title);
+    assert.match(unknown, /property="og:image" content="https:\/\/usil\.app\/og\/og-default\.png"/);
+  });
+
+  it('serves listing meta and a sitemap from approved vendors only', async () => {
+    const dir = tmpDir();
+    seedApprovedAndRejected(dir);
+    const indexHtmlPath = path.join(dir, 'index.html');
+    fs.writeFileSync(indexHtmlPath, '<html><head><title>قديم</title></head><body><div id="root"></div></body></html>');
+    const vendorStore = createVendorStore(dir);
+    const approved = () => listApprovedCatalogServices(vendorStore, vendorUsersFromDataDir(dir));
+    const app = express();
+    app.use(express.json());
+    const { sendSpa } = registerSeoRoutes(app, fakeAuth(null) as any, dir, {
+      indexHtmlPath,
+      getServiceEntries: () => approved().map((item) => ({ id: item.id, title: item.title })),
+      getServiceSeo: (id) => serviceSeoFrom(approved().find((item) => item.id === id)),
+    });
+    app.get('*', sendSpa);
+    const { url, close } = await listen(app);
+    try {
+      const xml = await (await fetch(`${url}/sitemap.xml`)).text();
+      assert.match(xml, /\/service\/lst-approved/);
+      assert.doesNotMatch(xml, /lst-rejected/);
+
+      const ok = await (await fetch(`${url}/service/lst-approved`)).text();
+      assert.match(ok, /<title>قهوة المورد المعتمد \| يوصل<\/title>/);
+      assert.match(ok, /og:image" content="https:\/\/usil\.app\/uploads\/listing-lst-approved\.jpg"/);
+
+      const rejected = await (await fetch(`${url}/service/lst-rejected`)).text();
+      assert.doesNotMatch(rejected, /المورد المرفوض/);
+      assert.match(rejected, /<title>يوصل \| سوق توريد المناسبات في السعودية<\/title>/);
+    } finally {
+      await close();
+    }
   });
 
   it('adds AI crawler allows and a sitemap line without dropping admin robots rules', () => {

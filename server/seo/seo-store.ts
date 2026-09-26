@@ -248,6 +248,65 @@ export function sanitizeSeoSettings(input: unknown, previous?: SeoSettings): Seo
   };
 }
 
+const SEO_STRING_FIELDS = [
+  'title',
+  'titleEn',
+  'description',
+  'descriptionEn',
+  'keywords',
+  'keywordsEn',
+  'ogTitle',
+  'ogDescription',
+  'ogImage',
+  'ogSiteName',
+  'twitterTitle',
+  'twitterDescription',
+  'twitterImage',
+  'canonicalBaseUrl',
+  'robotsTxt',
+  'googleSiteVerification',
+  'googleHtmlFileToken',
+  'analyticsId',
+] as const;
+const SEO_PAGE_FIELDS = ['title', 'titleEn', 'description', 'descriptionEn'] as const;
+
+export type SeoPatch = Partial<Omit<SeoSettings, 'pages' | 'updatedAt'>> & {
+  pages?: Partial<Record<SeoPageKey, Partial<SeoPageOverride>>>;
+};
+
+/**
+ * The recognised, well-typed fields of an admin SEO update — nothing else.
+ * Missing fields are left out (so saving never resets them), and a body with
+ * no usable field returns null so the route can answer 400.
+ */
+export function pickSeoPatch(input: unknown): SeoPatch | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const row = input as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const key of SEO_STRING_FIELDS) {
+    if (typeof row[key] === 'string') patch[key] = row[key];
+  }
+  if (row.twitterCard === 'summary' || row.twitterCard === 'summary_large_image') {
+    patch.twitterCard = row.twitterCard;
+  }
+  if (row.pages && typeof row.pages === 'object' && !Array.isArray(row.pages)) {
+    const pagesIn = row.pages as Record<string, unknown>;
+    const pages: Record<string, Record<string, string>> = {};
+    for (const key of SEO_PAGE_KEYS) {
+      const page = pagesIn[key];
+      if (!page || typeof page !== 'object' || Array.isArray(page)) continue;
+      const fields: Record<string, string> = {};
+      for (const field of SEO_PAGE_FIELDS) {
+        const value = (page as Record<string, unknown>)[field];
+        if (typeof value === 'string') fields[field] = value;
+      }
+      if (Object.keys(fields).length > 0) pages[key] = fields;
+    }
+    if (Object.keys(pages).length > 0) patch.pages = pages;
+  }
+  return Object.keys(patch).length > 0 ? (patch as SeoPatch) : null;
+}
+
 export function pathToPageKey(pathname: string): SeoPageKey {
   const path = pathname.replace(/\/$/, '') || '/';
   if (path === '/' || path === '' || path === '/ai-studio' || path === '/ai-packages') return 'home';
@@ -305,10 +364,36 @@ export function createSeoStore(dataDir: string) {
     return current;
   }
 
+  /**
+   * Apply an admin update. Only the fields present in `input` change on disk;
+   * every other stored value is written back exactly as it was, so a partial
+   * save cannot silently rewrite unrelated settings (e.g. the share images).
+   */
   function save(input: unknown): SeoSettings {
-    const next = sanitizeSeoSettings(input, readFile());
-    writeFile(next);
-    return next;
+    const patch = pickSeoPatch(input);
+    if (!patch) return readFile();
+    const raw = readJsonFile<unknown>(file, null);
+    const stored = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+    const previous = stored ? sanitizeSeoSettings(stored) : defaultSeoSettings();
+    const patched = sanitizeSeoSettings(patch, previous);
+
+    const next: Record<string, unknown> = stored ? { ...stored } : { ...patched };
+    for (const key of Object.keys(patch) as Array<keyof SeoPatch>) {
+      if (key === 'pages') continue;
+      next[key] = patched[key];
+    }
+    if (patch.pages) {
+      const storedPages =
+        stored?.pages && typeof stored.pages === 'object' && !Array.isArray(stored.pages)
+          ? (stored.pages as Record<string, unknown>)
+          : {};
+      const pages: Record<string, unknown> = { ...storedPages };
+      for (const key of Object.keys(patch.pages) as SeoPageKey[]) pages[key] = patched.pages[key];
+      next.pages = pages;
+    }
+    next.updatedAt = patched.updatedAt;
+    writeFile(next as SeoSettings);
+    return sanitizeSeoSettings(next);
   }
 
   return { file, load, save };

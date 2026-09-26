@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from 'express';
-import { createSupportStore, validateSupportMessage } from './support-store.ts';
+import { createSupportStore, isSupportStatus, validateSupportMessage } from './support-store.ts';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards.ts';
 
 type AuthApi = {
@@ -36,6 +36,16 @@ export function registerSupportRoutes(app: Express, auth: AuthApi, dataDir: stri
 
   app.get('/api/admin/support-messages', auth.requireRole(['admin']), (_req: Request, res: Response) => {
     res.json({ success: true, data: store.list() });
+  });
+
+  app.patch('/api/admin/support-messages/:id', auth.requireRole(['admin']), (req: Request, res: Response) => {
+    const status = req.body?.status;
+    if (!isSupportStatus(status)) {
+      return res.status(400).json({ success: false, error: 'حالة الرسالة غير صالحة.' });
+    }
+    const row = store.setStatus(String(req.params.id), status);
+    if (!row) return res.status(404).json({ success: false, error: 'الرسالة غير موجودة.' });
+    res.json({ success: true, message: row });
   });
 
   return store;

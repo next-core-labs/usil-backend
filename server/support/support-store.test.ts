@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { createSupportStore, validateSupportMessage } from './support-store.ts';
+import { createSupportStore, isSupportStatus, validateSupportMessage } from './support-store.ts';
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-support-'));
@@ -52,5 +52,40 @@ describe('support store', () => {
     const row = store.add({ name: 'نواف', email: 'a@usil.sa', phone: '', message: 'مرحبا' });
     assert.match(row.id, /^sup-\d+$/);
     assert.ok(!Number.isNaN(Date.parse(row.createdAt)));
+  });
+
+  it('reads new rows and pre-status rows as new', () => {
+    const dir = tmpDir();
+    fs.writeFileSync(
+      path.join(dir, 'support-messages.json'),
+      JSON.stringify([{ id: 'sup-1', name: 'قديم', email: 'a@usil.sa', phone: '', message: 'x', createdAt: '2026-01-01T00:00:00.000Z' }]),
+    );
+    const store = createSupportStore(dir);
+    const row = store.add({ name: 'جديد', email: '', phone: '0512345678', message: 'y' });
+    assert.equal(row.status, 'new');
+    assert.deepEqual(store.list().map((item) => item.status), ['new', 'new']);
+  });
+
+  it('updates the status of one message and persists it', () => {
+    const dir = tmpDir();
+    const store = createSupportStore(dir);
+    const first = store.add({ name: 'أول', email: 'a@usil.sa', phone: '', message: 'أ' });
+    const second = store.add({ name: 'ثاني', email: '', phone: '0512345678', message: 'ب' });
+
+    const updated = store.setStatus(first.id, 'replied');
+    assert.equal(updated?.status, 'replied');
+    assert.ok(updated?.updatedAt);
+
+    const reread = createSupportStore(dir).list();
+    assert.equal(reread.find((item) => item.id === first.id)?.status, 'replied');
+    assert.equal(reread.find((item) => item.id === second.id)?.status, 'new');
+  });
+
+  it('returns null for an unknown id and rejects unknown statuses', () => {
+    const store = createSupportStore(tmpDir());
+    assert.equal(store.setStatus('sup-missing', 'closed'), null);
+    assert.equal(isSupportStatus('closed'), true);
+    assert.equal(isSupportStatus('deleted'), false);
+    assert.equal(isSupportStatus(undefined), false);
   });
 });

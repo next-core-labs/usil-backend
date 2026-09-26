@@ -68,4 +68,14 @@ describe('external-bookings', () => {
     assert.equal(store.remove(created.id), true);
     assert.equal(store.remove(created.id), false);
   });
+
+  it('refuses an unknown status instead of resetting it to جديد', () => {
+    const store = createExternalBookingStore(tmpDir());
+    const created = store.create({ ...base, status: 'منفّذ' }, 'usr-courier');
+    assert.throws(() => store.update(created.id, { status: 'complete' }), /حالة الحجز غير صحيحة/);
+    assert.throws(() => store.update(created.id, { status: '' }), /حالة الحجز غير صحيحة/);
+    assert.equal(store.findById(created.id)?.status, 'منفّذ');
+    assert.throws(() => validateExternalBooking({ ...base, status: 'new' }), /حالة الحجز غير صحيحة/);
+    assert.equal(validateExternalBooking({ ...base }).status, 'جديد');
+  });
 });

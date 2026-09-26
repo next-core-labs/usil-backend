@@ -33,11 +33,28 @@ describe('booking-guards', () => {
     assert.equal(limiter.allow('1.2.3.4', t0 + 60_001), true);
   });
 
-  it('reads client IP from X-Forwarded-For without inventing a captcha', () => {
-    assert.equal(
-      clientIp({ headers: { 'x-forwarded-for': '10.1.2.3, 10.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } }),
-      '10.1.2.3',
-    );
-    assert.equal(clientIp({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }), '127.0.0.1');
+  it('never trusts a raw X-Forwarded-For — falls back to the TCP peer', () => {
+    const spoofed = { headers: { 'x-forwarded-for': '10.1.2.3, 10.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } };
+    assert.equal(clientIp(spoofed, {}), '127.0.0.1');
+    assert.equal(clientIp(spoofed, { NODE_ENV: 'production' }), '127.0.0.1');
+    assert.equal(clientIp({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }, {}), '127.0.0.1');
+    assert.equal(clientIp({ headers: {} }, {}), 'unknown');
+  });
+
+  it('uses cf-connecting-ip by default in production only', () => {
+    const req = { headers: { 'cf-connecting-ip': '198.51.100.7' }, socket: { remoteAddress: '172.18.0.2' } };
+    assert.equal(clientIp(req, { NODE_ENV: 'production' }), '198.51.100.7');
+    assert.equal(clientIp(req, { NODE_ENV: 'development' }), '172.18.0.2');
+    assert.equal(clientIp({ headers: {}, socket: { remoteAddress: '172.18.0.2' } }, { NODE_ENV: 'production' }), '172.18.0.2');
+  });
+
+  it('reads the header named by CLIENT_IP_HEADER (first value)', () => {
+    const req = {
+      headers: { 'x-real-ip': '203.0.113.5, 10.0.0.1', 'cf-connecting-ip': '198.51.100.7' },
+      socket: { remoteAddress: '127.0.0.1' },
+    };
+    assert.equal(clientIp(req, { CLIENT_IP_HEADER: 'X-Real-IP' }), '203.0.113.5');
+    assert.equal(clientIp(req, { CLIENT_IP_HEADER: 'x-real-ip', NODE_ENV: 'production' }), '203.0.113.5');
+    assert.equal(clientIp({ headers: {}, socket: { remoteAddress: '127.0.0.1' } }, { CLIENT_IP_HEADER: 'x-real-ip' }), '127.0.0.1');
   });
 });

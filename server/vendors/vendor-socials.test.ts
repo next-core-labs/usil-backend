@@ -5,6 +5,8 @@ import {
   setSocialVerification,
   normalizeSaudiWhatsApp,
   publicSocials,
+  isSafeSocialUrl,
+  sanitizeSocials,
   SOCIAL_NETWORKS,
 } from './vendor-socials.ts';
 
@@ -91,6 +93,32 @@ describe('vendor-socials', () => {
     const socials = parseVendorSocials({ instagram: '@ab', confirmedOwn: true });
     assert.equal(publicSocials(socials).length, 1);
     assert.equal(publicSocials(emptyLike()).length, 0);
+  });
+
+  it('only treats http(s) URLs on the network own domains as safe', () => {
+    assert.equal(isSafeSocialUrl('instagram', 'https://www.instagram.com/usil'), true);
+    assert.equal(isSafeSocialUrl('instagram', 'javascript:alert(1)'), false);
+    assert.equal(isSafeSocialUrl('instagram', 'javascript://instagram.com/%0aalert(1)'), false);
+    assert.equal(isSafeSocialUrl('instagram', 'https://instagram.com.evil.sa/usil'), false);
+    assert.equal(isSafeSocialUrl('x', 'https://instagram.com/usil'), false);
+    assert.equal(isSafeSocialUrl('whatsapp', 'https://wa.me/966500000000'), true);
+    assert.throws(() => parseVendorSocials({ instagram: 'https-evil://instagram.com/usil' }));
+  });
+
+  it('sanitizes stored socials: unsafe links dropped, verified only with an admin stamp', () => {
+    const now = new Date().toISOString();
+    const clean = sanitizeSocials({
+      confirmedOwn: true,
+      links: [
+        { network: 'instagram', handle: 'a', url: 'javascript:alert(1)', status: 'verified', confirmedOwn: true, updatedAt: now },
+        { network: 'x', handle: 'b', url: 'https://x.com/b', status: 'verified', confirmedOwn: false, updatedAt: now },
+        { network: 'tiktok', handle: 'c', url: 'https://www.tiktok.com/@c', status: 'verified', confirmedOwn: true, updatedAt: now, verifiedAt: now, verifiedBy: 'إدارة يوصل' },
+      ],
+    });
+    assert.deepEqual(clean.links.map((link) => [link.network, link.status]), [
+      ['x', 'pending'],
+      ['tiktok', 'verified'],
+    ]);
   });
 });
 

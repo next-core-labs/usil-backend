@@ -1,12 +1,11 @@
 import type { Express, Request, Response } from 'express';
-import { createVendorStore } from './vendor-store';
+import { createVendorStore, VendorStoreError } from './vendor-store';
 import { enrichVendorServices } from '../../core/data/saudiMarket';
 import { isPublicMarketplaceListing } from '../../core/utils/catalogMedia';
 import { createVendorApplicationStore } from './vendor-applications';
 import {
   SOCIAL_NETWORKS,
   emptyVendorSocials,
-  publicSocials,
   type SocialNetwork,
   type VendorSocials,
 } from './vendor-socials';
@@ -26,6 +25,14 @@ type AuthApi = {
   listVendorUsers?: () => PublicUser[];
 };
 
+function statusOf(error: unknown): number {
+  return error instanceof VendorStoreError ? error.status : 400;
+}
+
+function messageOf(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 function vendorIdFrom(req: Request): string | null {
   const user = (req as Request & { user?: { id: string; role: string } }).user;
   if (!user) return null;
@@ -40,10 +47,26 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   const applications = createVendorApplicationStore(dataDir);
   const guard = auth.requireRole(['vendor', 'admin']);
 
+  /** Vendor-typed handles/URLs — always re-parsed, verification never taken from the body. */
   function persistSocials(vendorId: string, socials: unknown) {
     const saved = store.saveSocials(vendorId, socials);
     auth.saveUserSocials?.(vendorId, saved);
     return saved;
+  }
+
+  /** Admin-reviewed socials copied across from an application. */
+  function syncReviewedSocials(vendorId: string, socials: VendorSocials) {
+    const saved = store.replaceSocials(vendorId, socials);
+    auth.saveUserSocials?.(vendorId, saved);
+    return saved;
+  }
+
+  /** The application behind a public vendor id, so the public file can fall back to it. */
+  function publicVendor(id: string) {
+    const vendors = auth.listVendorUsers?.() || [];
+    const user = vendors.find((item) => item.id === id);
+    const application = user ? applications.findByEmail(user.email) : applications.findById(id);
+    return { vendorId: user?.id, application };
   }
 
   app.get('/api/vendor/workspace', guard, (req: Request, res: Response) => {
@@ -55,8 +78,13 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   app.put('/api/vendor/workspace', guard, (req: Request, res: Response) => {
     const vendorId = vendorIdFrom(req);
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-    const saved = store.saveWorkspace(vendorId, req.body || {});
-    res.json({ success: true, data: saved });
+    try {
+      const user = auth.userFromRequest(req);
+      const saved = store.saveVendorWorkspace(vendorId, req.body || {}, user?.name);
+      res.json({ success: true, data: saved });
+    } catch (error) {
+      res.status(statusOf(error)).json({ success: false, error: messageOf(error, 'تعذر حفظ مساحة المورّد') });
+    }
   });
 
   app.get('/api/vendor/summary', guard, (req: Request, res: Response) => {
@@ -72,16 +100,20 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       const booking = store.addBooking(vendorId, req.body || {});
       res.status(201).json({ success: true, booking });
     } catch (error) {
-      res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'تعذر إنشاء الحجز' });
+      res.status(statusOf(error)).json({ success: false, error: messageOf(error, 'تعذر إنشاء الحجز') });
     }
   });
 
   app.patch('/api/vendor/bookings/:id', guard, (req: Request, res: Response) => {
     const vendorId = vendorIdFrom(req);
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-    const booking = store.updateBooking(vendorId, req.params.id, req.body || {});
-    if (!booking) return res.status(404).json({ success: false, error: 'الحجز غير موجود' });
-    res.json({ success: true, booking });
+    try {
+      const booking = store.updateBooking(vendorId, req.params.id, req.body || {});
+      if (!booking) return res.status(404).json({ success: false, error: 'الحجز غير موجود' });
+      res.json({ success: true, booking });
+    } catch (error) {
+      res.status(statusOf(error)).json({ success: false, error: messageOf(error, 'تعذر تعديل الحجز') });
+    }
   });
 
   app.delete('/api/vendor/bookings/:id', guard, (req: Request, res: Response) => {
@@ -96,10 +128,10 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     const vendorId = vendorIdFrom(req);
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
     try {
-      const row = store.addBlockedDate(vendorId, req.body || {});
-      res.status(201).json({ success: true, blockedDate: row });
+      const { blockedDate, created } = store.blockDate(vendorId, req.body || {});
+      res.status(created ? 201 : 200).json({ success: true, blockedDate, created });
     } catch (error) {
-      res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'تعذر الإغلاق' });
+      res.status(statusOf(error)).json({ success: false, error: messageOf(error, 'تعذر الإغلاق') });
     }
   });
 
@@ -123,13 +155,7 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   });
 
   app.get('/api/vendors/:id', (req: Request, res: Response) => {
-    const id = String(req.params.id || '');
-    const vendors = auth.listVendorUsers?.() || [];
-    const user = vendors.find((item) => item.id === id);
-    const application = user
-      ? applications.findByEmail(user.email)
-      : applications.findById(id);
-    const vendorId = user?.id;
+    const { vendorId, application } = publicVendor(String(req.params.id || ''));
     if (!vendorId) {
       return res.status(404).json({ success: false, error: 'المورد غير موجود أو لم يُعتمد بعد' });
     }
@@ -171,12 +197,15 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   });
 
   app.get('/api/vendors/:id/socials', (req: Request, res: Response) => {
-    const socials = store.getSocials(req.params.id);
+    // Same gate as GET /api/vendors/:id: only an approved vendor account is public.
+    const { vendorId, application } = publicVendor(String(req.params.id || ''));
+    const isPublic = Boolean(vendorId) && (!application || application.status === 'approved');
+    const socials = isPublic && vendorId ? store.getPublicSocials(vendorId, application) : [];
     res.json({
       success: true,
-      data: publicSocials(socials),
-      empty: !publicSocials(socials).length,
-      message: publicSocials(socials).length ? undefined : 'المورد ما ربط حسابات بعد',
+      data: socials,
+      empty: !socials.length,
+      message: socials.length ? undefined : 'المورد ما ربط حسابات بعد',
     });
   });
 
@@ -194,9 +223,9 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       const listing = store.addListing(vendorId, req.body || {}, (user as { name?: string } | null)?.name);
       res.status(201).json({ success: true, listing });
     } catch (error) {
-      res.status(400).json({
+      res.status(statusOf(error)).json({
         success: false,
-        error: error instanceof Error ? error.message : 'تعذر حفظ المنتج',
+        error: messageOf(error, 'تعذر حفظ المنتج'),
       });
     }
   });
@@ -215,9 +244,9 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       if (!listing) return res.status(404).json({ success: false, error: 'المنتج غير موجود' });
       res.json({ success: true, listing });
     } catch (error) {
-      res.status(400).json({
+      res.status(statusOf(error)).json({
         success: false,
-        error: error instanceof Error ? error.message : 'تعذر تعديل المنتج',
+        error: messageOf(error, 'تعذر تعديل المنتج'),
       });
     }
   });
@@ -313,7 +342,7 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       if (!row) throw new Error('الطلب غير موجود');
       const user = auth.findUserByEmail?.(row.email);
       if (user) {
-        persistSocials(user.id, row.socials || emptyVendorSocials());
+        syncReviewedSocials(user.id, row.socials || emptyVendorSocials());
       }
       return row.socials;
     }
@@ -366,9 +395,9 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       if (!listing) return res.status(404).json({ success: false, error: 'المنتج غير موجود' });
       res.json({ success: true, listing });
     } catch (error) {
-      res.status(400).json({
+      res.status(statusOf(error)).json({
         success: false,
-        error: error instanceof Error ? error.message : 'تعذر تعديل مسار المنتج',
+        error: messageOf(error, 'تعذر تعديل مسار المنتج'),
       });
     }
   });

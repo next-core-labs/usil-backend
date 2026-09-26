@@ -13,16 +13,42 @@ export function isValidSaudiMobile(raw: string): boolean {
   return normalizeSaudiMobile(raw) !== null;
 }
 
-export function clientIp(req: {
-  headers?: Record<string, unknown>;
-  ip?: string;
-  socket?: { remoteAddress?: string };
-}): string {
-  const forwarded = String(req.headers?.['x-forwarded-for'] || '')
+type ClientIpEnv = { CLIENT_IP_HEADER?: string; NODE_ENV?: string };
+
+function runtimeEnv(): ClientIpEnv {
+  const proc = (globalThis as { process?: { env?: ClientIpEnv } }).process;
+  return proc?.env || {};
+}
+
+function firstHeaderValue(value: unknown): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return String(raw || '')
     .split(',')[0]
     .trim();
-  if (forwarded) return forwarded;
-  if (req.ip) return req.ip;
+}
+
+/**
+ * The caller's IP, for rate-limit keys. Production runs Cloudflare → Caddy →
+ * node, so the raw `X-Forwarded-For` is caller-controlled and never read here —
+ * trusting it let anyone reset their rate-limit budget per request.
+ *
+ * - `CLIENT_IP_HEADER` set: that header (first value), e.g. `cf-connecting-ip`.
+ * - otherwise in production: `cf-connecting-ip`, which Cloudflare overwrites.
+ * - fallback: the TCP peer (`socket.remoteAddress`).
+ */
+export function clientIp(
+  req: {
+    headers?: Record<string, unknown>;
+    socket?: { remoteAddress?: string };
+  },
+  env: ClientIpEnv = runtimeEnv(),
+): string {
+  const configured = String(env.CLIENT_IP_HEADER || '').trim().toLowerCase();
+  const header = configured || (env.NODE_ENV === 'production' ? 'cf-connecting-ip' : '');
+  if (header) {
+    const value = firstHeaderValue(req.headers?.[header]);
+    if (value) return value;
+  }
   return req.socket?.remoteAddress || 'unknown';
 }
 

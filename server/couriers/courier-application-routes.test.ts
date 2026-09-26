@@ -36,6 +36,44 @@ function fakeAuth(role: 'admin' | 'vendor' | null) {
   };
 }
 
+/** Admin on /api/admin routes, and the given applicant (or a guest) on the public apply route. */
+function adminWithApplicant(applicant: Record<string, unknown> | null = null) {
+  const base = fakeAuth('admin');
+  return {
+    ...base,
+    userFromRequest: (req: Request) => (req.path.startsWith('/api/admin') ? base.userFromRequest() : applicant),
+  };
+}
+
+function writeUsers(dir: string, users: Array<Record<string, unknown>>) {
+  fs.writeFileSync(path.join(dir, 'users.json'), JSON.stringify(users));
+}
+
+function readUsers(dir: string): Array<{ id: string; role: string }> {
+  return JSON.parse(fs.readFileSync(path.join(dir, 'users.json'), 'utf-8'));
+}
+
+async function applyAndApprove(dir: string, auth: unknown, body: Record<string, unknown>) {
+  resetCourierApplyLimiter();
+  const app = express();
+  app.use(express.json());
+  registerCourierApplicationRoutes(app, auth as any, dir);
+  const { url, close } = await listen(app);
+  try {
+    const created = await fetch(`${url}/api/couriers/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const createdJson = await created.json();
+    assert.equal(created.status, 201, JSON.stringify(createdJson));
+    const approved = await fetch(`${url}/api/admin/couriers/${createdJson.application.id}/approve`, { method: 'POST' });
+    return { created: createdJson, status: approved.status, json: await approved.json() };
+  } finally {
+    await close();
+  }
+}
+
 const payload = {
   firstName: 'سعد',
   familyName: 'الدوسري',
@@ -85,6 +123,89 @@ describe('courier-application-routes', () => {
     const approved = await fetch(`${url}/api/admin/couriers/${id}/approve`, { method: 'POST' });
     assert.equal(approved.status, 200);
     assert.equal((await approved.json()).application.status, 'approved');
+    await close();
+  });
+
+  it('never links a guest application to an account by its typed email or phone', async () => {
+    const dir = tmpDir();
+    writeUsers(dir, [
+      { id: 'usr-1', email: 'saad@gmail.com', phone: '0551112222', role: 'client', name: 'سعد' },
+    ]);
+    const byEmail = await applyAndApprove(dir, adminWithApplicant(), { ...payload, email: 'Saad@Gmail.com' });
+    assert.equal(byEmail.status, 200);
+    assert.equal(byEmail.json.application.status, 'approved');
+    assert.equal(byEmail.json.account.status, 'not_linked');
+    assert.equal(byEmail.json.accountLinked, false);
+    assert.match(byEmail.json.message, /يلزم إنشاء حساب/);
+
+    const byPhone = await applyAndApprove(dir, adminWithApplicant(), {
+      ...payload,
+      nationalId: '1077123456',
+      phone: '+966 55 111 2222',
+    });
+    assert.equal(byPhone.json.account.status, 'not_linked');
+    assert.equal(readUsers(dir)[0].role, 'client');
+  });
+
+  it('promotes the signed-in applicant account on approval', async () => {
+    const dir = tmpDir();
+    writeUsers(dir, [
+      { id: 'usr-9', email: 'me@gmail.com', phone: '0559990000', role: 'client', name: 'أنا' },
+      { id: 'usr-2', email: 'other@gmail.com', phone: '0553334444', role: 'client', name: 'آخر' },
+    ]);
+    const applicant = { id: 'usr-9', email: 'me@gmail.com', phone: '0559990000', role: 'client', name: 'أنا' };
+    // A typed email naming someone else is ignored for a signed-in applicant too.
+    const result = await applyAndApprove(dir, adminWithApplicant(applicant), { ...payload, email: 'other@gmail.com' });
+    assert.equal(result.created.application.email, 'me@gmail.com');
+    assert.equal(result.json.account.status, 'promoted');
+    assert.equal(result.json.account.userId, 'usr-9');
+    assert.equal(result.json.accountLinked, true);
+    const users = readUsers(dir);
+    assert.equal(users.find((row) => row.id === 'usr-9')?.role, 'courier');
+    assert.equal(users.find((row) => row.id === 'usr-2')?.role, 'client');
+  });
+
+  for (const role of ['admin', 'accounts_manager', 'vendor']) {
+    it(`never changes a ${role} account and reports it`, async () => {
+      const dir = tmpDir();
+      const staff = { id: 'usr-x', email: 'staff@gmail.com', phone: '0551112222', role, name: 'موظف' };
+      writeUsers(dir, [staff]);
+      const result = await applyAndApprove(dir, adminWithApplicant(staff), payload);
+      assert.equal(result.status, 200);
+      assert.equal(result.json.application.status, 'approved');
+      assert.equal(result.json.account.status, 'protected_role');
+      assert.equal(result.json.account.role, role);
+      assert.equal(result.json.accountLinked, false);
+      assert.match(result.json.message, /لم نغيّر دوره/);
+      assert.equal(readUsers(dir)[0].role, role);
+    });
+  }
+
+  it('keeps the approval and says an account is needed when the applicant account is gone', async () => {
+    const dir = tmpDir();
+    writeUsers(dir, []);
+    const ghost = { id: 'usr-gone', email: 'gone@gmail.com', phone: '0551112222', role: 'client', name: 'س' };
+    const result = await applyAndApprove(dir, adminWithApplicant(ghost), payload);
+    assert.equal(result.status, 200);
+    assert.equal(result.json.application.status, 'approved');
+    assert.equal(result.json.account.status, 'not_found');
+    assert.match(result.json.message, /يلزم إنشاء حساب/);
+  });
+
+  it('rejects an invalid applicant email or phone', async () => {
+    resetCourierApplyLimiter();
+    const app = express();
+    app.use(express.json());
+    registerCourierApplicationRoutes(app, adminWithApplicant() as any, tmpDir());
+    const { url, close } = await listen(app);
+    for (const extra of [{ email: 'not-an-email' }, { phone: '12345' }]) {
+      const res = await fetch(`${url}/api/couriers/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, ...extra }),
+      });
+      assert.equal(res.status, 400);
+    }
     await close();
   });
 

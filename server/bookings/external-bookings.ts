@@ -126,7 +126,14 @@ export function validateExternalBooking(input: ExternalBookingInput) {
     throw new Error('اكتب المبلغ المتفق عليه بالريال');
   }
 
-  const status = isExternalBookingStatus(input.status) ? input.status : 'جديد';
+  // Missing means a new booking; anything else must be one of the known states.
+  // Never fall back silently — that let a typo wipe an existing booking's status.
+  const statusRaw = input.status;
+  const statusMissing = statusRaw === undefined || statusRaw === null || String(statusRaw).trim() === '';
+  if (!statusMissing && !isExternalBookingStatus(statusRaw)) {
+    throw new Error(`حالة الحجز غير صحيحة — اختر: ${EXTERNAL_BOOKING_STATUSES.join('، ')}`);
+  }
+  const status: ExternalBookingStatus = statusMissing ? 'جديد' : (statusRaw as ExternalBookingStatus);
 
   return {
     courierId,
@@ -186,9 +193,14 @@ export function createExternalBookingStore(dataDir: string) {
     const rows = readAll();
     const row = rows.find((item) => item.id === id);
     if (!row) return null;
+    const changes = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined));
+    // An explicit empty status in a patch is not a request to reset it.
+    if ('status' in changes && (changes.status === null || String(changes.status).trim() === '')) {
+      throw new Error(`حالة الحجز غير صحيحة — اختر: ${EXTERNAL_BOOKING_STATUSES.join('، ')}`);
+    }
     const merged = validateExternalBooking({
       ...row,
-      ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)),
+      ...changes,
       courierId: row.courierId,
       courierName: row.courierName,
     });

@@ -1,6 +1,7 @@
 import path from 'path';
 import { isValidNationalId } from '../vendors/vendor-applications';
 import { readJsonArray, writeJsonFile } from '../shared/json-file.ts';
+import { normalizeSaudiMobile } from '../shared/booking-guards';
 import {
   parseCourierProducts,
   parseFulfillmentLanes,
@@ -25,6 +26,11 @@ export type CourierApplication = {
   carTypeOther?: string;
   fulfillment: ListingFulfillmentLane[];
   products: CourierProductLine[];
+  /** Contact details for the admin. Never used to pick an account. */
+  email?: string;
+  phone?: string;
+  /** The account signed in when the application was filed; approval promotes only this one. */
+  applicantUserId?: string;
   status: CourierApplicationStatus;
   createdAt: string;
   reviewedAt?: string;
@@ -42,7 +48,11 @@ export type CourierApplicationInput = {
   carTypeOther?: string;
   fulfillment?: unknown;
   products?: unknown;
+  email?: string;
+  phone?: string;
 };
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function maskNationalId(raw: string): string {
   const digits = String(raw || '').replace(/\D/g, '');
@@ -104,6 +114,11 @@ export function validateCourierApplication(input: Partial<CourierApplicationInpu
   if (!isValidSaudiPlateNumbers(plateNumbers)) {
     throw new Error('رقم اللوحة يجب أن يكون من رقم إلى أربعة أرقام');
   }
+  const email = String(input.email || '').trim().toLowerCase() || undefined;
+  if (email && (email.length > 254 || !EMAIL_RE.test(email))) throw new Error('البريد الإلكتروني غير صحيح');
+  const rawPhone = String(input.phone || '').trim();
+  const phone = rawPhone ? normalizeSaudiMobile(rawPhone) : undefined;
+  if (phone === null) throw new Error('رقم الجوال غير صحيح — اكتبه بصيغة 05xxxxxxxx');
   const resolvedType = resolvedCarType(carType, input.carTypeOther);
   const carTypeOther = String(input.carTypeOther || '').trim() || undefined;
   const fulfillment = parseFulfillmentLanes(
@@ -124,6 +139,8 @@ export function validateCourierApplication(input: Partial<CourierApplicationInpu
     carTypeOther,
     fulfillment,
     products,
+    email,
+    phone,
   };
 }
 
@@ -154,7 +171,7 @@ export function createCourierApplicationStore(dataDir: string) {
     return readAll().find((row) => row.id === id) || null;
   }
 
-  function submit(input: CourierApplicationInput): CourierApplication {
+  function submit(input: CourierApplicationInput, opts: { applicantUserId?: string } = {}): CourierApplication {
     const clean = validateCourierApplication(input);
     const existing = findByNationalId(clean.nationalId);
     if (existing?.status === 'pending') {
@@ -174,6 +191,9 @@ export function createCourierApplicationStore(dataDir: string) {
       carTypeOther: clean.carTypeOther,
       fulfillment: clean.fulfillment,
       products: clean.products,
+      ...(clean.email ? { email: clean.email } : {}),
+      ...(clean.phone ? { phone: clean.phone } : {}),
+      ...(opts.applicantUserId ? { applicantUserId: opts.applicantUserId } : {}),
       status: 'pending',
       createdAt: new Date().toISOString(),
     };

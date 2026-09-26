@@ -1,0 +1,43 @@
+# Render Blueprint — New → Blueprint → pick this repo. See deploy/render.md.
+services:
+  - type: web
+    name: usil
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    branch: main
+    region: frankfurt
+    # a persistent disk needs a paid instance, and pins the service to one instance
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /api/health
+    disk:
+      name: usil-data
+      mountPath: /app/data
+      sizeGB: 1
+    domains:
+      - usil.app
+      # Moyasar webhooks — DNS only (grey cloud) in Cloudflare, see deploy/render.md
+      - hooks.usil.app
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PUBLIC_SITE_URL
+        value: https://usil.app
+      - key: APP_URL
+        value: https://usil.app
+      - key: MOYASAR_WEBHOOK_URL
+        value: https://hooks.usil.app/api/payments/webhook
+      - key: FRONTEND_REF
+        value: main
+      # read-only token for next-core-labs/usil-frontend, used only while building
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: MOYASAR_SECRET_KEY
+        sync: false
+      - key: MOYASAR_PUBLISHABLE_KEY
+        sync: false
+      - key: MOYASAR_WEBHOOK_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
