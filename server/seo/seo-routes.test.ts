@@ -350,6 +350,30 @@ describe('seo-routes', () => {
     }
   });
 
+  it('lists public vendor pages in the sitemap with the same rule as /api/vendors/:id', async () => {
+    const dir = tmpDir();
+    seedApprovedAndRejected(dir);
+    // The vendor role is what makes a vendor public, even with a rejected later application.
+    const users = JSON.parse(fs.readFileSync(path.join(dir, 'users.json'), 'utf-8'));
+    users.push({ id: 'usr-vendor-rejected', email: 'gone@vendor.sa', name: 'مرفوض', role: 'vendor' });
+    fs.writeFileSync(path.join(dir, 'users.json'), JSON.stringify(users));
+    fs.writeFileSync(
+      path.join(dir, 'vendor-applications.json'),
+      JSON.stringify([{ id: 'vap-gone', email: 'gone@vendor.sa', status: 'rejected' }]),
+    );
+    const app = express();
+    registerSeoRoutes(app, fakeAuth(null) as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      const xml = await (await fetch(`${url}/sitemap.xml`)).text();
+      assert.match(xml, /<loc>https:\/\/usil\.app\/vendor\/usr-approved<\/loc>/);
+      assert.doesNotMatch(xml, /\/vendor\/usr-rejected/);
+      assert.match(xml, /\/vendor\/usr-vendor-rejected/);
+    } finally {
+      await close();
+    }
+  });
+
   it('adds AI crawler allows and a sitemap line without dropping admin robots rules', () => {
     const merged = mergeRobotsTxt('User-agent: *\nAllow: /\nDisallow: /api/\n', 'https://usil.app');
     assert.match(merged, /User-agent: \*/);

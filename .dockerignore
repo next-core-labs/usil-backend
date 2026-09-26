@@ -2,6 +2,7 @@ node_modules
 .git
 data
 dist
+build
 .env
 .env.production.local
 **/*.test.ts

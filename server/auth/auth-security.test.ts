@@ -196,6 +196,22 @@ describe('admin user management — contact validation', () => {
   });
 });
 
+describe('admin user management — password minimum', () => {
+  it('create and edit both refuse passwords under 8 characters', async () => {
+    const { url, close, dir } = await mount();
+    const cookie = await loginAs(url, ADMIN);
+    const created = await call(`${url}/api/admin/users`, 'POST', { name: 'x', email: 'short@usil.sa', phone: '0533333398', password: 'abc1234', role: 'client' }, cookie);
+    assert.equal(created.res.status, 400);
+    const before = readUsers(dir).find((u) => u.id === CLIENT.id)!.passwordHash;
+    const edited = await call(`${url}/api/admin/users/${CLIENT.id}`, 'PATCH', { password: 'abc1234' }, cookie);
+    assert.equal(edited.res.status, 400);
+    assert.equal(readUsers(dir).find((u) => u.id === CLIENT.id)!.passwordHash, before);
+    const ok = await call(`${url}/api/admin/users/${CLIENT.id}`, 'PATCH', { password: 'abcd1234' }, cookie);
+    assert.equal(ok.res.status, 200);
+    await close();
+  });
+});
+
 describe('admin user management — founder protection', () => {
   it('another admin cannot change the founder email, role or password, or delete it', async () => {
     const { url, close, dir } = await mount();
@@ -211,6 +227,25 @@ describe('admin user management — founder protection', () => {
     assert.equal(after.email, FOUNDER_ADMIN_EMAIL);
     assert.equal(after.role, 'admin');
     assert.equal(after.passwordHash, before.passwordHash);
+    await close();
+  });
+
+  it('another admin cannot rename, re-avatar or un-verify the founder either', async () => {
+    const { url, close, dir } = await mount();
+    const cookie = await loginAs(url, ADMIN);
+    const before = readUsers(dir).find((u) => u.id === FOUNDER.id)!;
+    for (const patch of [{ name: 'مخترق' }, { avatarDataUrl: PNG_1PX }, { emailVerified: false }, {}]) {
+      const { res, json } = await call(`${url}/api/admin/users/${FOUNDER.id}`, 'PATCH', patch, cookie);
+      assert.equal(res.status, 403, JSON.stringify(patch));
+      assert.match(String(json.error), /الإدارة الرئيسي/);
+    }
+    assert.deepEqual(readUsers(dir).find((u) => u.id === FOUNDER.id), before);
+
+    const founder = await loginAs(url, FOUNDER);
+    const own = await call(`${url}/api/admin/users/${FOUNDER.id}`, 'PATCH', { name: 'نواف', avatarDataUrl: PNG_1PX }, founder);
+    assert.equal(own.res.status, 200);
+    assert.equal((own.json.user as { name: string }).name, 'نواف');
+    assert.match(String((own.json.user as { avatarUrl: string }).avatarUrl), /\.png$/);
     await close();
   });
 

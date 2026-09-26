@@ -29,6 +29,30 @@ export type MoyasarPayment = {
 
 const MOYASAR_API = 'https://api.moyasar.com/v1';
 
+/** One message for every "no secret key" path, so checkout, callback and lookups agree. */
+export const MOYASAR_NOT_CONFIGURED = 'ميسر غير مفعّل على الخادم حالياً. حاول لاحقاً أو تواصل مع إدارة يوصل.';
+
+/**
+ * Why a Moyasar call failed, so routes pick the status code: `not_configured`
+ * is ours (503), `not_found` is Moyasar's 404, `upstream` is anything else it
+ * or the network got wrong (502). Routes never forward Moyasar's raw text.
+ */
+export type MoyasarFailureCode = 'not_configured' | 'invalid' | 'not_found' | 'upstream';
+export type MoyasarFailure = { ok: false; error: string; code: MoyasarFailureCode };
+
+export class MoyasarError extends Error {
+  readonly code: MoyasarFailureCode;
+  constructor(message: string, code: MoyasarFailureCode) {
+    super(message);
+    this.name = 'MoyasarError';
+    this.code = code;
+  }
+}
+
+export function moyasarErrorCode(error: unknown): MoyasarFailureCode | null {
+  return error instanceof MoyasarError ? error.code : null;
+}
+
 export function moyasarSecretKey(): string {
   return String(
     process.env.MOYASAR_SECRET_KEY ||
@@ -110,7 +134,7 @@ export function isMoyasarCheckoutUrl(url: string): boolean {
 
 function moyasarAuthHeader(): string {
   if (!moyasarConfigured()) {
-    throw new Error('MOYASAR_SECRET_KEY غير مضبوط في متغيرات البيئة');
+    throw new MoyasarError(MOYASAR_NOT_CONFIGURED, 'not_configured');
   }
   return `Basic ${Buffer.from(`${moyasarSecretKey()}:`).toString('base64')}`;
 }
@@ -148,15 +172,15 @@ export async function createInvoice(input: {
   fetchImpl?: typeof fetch;
 }): Promise<MoyasarInvoice> {
   if (!moyasarConfigured()) {
-    throw new Error('MOYASAR_SECRET_KEY غير مضبوط في متغيرات البيئة');
+    throw new MoyasarError(MOYASAR_NOT_CONFIGURED, 'not_configured');
   }
   const amount = sarToHalalas(input.amountSar);
   if (amount < 100) {
-    throw new Error('المبلغ (amount) بالريال مطلوب ولا يقل عن 1');
+    throw new MoyasarError('المبلغ (amount) بالريال مطلوب ولا يقل عن 1', 'invalid');
   }
   const description = String(input.description || '').trim();
   if (!description) {
-    throw new Error('وصف الطلب (description) مطلوب');
+    throw new MoyasarError('وصف الطلب (description) مطلوب', 'invalid');
   }
 
   const fetchImpl = input.fetchImpl || fetch;
@@ -180,13 +204,15 @@ export async function createInvoice(input: {
       }),
     });
   } catch {
-    throw new Error('تعذر الاتصال بميسر. حاول مرة أخرى.');
+    throw new MoyasarError('تعذر الاتصال بميسر. حاول مرة أخرى.', 'upstream');
   }
 
   const data = (await res.json().catch(() => ({}))) as Partial<MoyasarInvoice> & { message?: string };
   const url = String(data.url || '');
   if (!res.ok || !data.id || !isMoyasarCheckoutUrl(url)) {
-    throw new Error(data.message || 'ميسر رفض رابط الدفع. تحقق من المفتاح من لوحة ميسر.');
+    // Moyasar's own text goes to the log, not to the customer.
+    console.warn('[moyasar] invoice refused', res.status, data.message || '');
+    throw new MoyasarError('تعذر إنشاء رابط الدفع من ميسر. حاول بعد قليل.', 'upstream');
   }
 
   return {
@@ -206,7 +232,7 @@ export async function createMoyasarInvoice(input: {
   successPath?: string;
   backPath?: string;
   fetchImpl?: typeof fetch;
-}): Promise<{ ok: true; invoice: MoyasarInvoice } | { ok: false; error: string }> {
+}): Promise<{ ok: true; invoice: MoyasarInvoice } | MoyasarFailure> {
   const site = publicSiteUrl();
   try {
     const invoice = await createInvoice({
@@ -224,11 +250,11 @@ export async function createMoyasarInvoice(input: {
     });
     return { ok: true, invoice };
   } catch (error) {
-    const message = (error as Error).message || 'تعذر إنشاء فاتورة ميسر.';
-    if (message.includes('MOYASAR_SECRET_KEY')) {
-      return { ok: false, error: 'ميسر غير مفعّل على الخادم. أضف MOYASAR_SECRET_KEY ثم أعد المحاولة.' };
-    }
-    return { ok: false, error: message };
+    return {
+      ok: false,
+      error: (error as Error).message || 'تعذر إنشاء فاتورة ميسر.',
+      code: moyasarErrorCode(error) || 'upstream',
+    };
   }
 }
 
@@ -236,13 +262,13 @@ export async function createMoyasarInvoice(input: {
 export async function fetchMoyasarPayment(
   paymentId: string,
   fetchImpl?: typeof fetch,
-): Promise<{ ok: true; payment: MoyasarPayment } | { ok: false; error: string }> {
+): Promise<{ ok: true; payment: MoyasarPayment } | MoyasarFailure> {
   if (!moyasarConfigured()) {
-    return { ok: false, error: 'ميسر غير مفعّل على الخادم.' };
+    return { ok: false, error: MOYASAR_NOT_CONFIGURED, code: 'not_configured' };
   }
   const id = String(paymentId || '').trim();
   if (!isSafeMoyasarId(id)) {
-    return { ok: false, error: 'رقم عملية ميسر غير صالح.' };
+    return { ok: false, error: 'رقم عملية ميسر غير صالح.', code: 'invalid' };
   }
 
   const impl = fetchImpl || fetch;
@@ -252,7 +278,7 @@ export async function fetchMoyasarPayment(
       headers: { Authorization: moyasarAuthHeader() },
     });
   } catch {
-    return { ok: false, error: 'تعذر التحقق من عملية ميسر.' };
+    return { ok: false, error: 'تعذر التحقق من عملية ميسر.', code: 'upstream' };
   }
 
   const data = (await res.json().catch(() => ({}))) as {
@@ -266,13 +292,17 @@ export async function fetchMoyasarPayment(
     source?: { type?: string; company?: string; message?: string | null; transaction_url?: string };
     message?: string;
   };
+  if (res.status === 404) {
+    return { ok: false, error: 'عملية ميسر غير موجودة.', code: 'not_found' };
+  }
   if (!res.ok || !data.id) {
-    return { ok: false, error: data.message || 'عملية ميسر غير موجودة.' };
+    console.warn('[moyasar] payment lookup failed', res.status, data.message || '');
+    return { ok: false, error: 'تعذر التحقق من عملية ميسر.', code: 'upstream' };
   }
 
   const transactionUrl = String(data.source?.transaction_url || '');
   if (transactionUrl && !isMoyasarCheckoutUrl(transactionUrl)) {
-    return { ok: false, error: 'رابط إكمال الدفع من ميسر غير صالح.' };
+    return { ok: false, error: 'رابط إكمال الدفع من ميسر غير صالح.', code: 'upstream' };
   }
 
   const metadata = asMetadata(data.metadata);
@@ -304,7 +334,7 @@ export async function fetchPayment(
   fetchImpl?: typeof fetch,
 ): Promise<MoyasarPayment> {
   const out = await fetchMoyasarPayment(paymentId, fetchImpl);
-  if (out.ok === false) throw new Error(out.error);
+  if (out.ok === false) throw new MoyasarError(out.error, out.code);
   return out.payment;
 }
 
@@ -312,13 +342,13 @@ export async function fetchPayment(
 export async function fetchMoyasarInvoice(
   invoiceId: string,
   fetchImpl?: typeof fetch,
-): Promise<{ ok: true; invoice: MoyasarInvoice } | { ok: false; error: string }> {
+): Promise<{ ok: true; invoice: MoyasarInvoice } | MoyasarFailure> {
   if (!moyasarConfigured()) {
-    return { ok: false, error: 'ميسر غير مفعّل على الخادم.' };
+    return { ok: false, error: MOYASAR_NOT_CONFIGURED, code: 'not_configured' };
   }
   const id = String(invoiceId || '').trim();
   if (!isSafeMoyasarId(id)) {
-    return { ok: false, error: 'رقم فاتورة ميسر غير صالح.' };
+    return { ok: false, error: 'رقم فاتورة ميسر غير صالح.', code: 'invalid' };
   }
 
   const impl = fetchImpl || fetch;
@@ -328,16 +358,20 @@ export async function fetchMoyasarInvoice(
       headers: { Authorization: moyasarAuthHeader() },
     });
   } catch {
-    return { ok: false, error: 'تعذر التحقق من فاتورة ميسر.' };
+    return { ok: false, error: 'تعذر التحقق من فاتورة ميسر.', code: 'upstream' };
   }
 
   const data = (await res.json().catch(() => ({}))) as Partial<MoyasarInvoice> & { message?: string };
   const url = String(data.url || '');
+  if (res.status === 404) {
+    return { ok: false, error: 'فاتورة ميسر غير موجودة.', code: 'not_found' };
+  }
   if (!res.ok || !data.id) {
-    return { ok: false, error: data.message || 'فاتورة ميسر غير موجودة.' };
+    console.warn('[moyasar] invoice lookup failed', res.status, data.message || '');
+    return { ok: false, error: 'تعذر التحقق من فاتورة ميسر.', code: 'upstream' };
   }
   if (url && !isMoyasarCheckoutUrl(url)) {
-    return { ok: false, error: 'رابط فاتورة ميسر غير صالح.' };
+    return { ok: false, error: 'رابط فاتورة ميسر غير صالح.', code: 'upstream' };
   }
 
   return {
@@ -359,13 +393,17 @@ export async function verifyMoyasarCheckout(
 ): Promise<
   | { ok: true; kind: 'payment'; payment: MoyasarPayment }
   | { ok: true; kind: 'invoice'; invoice: MoyasarInvoice }
-  | { ok: false; error: string }
+  | MoyasarFailure
 > {
   const payment = await fetchMoyasarPayment(id, fetchImpl);
-  if (payment.ok) return { ok: true, kind: 'payment', payment: payment.payment };
+  if (payment.ok === true) return { ok: true, kind: 'payment', payment: payment.payment };
+  // Without a key (or with a malformed id) the invoice lookup fails the same way.
+  if (payment.code === 'not_configured' || payment.code === 'invalid') return payment;
   const invoice = await fetchMoyasarInvoice(id, fetchImpl);
-  if (invoice.ok) return { ok: true, kind: 'invoice', invoice: invoice.invoice };
-  return { ok: false, error: payment.ok === false ? payment.error : 'تعذر التحقق من عملية ميسر.' };
+  if (invoice.ok === true) return { ok: true, kind: 'invoice', invoice: invoice.invoice };
+  // Unknown to both endpoints is "not found"; any other failure is the provider's.
+  if (payment.code === 'not_found' && invoice.code === 'not_found') return invoice;
+  return payment.code === 'upstream' ? payment : invoice;
 }
 
 const WEBHOOK_EVENTS = [

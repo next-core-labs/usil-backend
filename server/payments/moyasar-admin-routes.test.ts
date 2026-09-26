@@ -152,4 +152,38 @@ describe('moyasar-admin-routes', () => {
     assert.equal(urls.some((row) => row.startsWith('POST ')), true);
     await close();
   });
+
+  it('names a pasted publishable key as such, even with no key saved yet', async () => {
+    const dir = tmpDir();
+    let calls = 0;
+    const app = express();
+    app.use(express.json());
+    registerMoyasarAdminRoutes(app, fakeAuth('admin') as any, dir, {
+      fetchImpl: (async () => {
+        calls += 1;
+        return new Response('{}', { status: 200 });
+      }) as typeof fetch,
+    });
+    const { url, close } = await listen(app);
+    const put = (body: unknown) =>
+      fetch(`${url}/api/admin/moyasar`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    const pk = await put({ secretKey: 'pk_test_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' });
+    const pkJson = (await pk.json()) as { error?: string };
+    assert.equal(pk.status, 400);
+    assert.match(String(pkJson.error), /المفتاح العام/);
+
+    const empty = await put({});
+    const emptyJson = (await empty.json()) as { error?: string };
+    assert.equal(empty.status, 400);
+    assert.match(String(emptyJson.error), /الصق Secret Key/);
+
+    assert.equal(calls, 0);
+    assert.equal(fs.existsSync(path.join(dir, 'moyasar.json')), false);
+    await close();
+  });
 });

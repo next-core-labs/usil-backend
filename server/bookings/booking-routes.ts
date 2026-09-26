@@ -1,8 +1,10 @@
 import type { Express, Request, Response } from 'express';
 import {
   BOOKING_IN_PROGRESS_STATUS,
+  CANCELLING_BOOKING_STATUSES,
   CLOSED_BOOKING_STATUSES,
   bookingTotalHalalas,
+  checkStatusTransition,
   clientOwnsBooking,
   createBookingStore,
   isPlatformBookingStatus,
@@ -24,7 +26,7 @@ import {
   BOOKING_PENDING_APPROVAL_STATUS,
 } from '../vendors/vendor-listings.ts';
 import { createVendorStore } from '../vendors/vendor-store.ts';
-import { createMoyasarInvoice } from '../payments/moyasar.ts';
+import { MOYASAR_NOT_CONFIGURED, createMoyasarInvoice } from '../payments/moyasar.ts';
 import { isIsoDate, quoteBooking, riyadhToday, type PricedListing } from './booking-pricing.ts';
 
 export type BookingActor = { id: string; role: string; email?: string; phone?: string; emailVerified?: boolean };
@@ -82,12 +84,101 @@ const ALREADY_CLOSED = 'الطلب ملغي أو منتهٍ، ولا يمكن إ
 const EXECUTION_STARTED =
   'بدأ تنفيذ الطلب، والإلغاء بعد بدء التنفيذ غير متاح حسب سياسة الاسترجاع. تواصل مع الدعم.';
 const EVENT_PASSED = 'موعد المناسبة مضى، ولا يمكن إلغاء الطلب. للخدمة غير المطابقة افتح طلباً من صفحة الدعم.';
+const BAD_FIELDS = 'بيانات الطلب غير صالحة. تأكد من الاسم والجوال والمدينة والملاحظات وحاول مرة أخرى.';
+const BAD_ITEMS = 'محتوى السلة غير صالح. حدّث الصفحة وأعد إضافة المنتجات.';
+const STATUS_FINAL = 'الطلب ملغي أو مرفوض أو مكتمل، ولا يمكن تغيير حالته. تواصل مع إدارة يوصل إن كان هناك خطأ.';
+const STATUS_BACK_TO_NEW = 'لا يمكن إرجاع الطلب إلى «جديد». اختر حالة تالية.';
+const PAID_NEEDS_ADMIN =
+  'الطلب مدفوع، وإلغاؤه أو رفضه يحتاج استرجاع المبلغ للعميل. تواصل مع إدارة يوصل لإتمام ذلك.';
+
+/** Caps for free-text checkout fields — enough for real input, small enough for the admin table. */
+const MAX_NAME = 100;
+const MAX_EMAIL = 254;
+const MAX_CITY = 80;
+const MAX_NOTES = 1000;
+const MAX_SERVICE_NAME = 200;
+const MAX_ID = 120;
+const MAX_CART_LINES = 100;
 
 /** Every platform order settles through Moyasar. */
 const SETTLEMENT_LABEL = 'ميسر — دفع إلكتروني (مدى / آبل باي / STC Pay)';
 
 function isSupervisor(role?: string): boolean {
   return role === 'admin' || role === 'accounts_manager';
+}
+
+type CheckoutFields = {
+  name: string;
+  phone: string;
+  email: string;
+  serviceId?: string;
+  serviceName: string;
+  notes: string;
+  city: string;
+  eventDate: string;
+  items?: Array<Record<string, unknown>>;
+};
+
+/**
+ * Checkout is open to guests, so every field is checked for shape before it
+ * is stored: an object or array in `name` would be saved as-is and break
+ * every screen that renders it. Strings are trimmed and capped; absent
+ * optional fields become ''. Line quantities and prices are left to
+ * `quoteBooking`, which reads prices from the listings anyway.
+ */
+export function readCheckoutFields(body: unknown): { ok: true; fields: CheckoutFields } | { ok: false; error: string } {
+  const raw = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+  const text = (key: string, max: number): string | null => {
+    const value = raw[key];
+    if (value === undefined || value === null) return '';
+    if (typeof value !== 'string') return null;
+    return value.trim().slice(0, max);
+  };
+
+  const name = text('name', MAX_NAME);
+  const phone = text('phone', 40);
+  const email = text('email', MAX_EMAIL);
+  const serviceId = text('serviceId', MAX_ID);
+  const serviceName = text('serviceName', MAX_SERVICE_NAME);
+  const notes = text('notes', MAX_NOTES);
+  const city = text('city', MAX_CITY);
+  // Not truncated to 10, so "2026-10-10junk" still fails the date check.
+  const eventDate = text('eventDate', 40);
+  if ([name, phone, email, serviceId, serviceName, notes, city, eventDate].some((value) => value === null)) {
+    return { ok: false, error: BAD_FIELDS };
+  }
+  if (!name || !phone) return { ok: false, error: NAME_AND_PHONE };
+
+  let items: Array<Record<string, unknown>> | undefined;
+  if (raw.items !== undefined && raw.items !== null) {
+    if (!Array.isArray(raw.items) || raw.items.length > MAX_CART_LINES) return { ok: false, error: BAD_ITEMS };
+    const plain = raw.items.every(
+      (line) =>
+        Boolean(line) &&
+        typeof line === 'object' &&
+        !Array.isArray(line) &&
+        typeof (line as { id?: unknown }).id === 'string' &&
+        Boolean(((line as { id: string }).id).trim()) &&
+        (line as { id: string }).id.length <= MAX_ID,
+    );
+    if (!plain) return { ok: false, error: BAD_ITEMS };
+    items = raw.items as Array<Record<string, unknown>>;
+  }
+
+  return {
+    ok: true,
+    fields: {
+      name: name!,
+      phone: phone!,
+      email: email!,
+      serviceId: serviceId || undefined,
+      serviceName: serviceName!,
+      notes: notes!,
+      city: city!,
+      eventDate: eventDate!,
+      items,
+    },
+  };
 }
 
 export function registerBookingRoutes(
@@ -102,6 +193,18 @@ export function registerBookingRoutes(
   const now = deps.now || (() => new Date());
   /** Checkouts whose invoice is still being raised, so a double tap cannot race past the duplicate check. */
   const inFlight = new Set<string>();
+  /**
+   * Guest checkouts with no account and no email, keyed by device (IP) and
+   * order. The stored-row check needs an account or email, so without this a
+   * guest's second tap would raise a second invoice; keying on the IP keeps a
+   * stranger who only knows the phone from blocking them.
+   */
+  const recentGuestCheckouts = new Map<string, { bookingId: string; at: number }>();
+  const forgetStaleGuestCheckouts = (at: number) => {
+    for (const [key, entry] of recentGuestCheckouts) {
+      if (at - entry.at > DUPLICATE_WINDOW_MS) recentGuestCheckouts.delete(key);
+    }
+  };
 
   const approvedVendorIds = (): Set<string> =>
     new Set(
@@ -157,17 +260,17 @@ export function registerBookingRoutes(
       return res.status(429).json({ success: false, error: RATE_LIMITED });
     }
 
-    const { name, phone, email, serviceId, serviceName, notes, city, eventDate, items, totalAmount } =
-      req.body || {};
-    if (!name || !phone) {
-      return res.status(400).json({ success: false, error: NAME_AND_PHONE });
+    const parsed = readCheckoutFields(req.body);
+    if (parsed.ok === false) {
+      return res.status(400).json({ success: false, error: parsed.error });
     }
-    const saudiPhone = normalizeSaudiMobile(String(phone));
+    const { name, phone, email, serviceId, serviceName, notes, city, eventDate: date, items } = parsed.fields;
+    const totalAmount = req.body?.totalAmount;
+    const saudiPhone = normalizeSaudiMobile(phone);
     if (!saudiPhone) {
       return res.status(400).json({ success: false, error: BAD_PHONE });
     }
 
-    const date = String(eventDate || '').trim();
     if (!isIsoDate(date)) {
       return res.status(400).json({ success: false, error: BAD_EVENT_DATE });
     }
@@ -186,12 +289,12 @@ export function registerBookingRoutes(
     }
     // The client total is advisory: a mismatch means the cart shows stale
     // prices, so the customer re-checks rather than paying a surprise amount.
-    if (
-      totalAmount !== undefined &&
-      totalAmount !== null &&
-      totalAmount !== '' &&
-      Math.abs(Number(totalAmount) - quote.totalAmount) > 0.009
-    ) {
+    const hasClientTotal = totalAmount !== undefined && totalAmount !== null && totalAmount !== '';
+    if (hasClientTotal && (typeof totalAmount !== 'number' && typeof totalAmount !== 'string')) {
+      return res.status(400).json({ success: false, error: BAD_FIELDS });
+    }
+    // NaN never compares greater, so a non-numeric total counts as a mismatch.
+    if (hasClientTotal && !(Math.abs(Number(totalAmount) - quote.totalAmount) <= 0.009)) {
       return res.status(409).json({ success: false, error: PRICE_CHANGED, totalAmount: quote.totalAmount });
     }
 
@@ -203,6 +306,7 @@ export function registerBookingRoutes(
     const sessionUser = auth.userFromRequest(req);
     const orderEmail = String(email || sessionUser?.email || '').trim();
     const listingIds = quote.lines.map((line) => line.id);
+    const nowMs = now().getTime();
 
     const duplicate = store.findRecentDuplicate({
       userId: sessionUser?.id,
@@ -211,7 +315,7 @@ export function registerBookingRoutes(
       listingIds,
       eventDate: date,
       windowMs: DUPLICATE_WINDOW_MS,
-      now: now().getTime(),
+      now: nowMs,
     });
     if (duplicate) {
       // Only the account that placed it gets the row (and its pay link) back.
@@ -220,9 +324,19 @@ export function registerBookingRoutes(
       }
       return res.status(409).json({ success: false, error: DUPLICATE_ORDER });
     }
-    const flightKey = [sessionUser?.id || orderEmail.toLowerCase() || saudiPhone, [...listingIds].sort().join('|'), date].join('#');
+    const anonymous = !sessionUser && !orderEmail;
+    const buyerKey = sessionUser?.id || orderEmail.toLowerCase() || `${clientIp(req)}|${saudiPhone}`;
+    const flightKey = [buyerKey, [...listingIds].sort().join('|'), date].join('#');
     if (inFlight.has(flightKey)) {
       return res.status(409).json({ success: false, error: DUPLICATE_ORDER });
+    }
+    if (anonymous) {
+      forgetStaleGuestCheckouts(nowMs);
+      const earlier = recentGuestCheckouts.get(flightKey);
+      const earlierRow = earlier ? store.findById(earlier.bookingId) : null;
+      if (earlierRow && earlierRow.paymentStatus === 'unpaid' && !CLOSED_BOOKING_STATUSES.includes(earlierRow.status)) {
+        return res.status(409).json({ success: false, error: DUPLICATE_ORDER });
+      }
     }
     inFlight.add(flightKey);
 
@@ -234,9 +348,9 @@ export function registerBookingRoutes(
         phone: saudiPhone,
         email: orderEmail,
         serviceId: quote.lines[0].id,
-        serviceName: String(serviceName || '').trim() || quote.lines.map((line) => line.title).join(' + ') || 'باقة مخصصة',
-        notes: notes || '',
-        city: city || '',
+        serviceName: serviceName || quote.lines.map((line) => line.title).join(' + ') || 'باقة مخصصة',
+        notes,
+        city,
         eventDate: date,
         paymentMethod: 'moyasar',
         settlement: SETTLEMENT_LABEL,
@@ -257,12 +371,16 @@ export function registerBookingRoutes(
         bookingId: booking.id,
       });
       if (invoice.ok === false) {
-        return res.status(400).json({ success: false, error: invoice.error });
+        if (invoice.code === 'not_configured') {
+          return res.status(503).json({ success: false, error: MOYASAR_NOT_CONFIGURED });
+        }
+        return res.status(502).json({ success: false, error: invoice.error });
       }
       booking.moyasarInvoiceId = invoice.invoice.id;
       booking.paymentUrl = invoice.invoice.url;
 
       store.add(booking);
+      if (anonymous) recentGuestCheckouts.set(flightKey, { bookingId: booking.id, at: nowMs });
       res.status(201).json({ success: true, booking });
     } finally {
       inFlight.delete(flightKey);
@@ -335,8 +453,44 @@ export function registerBookingRoutes(
       }
     }
 
-    const booking = store.updateStatus(current.id, status);
+    const by = isSupervisor(user.role) ? 'admin' : 'vendor';
+    const transition = checkStatusTransition(current.status, status, by);
+    if (transition.ok === false) {
+      return res
+        .status(409)
+        .json({ success: false, error: transition.reason === 'final' ? STATUS_FINAL : STATUS_BACK_TO_NEW });
+    }
+
+    // Ending an order records who ended it and what is owed, in the same shape
+    // a client cancellation uses, so a refund is never lost. A paid order owes
+    // the full amount (the customer did not cancel), which only an admin may
+    // commit Usil to — a vendor is sent to administration instead.
+    let cancellation: BookingCancellation | undefined;
+    const ending = CANCELLING_BOOKING_STATUSES.includes(status) && !CANCELLING_BOOKING_STATUSES.includes(current.status);
+    if (ending) {
+      const paid = current.paymentStatus === 'paid';
+      if (paid && by === 'vendor') {
+        return res.status(409).json({ success: false, error: PAID_NEEDS_ADMIN });
+      }
+      const refundHalalas = paid ? bookingTotalHalalas(current) : 0;
+      cancellation = {
+        cancelledAt: now().toISOString(),
+        cancelledBy: by,
+        refundPercent: paid ? 100 : 0,
+        refundHalalas,
+        refundStatus: !paid ? 'not_applicable' : refundHalalas > 0 ? 'pending' : 'none',
+        note: !paid
+          ? 'أُلغي قبل الدفع — لا يوجد مبلغ للاسترجاع.'
+          : 'ألغته إدارة يوصل بعد الدفع — يُعاد كامل المبلغ عبر ميسر بنفس وسيلة الدفع.',
+      };
+    }
+
+    const booking = store.updateStatus(current.id, status, { by, cancellation });
     if (!booking) return res.status(404).json({ success: false, error: NOT_FOUND });
+    // Rows carry no status history; the log is the record of an admin override.
+    if (transition.override) {
+      console.warn('[bookings] admin status override', booking.id, current.status, '->', status, 'by', user.id);
+    }
     res.json({ success: true, booking });
   });
 

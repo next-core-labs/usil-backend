@@ -7,6 +7,7 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { registerVendorApplicationRoutes } from './vendor-application-routes.ts';
 import { createAuth, hashPassword } from '../auth/auth.ts';
+import { createVendorStore } from './vendor-store.ts';
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vap-api-'));
@@ -72,7 +73,7 @@ const payload = {
   bankName: 'مصرف الراجحي',
   iban: 'SA0380000000608010167519',
   accountHolderName: 'نواف محمد المهيع',
-  password: 'Secret1',
+  password: 'Secret12',
   fulfillment: ['hour', 'same_day'],
   instagram: '@usil.vendor',
   confirmedOwn: true,
@@ -311,3 +312,77 @@ describe('vendor-application-routes — account takeover and orphan uploads', ()
   });
 });
 
+
+describe('vendor-application-routes — rejection leftovers and password rule', () => {
+  async function mount(auth: unknown) {
+    const dir = tmpDir();
+    const app = express();
+    app.use(express.json({ limit: '2mb' }));
+    registerVendorApplicationRoutes(app, auth as any, dir);
+    const server = await listen(app);
+    const post = (route: string, body: unknown = {}) =>
+      fetch(`${server.url}${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    return { dir, post, ...server };
+  }
+
+  it('removes the listing and workspace a rejected application created, and leaves other vendors alone', async () => {
+    const { dir, post, close } = await mount(fakeAuth('admin'));
+    try {
+      // An unrelated approved vendor with their own product.
+      const store = createVendorStore(dir);
+      store.saveWorkspace('usr-approved', {
+        listings: [
+          { title: 'منتج معتمد', category: 'hospitality', price: 90, fulfillment: ['hour'], images: ['/uploads/a.jpg'] },
+        ],
+      });
+      const created = await post('/api/vendor-applications', payload);
+      assert.equal(created.status, 201);
+      const id = (await created.json()).application.id;
+      assert.equal(store.getWorkspace('usr-applicant').listings.length, 1);
+
+      const rejected = await post(`/api/admin/vendor-applications/${id}/reject`, { reason: 'بيانات ناقصة' });
+      assert.equal(rejected.status, 200);
+      assert.equal(store.hasWorkspace('usr-applicant'), false);
+      assert.ok(!store.listAllListings().some((row) => row.vendorId === 'usr-applicant'));
+      assert.equal(store.getWorkspace('usr-approved').listings.length, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('never removes the workspace of a vendor account whose new application is rejected', async () => {
+    const auth = {
+      ...fakeAuth('admin'),
+      ensureApplicantUser: (input: { email: string }) => ({ id: 'usr-live-vendor', email: input.email, role: 'vendor' }),
+      findUserByEmail: (email: string) => (email === payload.email ? { id: 'usr-live-vendor', email, role: 'vendor' } : null),
+    };
+    const { dir, post, close } = await mount(auth);
+    try {
+      const created = await post('/api/vendor-applications', payload);
+      assert.equal(created.status, 201);
+      const id = (await created.json()).application.id;
+      const rejected = await post(`/api/admin/vendor-applications/${id}/reject`);
+      assert.equal(rejected.status, 200);
+      assert.equal(createVendorStore(dir).getWorkspace('usr-live-vendor').listings.length, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('requires an 8-character password on a vendor application', async () => {
+    const { post, close } = await mount(fakeAuth('admin'));
+    try {
+      const short = await post('/api/vendor-applications', { ...payload, password: 'Secret1' });
+      assert.equal(short.status, 400);
+      assert.match((await short.json()).error, /8 خانات/);
+      const ok = await post('/api/vendor-applications', { ...payload, password: 'Secret12' });
+      assert.equal(ok.status, 201);
+    } finally {
+      await close();
+    }
+  });
+});

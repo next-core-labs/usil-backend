@@ -28,9 +28,12 @@ function firstHeaderValue(value: unknown): string {
 }
 
 /**
- * The caller's IP, for rate-limit keys. Production runs Cloudflare → Caddy →
- * node, so the raw `X-Forwarded-For` is caller-controlled and never read here —
- * trusting it let anyone reset their rate-limit budget per request.
+ * The caller's IP, for rate-limit keys. Production runs on Render, which sits
+ * behind Cloudflare (responses carry `server: cloudflare` and `cf-ray`), and
+ * Cloudflare overwrites `cf-connecting-ip` with the real caller — so that is
+ * the production default. The raw `X-Forwarded-For` is caller-controlled and
+ * never read here: trusting it let anyone reset their rate-limit budget per
+ * request.
  *
  * - `CLIENT_IP_HEADER` set: that header (first value), e.g. `cf-connecting-ip`.
  * - otherwise in production: `cf-connecting-ip`, which Cloudflare overwrites.

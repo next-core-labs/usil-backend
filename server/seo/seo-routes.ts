@@ -9,6 +9,8 @@ import {
   mergeRobotsTxt,
   type ServicePageSeo,
 } from './seo-html';
+import { createVendorStore } from '../vendors/vendor-store';
+import { publicVendorAccounts, vendorUsersFromDataDir, type VendorAccountLike } from '../shared/approved-catalog';
 
 type AuthLike = {
   userFromRequest: (req: Request) => { role?: string } | null;
@@ -17,6 +19,8 @@ type AuthLike = {
     res: Response,
     next: () => void,
   ) => void;
+  /** Vendor accounts (`auth.listVendorUsers`); users.json is read when absent. */
+  listVendorUsers?: () => VendorAccountLike[];
 };
 
 export type SeoRouteOptions = {
@@ -26,6 +30,11 @@ export type SeoRouteOptions = {
    * vendor listing (same source as `/api/catalog/listings`); null otherwise.
    */
   getServiceSeo?: (id: string) => ServicePageSeo | null;
+  /**
+   * Public vendor pages (`/vendor/<id>`) for the sitemap. Defaults to the same
+   * public-vendor rule as `/api/vendors/:id`, read from this data dir.
+   */
+  getVendorEntries?: () => Array<{ id: string; updatedAt?: string }>;
   indexHtmlPath?: string;
 };
 
@@ -49,12 +58,36 @@ export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string,
   const store = createSeoStore(dataDir);
   const requireAdmin = auth.requireRole(['admin']);
 
-  const extraPaths = () => {
-    const entries = options.getServiceEntries?.() || [];
+  const defaultVendorEntries = () => {
+    const vendors = createVendorStore(dataDir);
+    const users = (auth.listVendorUsers || vendorUsersFromDataDir(dataDir))();
+    return publicVendorAccounts(users).map((user) => ({
+      id: user.id,
+      updatedAt: vendors.hasWorkspace(user.id) ? vendors.getWorkspace(user.id).updatedAt : undefined,
+    }));
+  };
+
+  const vendorPaths = () => {
+    let entries: Array<{ id: string; updatedAt?: string }> = [];
+    try {
+      entries = (options.getVendorEntries || defaultVendorEntries)();
+    } catch {
+      // A broken vendor file must not take the whole sitemap down.
+      entries = [];
+    }
     return entries
       .map((item) => ({ id: String(item.id || '').trim(), lastmod: isoDate(item.updatedAt) }))
       .filter((item) => Boolean(item.id))
+      .map((item) => ({ path: `/vendor/${encodeURIComponent(item.id)}`, lastmod: item.lastmod }));
+  };
+
+  const extraPaths = () => {
+    const entries = options.getServiceEntries?.() || [];
+    const services = entries
+      .map((item) => ({ id: String(item.id || '').trim(), lastmod: isoDate(item.updatedAt) }))
+      .filter((item) => Boolean(item.id))
       .map((item) => ({ path: `/service/${item.id}`, lastmod: item.lastmod }));
+    return [...services, ...vendorPaths()];
   };
 
   app.get('/api/seo/public', (_req: Request, res: Response) => {

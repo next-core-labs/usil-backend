@@ -64,6 +64,8 @@ export const SAUDI_BANKS = [
 
 export type VendorApplicationStatus = 'pending' | 'approved' | 'rejected';
 
+export const VENDOR_PASSWORD_MIN_LENGTH = 8;
+
 const FULFILLMENT_IDS = ['hour', 'same_day', 'tomorrow', 'instant'] as const;
 export type VendorFulfillmentLane = (typeof FULFILLMENT_IDS)[number];
 
@@ -183,8 +185,9 @@ export function validateVendorApplication(input: Partial<VendorApplicationInput>
   if (!(SAUDI_BANKS as readonly string[]).includes(String(input.bankName))) {
     throw new Error('اختر بنكاً سعودياً من القائمة');
   }
-  if (String(input.password).length < 6) {
-    throw new Error('الرقم السري يجب ألا يقل عن 6 خانات');
+  // Same minimum as every other account on the platform.
+  if (String(input.password).length < VENDOR_PASSWORD_MIN_LENGTH) {
+    throw new Error(`الرقم السري يجب ألا يقل عن ${VENDOR_PASSWORD_MIN_LENGTH} خانات`);
   }
   return resolvedProjectType(String(input.projectType), input.projectTypeOther);
 }

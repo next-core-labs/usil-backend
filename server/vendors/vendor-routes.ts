@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from 'express';
-import { createVendorStore, VendorStoreError } from './vendor-store';
+import { createVendorStore, VendorStoreError, type VendorStoreOptions } from './vendor-store';
 import { enrichVendorServices } from '../../core/data/saudiMarket';
 import { isPublicMarketplaceListing } from '../../core/utils/catalogMedia';
 import { createVendorApplicationStore } from './vendor-applications';
@@ -12,6 +12,8 @@ import {
 import type { PublicUser } from '../auth/auth';
 import { isVendorSupervisor } from '../auth/roles';
 import { buildVendorHubs } from './vendor-hubs';
+import { publicVendorAccounts } from '../shared/approved-catalog';
+import type { VendorProfileSource } from './vendor-profile';
 
 type AuthApi = {
   userFromRequest: (req: Request) => { id: string; role: string; name?: string; email?: string } | null;
@@ -21,7 +23,7 @@ type AuthApi = {
     next: () => void,
   ) => void;
   saveUserSocials?: (userId: string, socials: VendorSocials) => PublicUser | null;
-  findUserByEmail?: (email: string) => { id: string; email: string; socials?: VendorSocials } | null;
+  findUserByEmail?: (email: string) => { id: string; email: string; role?: string; socials?: VendorSocials } | null;
   listVendorUsers?: () => PublicUser[];
 };
 
@@ -42,10 +44,34 @@ function vendorIdFrom(req: Request): string | null {
   return user.id;
 }
 
-export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: string) {
-  const store = createVendorStore(dataDir);
+export type VendorRouteOptions = VendorStoreOptions;
+
+export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: string, options: VendorRouteOptions = {}) {
+  const store = createVendorStore(dataDir, options);
   const applications = createVendorApplicationStore(dataDir);
   const guard = auth.requireRole(['vendor', 'admin']);
+
+  /** Vendor accounts that pass the shared public rule (see `isPublicVendorAccount`). */
+  function publicVendorUsers(): PublicUser[] {
+    return publicVendorAccounts(auth.listVendorUsers?.() || []);
+  }
+
+  /**
+   * Workspaces left behind by rejected applications filed before rejection
+   * started removing them: the application id, or the applicant's non-vendor
+   * account. Hidden from the admin lists; a vendor account is never included.
+   */
+  function rejectedLeftoverIds(): Set<string> {
+    const vendorIds = new Set((auth.listVendorUsers?.() || []).map((user) => user.id));
+    const ids = new Set<string>();
+    for (const row of applications.list()) {
+      if (row.status !== 'rejected') continue;
+      if (!vendorIds.has(row.id)) ids.add(row.id);
+      const account = auth.findUserByEmail?.(row.email);
+      if (account && account.role === 'client' && !vendorIds.has(account.id)) ids.add(account.id);
+    }
+    return ids;
+  }
 
   /** Vendor-typed handles/URLs — always re-parsed, verification never taken from the body. */
   function persistSocials(vendorId: string, socials: unknown) {
@@ -54,19 +80,34 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     return saved;
   }
 
-  /** Admin-reviewed socials copied across from an application. */
-  function syncReviewedSocials(vendorId: string, socials: VendorSocials) {
-    const saved = store.replaceSocials(vendorId, socials);
+  /** One admin-reviewed network copied across from an application, merged into the live socials. */
+  function syncReviewedSocial(vendorId: string, network: SocialNetwork, socials: VendorSocials) {
+    const saved = store.mergeReviewedSocial(vendorId, network, socials);
     auth.saveUserSocials?.(vendorId, saved);
     return saved;
   }
 
-  /** The application behind a public vendor id, so the public file can fall back to it. */
-  function publicVendor(id: string) {
-    const vendors = auth.listVendorUsers?.() || [];
-    const user = vendors.find((item) => item.id === id);
-    const application = user ? applications.findByEmail(user.email) : applications.findById(id);
-    return { vendorId: user?.id, application };
+  /**
+   * A public vendor id and the profile source behind it: the application when
+   * there is one, otherwise the account itself (admin-created vendors).
+   */
+  function publicVendor(id: string): { vendorId?: string; source: VendorProfileSource | null } {
+    const user = publicVendorUsers().find((item) => item.id === id);
+    if (!user) return { source: null };
+    const application = applications.findByEmail(user.email);
+    // The account already passed the public rule, so it shows as approved.
+    const source: VendorProfileSource = application
+      ? { ...application, status: 'approved' }
+      : {
+          id: user.id,
+          projectName: user.name,
+          firstName: user.name,
+          email: user.email,
+          phone: user.phone,
+          socials: user.socials,
+          status: 'approved',
+        };
+    return { vendorId: user.id, source };
   }
 
   app.get('/api/vendor/workspace', guard, (req: Request, res: Response) => {
@@ -144,7 +185,7 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   });
 
   app.get('/api/catalog/listings', (_req: Request, res: Response) => {
-    const approvedIds = new Set((auth.listVendorUsers?.() || []).map((user) => user.id));
+    const approvedIds = new Set(publicVendorUsers().map((user) => user.id));
     const listings = store.listAllListings().filter((listing) => approvedIds.has(listing.vendorId));
     res.json({
       success: true,
@@ -155,14 +196,11 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   });
 
   app.get('/api/vendors/:id', (req: Request, res: Response) => {
-    const { vendorId, application } = publicVendor(String(req.params.id || ''));
+    const { vendorId, source } = publicVendor(String(req.params.id || ''));
     if (!vendorId) {
       return res.status(404).json({ success: false, error: 'المورد غير موجود أو لم يُعتمد بعد' });
     }
-    if (application && application.status !== 'approved') {
-      return res.status(404).json({ success: false, error: 'المورد غير موجود أو لم يُعتمد بعد' });
-    }
-    const file = store.getPublicFile(vendorId, application);
+    const file = store.getPublicFile(vendorId, source);
     if (!file) {
       return res.status(404).json({ success: false, error: 'المورد غير موجود أو لم يُعتمد بعد' });
     }
@@ -198,9 +236,8 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
 
   app.get('/api/vendors/:id/socials', (req: Request, res: Response) => {
     // Same gate as GET /api/vendors/:id: only an approved vendor account is public.
-    const { vendorId, application } = publicVendor(String(req.params.id || ''));
-    const isPublic = Boolean(vendorId) && (!application || application.status === 'approved');
-    const socials = isPublic && vendorId ? store.getPublicSocials(vendorId, application) : [];
+    const { vendorId, source } = publicVendor(String(req.params.id || ''));
+    const socials = vendorId ? store.getPublicSocials(vendorId, source) : [];
     res.json({
       success: true,
       data: socials,
@@ -264,6 +301,8 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   app.get('/api/admin/vendor-hubs', adminOnly, (req: Request, res: Response) => {
     const actor = auth.userFromRequest(req);
     if (!actor) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    const leftovers = rejectedLeftoverIds();
+    const summaries = Object.fromEntries(Object.entries(store.listSummaries()).filter(([id]) => !leftovers.has(id)));
     const hubs = buildVendorHubs({
       actor: { id: actor.id, email: actor.email || '' },
       vendors: auth.listVendorUsers?.() || [],
@@ -275,14 +314,15 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
         projectName: row.projectName,
         status: row.status,
       })),
-      summaries: store.listSummaries(),
+      summaries,
     });
     res.json({ success: true, data: hubs });
   });
 
   app.get('/api/admin/vendor-socials', adminOnly, (_req: Request, res: Response) => {
     const users = auth.listVendorUsers?.() || [];
-    const workspaceRows = store.listSocials();
+    const leftovers = rejectedLeftoverIds();
+    const workspaceRows = store.listSocials().filter((row) => !leftovers.has(row.vendorId));
     const byId = new Map<string, { vendorId: string; name: string; email?: string; projectName?: string; socials: VendorSocials; source: string }>();
 
     for (const user of users) {
@@ -310,6 +350,8 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     }
     for (const app of applications.list()) {
       if (!app.socials?.links?.length) continue;
+      // Nothing left to verify for a rejected applicant.
+      if (app.status === 'rejected') continue;
       const user = auth.findUserByEmail?.(app.email);
       if (user && byId.has(user.id)) {
         const current = byId.get(user.id)!;
@@ -342,7 +384,7 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
       if (!row) throw new Error('الطلب غير موجود');
       const user = auth.findUserByEmail?.(row.email);
       if (user) {
-        syncReviewedSocials(user.id, row.socials || emptyVendorSocials());
+        syncReviewedSocial(user.id, network, row.socials || emptyVendorSocials());
       }
       return row.socials;
     }
@@ -386,7 +428,8 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   });
 
   app.get('/api/admin/listings', adminOnly, (_req: Request, res: Response) => {
-    res.json({ success: true, data: store.listAllListings() });
+    const leftovers = rejectedLeftoverIds();
+    res.json({ success: true, data: store.listAllListings().filter((listing) => !leftovers.has(listing.vendorId)) });
   });
 
   app.patch('/api/admin/listings/:id', adminOnly, (req: Request, res: Response) => {

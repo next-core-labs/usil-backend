@@ -276,6 +276,118 @@ describe('email verification API', () => {
     await close();
   });
 
+  it('never hands a verified account to someone who only knows its email', async () => {
+    const dir = tmpDir();
+    const email = 'already.verified@usil.sa';
+    const phone = '0596666777';
+    fs.writeFileSync(
+      path.join(dir, 'users.json'),
+      JSON.stringify([
+        {
+          id: 'usr-verified',
+          name: 'حساب مؤكد',
+          email,
+          phone,
+          role: 'client',
+          passwordHash: hashPassword('secret12'),
+          emailVerified: true,
+        },
+      ]),
+    );
+    const { app } = mount(dir);
+    const { url, close } = await listen(app);
+    const post = (route: string, body: unknown, cookie = '') =>
+      fetch(`${url}${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(cookie ? { cookie } : {}) },
+        body: JSON.stringify(body),
+      }).then(async (res) => ({ status: res.status, json: await res.json() }));
+
+    // No code check happens for a verified account, so strangers get only the message.
+    for (const body of [{ email, code: '000000' }, { email, phone, code: '000000' }]) {
+      const stranger = await post('/api/auth/verify-email', body);
+      assert.equal(stranger.status, 200);
+      assert.equal(stranger.json.success, true);
+      assert.equal(stranger.json.user, undefined, JSON.stringify(body));
+      assert.match(stranger.json.message, /مؤكد مسبقاً/);
+    }
+    const resendStranger = await post('/api/auth/resend-verification', { email, phone });
+    assert.equal(resendStranger.json.success, true);
+    assert.equal(resendStranger.json.user, undefined);
+
+    const login = await fetch(`${url}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, phone, password: 'secret12' }),
+    });
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    const owner = await post('/api/auth/verify-email', { email, code: '000000' }, cookie);
+    assert.equal(owner.json.user.id, 'usr-verified');
+    const resendOwner = await post('/api/auth/resend-verification', { email, phone }, cookie);
+    assert.equal(resendOwner.json.user.id, 'usr-verified');
+    await close();
+  });
+
+  it('never returns the verification code in production when mail fails', async () => {
+    const saved = { NODE_ENV: process.env.NODE_ENV, warn: console.warn };
+    const mailVars = ['SMTP_HOST', 'MAIL_HOST', 'SMTP_URL', 'MAIL_URL', 'SMTP_SERVER'];
+    const savedMail = mailVars.map((key) => [key, process.env[key]] as const);
+    const warnings: string[] = [];
+    process.env.NODE_ENV = 'production';
+    for (const key of mailVars) delete process.env[key];
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '));
+    };
+    try {
+      const dir = tmpDir();
+      const { app } = mount(dir);
+      assert.ok(warnings.some((line) => /SMTP is not configured/.test(line)), 'warns once at startup');
+      const { url, close } = await listen(app);
+      const email = 'prod.nomail@usil.sa';
+      const phone = '0591231234';
+      const res = await fetch(`${url}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'بلا بريد', email, phone, password: 'secret12' }),
+      });
+      const json = await res.json();
+      assert.equal(res.status, 201);
+      assert.equal(json.emailSent, false);
+      assert.equal(json.verificationCode, undefined);
+      assert.match(json.message, /تعذر إرسال/);
+
+      const resend = await fetch(`${url}/api/auth/resend-verification`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, phone }),
+      });
+      const resendJson = await resend.json();
+      assert.equal(resendJson.emailSent, false);
+      assert.equal(resendJson.verificationCode, undefined);
+      assert.match(resendJson.message, /تعذر إرسال/);
+      await close();
+    } finally {
+      console.warn = saved.warn;
+      if (saved.NODE_ENV === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = saved.NODE_ENV;
+      for (const [key, value] of savedMail) if (value !== undefined) process.env[key] = value;
+    }
+  });
+
+  it('refuses sign-up passwords shorter than 8 characters', async () => {
+    const dir = tmpDir();
+    const { app } = mount(dir);
+    const { url, close } = await listen(app);
+    const res = await fetch(`${url}/api/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'قصير', email: 'short.pw@usil.sa', phone: '0591239876', password: 'abc1234' }),
+    });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /8 خانات/);
+    await close();
+  });
+
   it('never mints an admin from public sign-up with the founder email', async () => {
     const dir = tmpDir();
     const { app } = mount(dir);

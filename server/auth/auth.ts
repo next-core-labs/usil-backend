@@ -6,7 +6,12 @@ import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from 
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
 import { FOUNDER_ADMIN_EMAIL, isDummyEmail, purgeLiveDummyData, wipeAllVendorsAndDummyMedia } from './dummy-accounts';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
-import { notifyPasswordChanged, sendPasswordResetEmail, sendVerificationEmail } from '../shared/optional-mail';
+import {
+  hasMailConfig,
+  notifyPasswordChanged,
+  sendPasswordResetEmail,
+  sendVerificationEmail,
+} from '../shared/optional-mail';
 import { emptyVendorSocials, type VendorSocials } from '../vendors/vendor-socials';
 import { isAccountRole, isVendorSupervisor, roleAllowed, type AccountRole } from './roles';
 export type { AccountRole } from './roles';
@@ -183,10 +188,19 @@ const FORGOT_WINDOW_MS = 15 * 60 * 1000;
  */
 const LOGIN_LIMIT = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+/**
+ * Second guard keyed on the email alone, because rotating IPs resets the
+ * IP+email budget. The ceiling is a trade-off: low enough to stop a distributed
+ * guess run, high enough that a person mistyping never meets it and locking a
+ * victim out takes a sustained, deliberate flood rather than a few requests.
+ */
+const LOGIN_ACCOUNT_LIMIT = 30;
 const LOGIN_RATE_LIMIT = 'حدّ محاولات الدخول. انتظر 15 دقيقة ثم أعد المحاولة.';
 /** One answer for unknown email, wrong phone and wrong password — no account probing. */
 const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والجوال والرقم السري.';
-const WEAK_PASSWORD = 'الرقم السري ضعيف. استخدم 8 خانات على الأقل.';
+/** Checked only when a password is set, so older shorter passwords still log in. */
+const PASSWORD_MIN_LENGTH = 8;
+const WEAK_PASSWORD = `الرقم السري ضعيف. استخدم ${PASSWORD_MIN_LENGTH} خانات على الأقل.`;
 const RESET_RATE_LIMIT = 'حدّ المحاولات. انتظر 15 دقيقة ثم أعد المحاولة.';
 const RESET_SUCCESS = 'تم تغيير الرقم السري. ادخل الآن.';
 const RESET_CODE_TTL_MS = 15 * 60 * 1000;
@@ -205,7 +219,9 @@ function isPlausibleContact(email: string, phone: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && phone.replace(/\D/g, '').length >= 9;
 }
 
-const FOUNDER_LOCKED = 'لا يمكن تعديل البريد أو الجوال أو الصلاحية أو الرقم السري لحساب الإدارة الرئيسي.';
+const FOUNDER_LOCKED = 'حساب الإدارة الرئيسي لا يعدّله إلا صاحبه، وبريده ثابت لا يتغيّر.';
+/** Production has no on-screen fallback: the code would prove nothing about the mailbox. */
+const EMAIL_UNSENT = 'تعذر إرسال رمز التأكيد إلى بريدك الآن. حاول لاحقاً أو تواصل مع الدعم.';
 const PRIVILEGED_ONLY = 'إدارة حسابات المدراء متاحة لمدير كل الحسابات فقط.';
 const SELF_ROLE_LOCKED = 'لا يمكنك تغيير صلاحية حسابك.';
 export const APPLICANT_LOGIN_REQUIRED = 'البريد أو رقم الجوال مسجّل لحساب موجود. سجّل الدخول بذلك الحساب أولاً ثم أرسل الطلب.';
@@ -218,10 +234,19 @@ export class ApplicantAccountConflictError extends Error {
   }
 }
 
+let warnedNoMail = false;
+
 export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env) {
+  if (isProduction() && !hasMailConfig() && !warnedNoMail) {
+    warnedNoMail = true;
+    console.warn(
+      'SMTP is not configured: verification and password-reset codes cannot be delivered, and production never returns them in API responses.',
+    );
+  }
   const forgotLimiter = createSlidingWindowLimiter(FORGOT_LIMIT, FORGOT_WINDOW_MS);
   const resetLimiter = createSlidingWindowLimiter(FORGOT_LIMIT * 2, FORGOT_WINDOW_MS);
   const loginLimiter = createSlidingWindowLimiter(LOGIN_LIMIT, LOGIN_WINDOW_MS);
+  const loginAccountLimiter = createSlidingWindowLimiter(LOGIN_ACCOUNT_LIMIT, LOGIN_WINDOW_MS);
   const resendLimiter = createSlidingWindowLimiter(EMAIL_RESEND_LIMIT, EMAIL_RESEND_WINDOW_MS);
   const verifyAttemptLimiter = createSlidingWindowLimiter(EMAIL_VERIFY_ATTEMPT_LIMIT, EMAIL_VERIFY_ATTEMPT_WINDOW_MS);
 
@@ -262,8 +287,15 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     delete user.passwordResetAttempts;
   }
 
-  function verificationPayload(emailSent: boolean, code: string) {
-    return emailSent ? { emailSent: true as const } : { emailSent: false as const, verificationCode: code };
+  /**
+   * The on-screen code is a local-dev convenience only. In production it would
+   * let anyone "verify" an email they don't own, and a verified email unlocks
+   * guest orders placed with it — so production just says the mail failed.
+   */
+  function verificationPayload(emailSent: boolean, code: string, sentMessage: string, devMessage: string) {
+    if (emailSent) return { emailSent: true as const, message: sentMessage };
+    if (isProduction()) return { emailSent: false as const, message: EMAIL_UNSENT };
+    return { emailSent: false as const, message: devMessage, verificationCode: code };
   }
 
   let dummyPurged = false;
@@ -302,7 +334,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     if (!email && !password) return;
     const users = seedUsers();
     if (users.some((item) => item.role === 'admin')) return;
-    if (!email.includes('@') || password.length < 8) {
+    if (!email.includes('@') || password.length < PASSWORD_MIN_LENGTH) {
       console.warn('OWNER_EMAIL / OWNER_PASSWORD ignored: needs a valid email and a password of 8+ characters.');
       return;
     }
@@ -426,7 +458,10 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
       const phone = normalizePhone(req.body?.phone || '');
       const password = String(req.body?.password || '');
-      if (!loginLimiter.allow(`${clientIp(req)}:${email}`)) {
+      if (
+        !loginLimiter.allow(`${clientIp(req)}:${email}`) ||
+        (email && !loginAccountLimiter.allow(email))
+      ) {
         return res.status(429).json({ success: false, error: LOGIN_RATE_LIMIT });
       }
       if (!email || !password) {
@@ -488,8 +523,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (!email.includes('@')) {
         return res.status(400).json({ success: false, error: 'أدخل بريداً إلكترونياً صحيحاً.' });
       }
-      if (password.length < 6) {
-        return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
+      if (password.length < PASSWORD_MIN_LENGTH) {
+        return res.status(400).json({ success: false, error: WEAK_PASSWORD });
       }
 
       // Public sign-up never creates an admin. The founder address is reserved:
@@ -531,10 +566,12 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         success: true,
         user: publicUser(user),
         needsEmailVerification: true,
-        message: emailSent
-          ? 'أدخل رمز التأكيد المرسل إلى بريدك.'
-          : 'أدخل رمز التأكيد. يظهر مرة واحدة هنا لأن البريد غير مفعّل.',
-        ...verificationPayload(emailSent, issued.code),
+        ...verificationPayload(
+          emailSent,
+          issued.code,
+          'أدخل رمز التأكيد المرسل إلى بريدك.',
+          'أدخل رمز التأكيد. يظهر مرة واحدة هنا لأن البريد غير مفعّل.',
+        ),
       });
     } catch {
       res.status(500).json({ success: false, error: 'تعذر إنشاء الحساب. حاول مرة أخرى.' });
@@ -607,8 +644,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     if (isFounderEmail(email)) {
       return res.status(409).json({ success: false, error: RESERVED_EMAIL });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
+    if (password.length < PASSWORD_MIN_LENGTH) {
+      return res.status(400).json({ success: false, error: WEAK_PASSWORD });
     }
 
     const users = loadUsers();
@@ -651,20 +688,21 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       return res.status(403).json({ success: false, error: PRIVILEGED_ONLY });
     }
     const isSelf = user.id === actor.id;
+    const founder = isFounderEmail(user.email);
+    // Nobody else edits the founder at all: a field-by-field lock kept leaving
+    // gaps (name, avatar, the verified flag) for another admin to deface.
+    if (founder && !isSelf) {
+      return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
+    }
     if (isSelf && nextRole !== user.role) {
       return res.status(403).json({ success: false, error: SELF_ROLE_LOCKED });
     }
 
     const nextEmail = req.body?.email ? normalizeEmail(req.body.email) : user.email;
     const emailChanges = nextEmail !== user.email;
-    const founder = isFounderEmail(user.email);
-    // The founder's email is frozen for everyone: changing it first and then
+    // The founder's own email is frozen too: changing it first and then
     // demoting the account was the way around the role lock.
     if (founder && emailChanges) {
-      return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
-    }
-    // Phone is a login factor, so changing it would lock the founder out too.
-    if (founder && !isSelf && (nextRole !== user.role || req.body?.password || req.body?.phone)) {
       return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
     }
     if (!founder && emailChanges && isFounderEmail(nextEmail)) {
@@ -696,8 +734,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     let nextPasswordHash = user.passwordHash;
     if (req.body?.password) {
       const password = String(req.body.password);
-      if (password.length < 6) {
-        return res.status(400).json({ success: false, error: 'الرقم السري يجب ألا يقل عن 6 خانات.' });
+      if (password.length < PASSWORD_MIN_LENGTH) {
+        return res.status(400).json({ success: false, error: WEAK_PASSWORD });
       }
       nextPasswordHash = hashPassword(password);
     }
@@ -949,7 +987,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (!email || !code || !newPassword) {
         return res.status(400).json({ success: false, error: RESET_FIELDS_REQUIRED });
       }
-      if (newPassword.length < 8) {
+      if (newPassword.length < PASSWORD_MIN_LENGTH) {
         return res.status(400).json({ success: false, error: WEAK_PASSWORD });
       }
 
@@ -1010,6 +1048,11 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     res.json({ success: true, user: publicUser(user) });
   }
 
+  /** `{ user }` only when the request's own session is that account. */
+  function ownUserOnly(req: Request, user: StoredUser): { user?: PublicUser } {
+    return userFromRequest(req)?.id === user.id ? { user: publicUser(user) } : {};
+  }
+
   function markVerified(user: StoredUser, users: StoredUser[]) {
     clearEmailVerificationSecrets(user);
     saveUsers(users);
@@ -1041,7 +1084,9 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         return res.status(400).json({ success: false, error: EMAIL_VERIFY_NOT_FOUND });
       }
       if (isStoredEmailVerified(user)) {
-        return res.json({ success: true, user: publicUser(user), message: EMAIL_VERIFY_ALREADY });
+        // No code was checked here, so only the signed-in owner gets the account
+        // back — otherwise any email returned that account's id, phone and role.
+        return res.json({ success: true, message: EMAIL_VERIFY_ALREADY, ...ownUserOnly(req, user) });
       }
       if (isEmailVerificationExpired(user.emailVerifyExpiresAt)) {
         return res.status(400).json({ success: false, error: EMAIL_VERIFY_EXPIRED });
@@ -1076,8 +1121,10 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (!user) {
         return res.status(400).json({ success: false, error: EMAIL_VERIFY_NOT_FOUND });
       }
+      // Email + phone is not proof of ownership, so the account itself only
+      // goes back to its signed-in owner.
       if (isStoredEmailVerified(user)) {
-        return res.json({ success: true, user: publicUser(user), emailSent: true, message: EMAIL_VERIFY_ALREADY });
+        return res.json({ success: true, emailSent: true, message: EMAIL_VERIFY_ALREADY, ...ownUserOnly(req, user) });
       }
 
       const issued = issueEmailVerification(user);
@@ -1085,9 +1132,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       const emailSent = await sendVerificationEmail(user.email, issued.code, issued.token);
       res.json({
         success: true,
-        user: publicUser(user),
-        message: emailSent ? EMAIL_RESEND_SENT : EMAIL_RESEND_FALLBACK,
-        ...verificationPayload(emailSent, issued.code),
+        ...ownUserOnly(req, user),
+        ...verificationPayload(emailSent, issued.code, EMAIL_RESEND_SENT, EMAIL_RESEND_FALLBACK),
       });
     } catch {
       res.status(500).json({ success: false, error: 'تعذر إعادة إرسال رمز التأكيد.' });

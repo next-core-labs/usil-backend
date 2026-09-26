@@ -501,11 +501,192 @@ describe('POST /api/bookings — server-side pricing and checks', () => {
     delete process.env.MOYASAR_SECRET_KEY;
     try {
       const res = await call(url, 'POST', '/api/bookings', '', checkout);
-      assert.equal(res.status, 400);
-      assert.match(res.json.error, /ميسر/);
+      assert.equal(res.status, 503);
+      assert.match(res.json.error, /ميسر غير مفعّل/);
       assert.equal(createBookingStore(dir).count(), 0);
     } finally {
       process.env.MOYASAR_SECRET_KEY = saved;
+      await close();
+    }
+  });
+});
+
+describe('POST /api/bookings — field shapes', () => {
+  it('refuses objects and arrays in text fields and stores nothing', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const bad: Array<Record<string, unknown>> = [
+        { name: { $gt: '' } },
+        { notes: { a: [1] } },
+        { city: ['x'] },
+        { email: { x: 1 } },
+        { serviceName: ['a', 'b'] },
+        { eventDate: { y: 2026 } },
+        { phone: ['0551234567'] },
+        { serviceId: { id: 'lst-coffee' } },
+        { totalAmount: { n: 1000 } },
+      ];
+      for (const patch of bad) {
+        const res = await call(url, 'POST', '/api/bookings', '', { ...checkout, ...patch });
+        assert.equal(res.status, 400, JSON.stringify(patch));
+      }
+      const blankName = await call(url, 'POST', '/api/bookings', '', { ...checkout, name: '   ' });
+      assert.equal(blankName.status, 400);
+      assert.equal(createBookingStore(dir).count(), 0);
+    } finally {
+      await close();
+    }
+  });
+
+  it('requires items to be an array of plain objects with string ids', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      for (const items of ['lst-coffee', { id: 'lst-coffee' }, [['lst-coffee']], [null], [{ id: 7 }], [{ id: { $ne: '' } }], [{ id: '  ' }]]) {
+        const res = await call(url, 'POST', '/api/bookings', '', { ...checkout, items });
+        assert.equal(res.status, 400, JSON.stringify(items));
+      }
+      assert.equal(createBookingStore(dir).count(), 0);
+    } finally {
+      await close();
+    }
+  });
+
+  it('trims and caps the text it stores', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'POST', '/api/bookings', '', {
+        ...checkout,
+        name: `  ${'ن'.repeat(300)}  `,
+        notes: 'م'.repeat(5000),
+        city: `  ${'ر'.repeat(200)}`,
+      });
+      assert.equal(res.status, 201, JSON.stringify(res.json));
+      const stored = createBookingStore(dir).findById(res.json.booking.id)!;
+      assert.equal(stored.name.length, 100);
+      assert.equal(stored.notes.length, 1000);
+      assert.equal(stored.city.length, 80);
+      assert.equal(typeof stored.email, 'string');
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('POST /api/bookings — duplicate check needs the same buyer', () => {
+  it('a stranger\'s order with the same phone does not block a signed-in customer', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      // A guest types the client's phone and an email of their own.
+      const squat = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0512345678', email: 'x@evil.sa' });
+      assert.equal(squat.status, 201);
+      const mine = await call(url, 'POST', '/api/bookings', 'client', { ...checkout, phone: '0512345678' });
+      assert.equal(mine.status, 201, JSON.stringify(mine.json));
+      assert.notEqual(mine.json.booking.id, squat.json.booking.id);
+      // The guest's own repeat is still caught.
+      const again = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0512345678', email: 'x@evil.sa' });
+      assert.equal(again.status, 409);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('PATCH /api/bookings/:id — transition rules', () => {
+  it('keeps final statuses final for vendors and never goes back to new', async () => {
+    const dir = tmpDir();
+    seed(dir, [
+      row({ id: 'BK-cancelled', status: 'ملغي' }),
+      row({ id: 'BK-done', status: 'مكتمل' }),
+      row({ id: 'BK-rejected', status: 'مرفوض من المورّد' }),
+      row({ id: 'BK-confirmed', status: 'مؤكد' }),
+    ]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      for (const id of ['BK-cancelled', 'BK-done', 'BK-rejected']) {
+        const res = await call(url, 'PATCH', `/api/bookings/${id}`, 'vendor1', { status: 'مؤكد' });
+        assert.equal(res.status, 409, id);
+        assert.match(res.json.error, /لا يمكن تغيير حالته/);
+      }
+      const back = await call(url, 'PATCH', '/api/bookings/BK-confirmed', 'vendor1', { status: 'جديد' });
+      assert.equal(back.status, 409);
+      const store = createBookingStore(dir);
+      assert.equal(store.findById('BK-cancelled')?.status, 'ملغي');
+      assert.equal(store.findById('BK-done')?.status, 'مكتمل');
+      assert.equal(store.findById('BK-confirmed')?.status, 'مؤكد');
+
+      // The normal path still works.
+      assert.equal((await call(url, 'PATCH', '/api/bookings/BK-confirmed', 'vendor1', { status: 'قيد التنفيذ' })).status, 200);
+      assert.equal((await call(url, 'PATCH', '/api/bookings/BK-confirmed', 'vendor1', { status: 'مكتمل' })).status, 200);
+    } finally {
+      await close();
+    }
+  });
+
+  it('lets an admin override a final status', async () => {
+    const dir = tmpDir();
+    seed(dir, [row({ id: 'BK-done', status: 'مكتمل' })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'PATCH', '/api/bookings/BK-done', 'admin', { status: 'قيد التنفيذ' });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.booking.status, 'قيد التنفيذ');
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('PATCH /api/bookings/:id — ending a paid order', () => {
+  it('refuses a vendor cancelling or rejecting a paid order', async () => {
+    const dir = tmpDir();
+    seed(dir, [row({ id: 'BK-paid', paymentStatus: 'paid', status: 'مؤكد' })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      for (const status of ['ملغي', 'مرفوض من المورّد']) {
+        const res = await call(url, 'PATCH', '/api/bookings/BK-paid', 'vendor1', { status });
+        assert.equal(res.status, 409, status);
+        assert.match(res.json.error, /إدارة يوصل/);
+      }
+      const stored = createBookingStore(dir).findById('BK-paid');
+      assert.equal(stored?.status, 'مؤكد');
+      assert.equal(stored?.cancellation, undefined);
+    } finally {
+      await close();
+    }
+  });
+
+  it('records a pending full refund when an admin cancels a paid order', async () => {
+    const dir = tmpDir();
+    seed(dir, [row({ id: 'BK-paid', paymentStatus: 'paid', status: 'مؤكد', totalAmount: 1234.5 })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'PATCH', '/api/bookings/BK-paid', 'admin', { status: 'ملغي' });
+      assert.equal(res.status, 200);
+      const cancellation = createBookingStore(dir).findById('BK-paid')?.cancellation;
+      assert.equal(cancellation?.cancelledBy, 'admin');
+      assert.equal(cancellation?.refundPercent, 100);
+      assert.equal(cancellation?.refundHalalas, 123_450);
+      assert.equal(cancellation?.refundStatus, 'pending');
+      assert.ok(cancellation?.cancelledAt);
+    } finally {
+      await close();
+    }
+  });
+
+  it('lets a vendor reject an unpaid order, noting nothing is owed', async () => {
+    const dir = tmpDir();
+    seed(dir, [row({ id: 'BK-unpaid', status: 'بانتظار موافقة المورّد' })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'PATCH', '/api/bookings/BK-unpaid', 'vendor1', { status: 'مرفوض من المورّد' });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.booking.cancellation.cancelledBy, 'vendor');
+      assert.equal(res.json.booking.cancellation.refundStatus, 'not_applicable');
+    } finally {
       await close();
     }
   });

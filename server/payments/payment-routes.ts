@@ -4,15 +4,19 @@ import { publicSiteUrl } from '../auth/email-verification.ts';
 import type { BookingService } from '../bookings/booking-routes.ts';
 import { CLOSED_BOOKING_STATUSES, clientOwnsBooking } from '../bookings/booking-store.ts';
 import {
+  MOYASAR_NOT_CONFIGURED,
   createInvoice,
+  fetchMoyasarPayment,
   fetchPayment,
   isSafeMoyasarId,
+  moyasarErrorCode,
   moyasarConfigured,
   moyasarFormReady,
   moyasarPublishableKey,
   moyasarWebhookAuthorized,
   moyasarWebhookUrl,
   verifyMoyasarCheckout,
+  type MoyasarFailureCode,
 } from './moyasar.ts';
 
 type Deps = {
@@ -23,8 +27,8 @@ type Deps = {
 };
 
 /**
- * Guest checkout means invoice creation cannot require a session, so it is
- * throttled per IP instead — each accepted call raises a real invoice.
+ * Each accepted call raises a real invoice, so it is throttled per IP on top
+ * of the session check. Guest checkout gets its invoice from POST /api/bookings.
  */
 const INVOICE_LIMIT = 10;
 const INVOICE_WINDOW_MS = 60_000;
@@ -40,6 +44,22 @@ const INVOICE_NEEDS_LOGIN = 'سجّل الدخول بالحساب الذي أن�
 const INVOICE_BOOKING_NOT_FOUND = 'الحجز غير موجود';
 const INVOICE_ALREADY_PAID = 'هذا الطلب مدفوع مسبقاً.';
 const INVOICE_BOOKING_CLOSED = 'الطلب ملغي أو منتهٍ، ولا يمكن دفعه.';
+const INVOICE_NEEDS_BOOKING = 'الدفع يكون لطلب محفوظ. أكمل الطلب من السلة ثم ادفع.';
+const PAYMENT_NOT_FOUND = 'عملية الدفع غير موجودة.';
+const PAYMENT_UPSTREAM = 'تعذر التواصل مع ميسر الآن. حاول بعد قليل.';
+const INVOICE_UPSTREAM = 'تعذر إنشاء رابط الدفع من ميسر. حاول بعد قليل.';
+
+/** Our missing key is 503 (retry later); Moyasar's own failure is 502. */
+function moyasarFailureStatus(code: MoyasarFailureCode | null): number {
+  if (code === 'not_configured') return 503;
+  if (code === 'not_found') return 404;
+  if (code === 'invalid') return 400;
+  return 502;
+}
+
+function isSupervisor(role?: string): boolean {
+  return role === 'admin' || role === 'accounts_manager';
+}
 
 export function registerPaymentRoutes(app: Express, deps: Deps) {
   const { bookings } = deps;
@@ -80,12 +100,16 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     // order, and always for the stored amount — never the client's.
     const requestedBookingId = BOOKING_METADATA_KEYS.map((key) => metadata[key]).find(Boolean) || '';
     const booking = requestedBookingId ? bookings.findById(requestedBookingId) : null;
+    const actor = bookings.actorFromRequest(req);
+    // A free amount is only for supervisors raising a manual invoice. The
+    // storefront always names a booking (checkout raises its own invoice).
+    if (!requestedBookingId && !isSupervisor(actor?.role)) {
+      return res.status(actor ? 403 : 401).json({ error: actor ? INVOICE_NEEDS_BOOKING : INVOICE_NEEDS_LOGIN });
+    }
     if (requestedBookingId) {
-      const actor = bookings.actorFromRequest(req);
       if (!actor) return res.status(401).json({ error: INVOICE_NEEDS_LOGIN });
       const allowed =
-        actor.role === 'admin' ||
-        actor.role === 'accounts_manager' ||
+        isSupervisor(actor.role) ||
         (actor.role === 'client' && Boolean(booking) && clientOwnsBooking(actor, booking!));
       if (!booking || !allowed) return res.status(404).json({ error: INVOICE_BOOKING_NOT_FOUND });
       if (booking.paymentStatus === 'paid') return res.status(409).json({ error: INVOICE_ALREADY_PAID });
@@ -119,7 +143,11 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
       if (booking) bookings.attachInvoice(booking.id, { id: invoice.id, url: invoice.url });
       res.json({ id: invoice.id, url: invoice.url });
     } catch (error) {
-      res.status(502).json({ error: (error as Error).message });
+      const code = moyasarErrorCode(error);
+      if (code === 'not_configured') return res.status(503).json({ error: MOYASAR_NOT_CONFIGURED });
+      if (code === 'invalid') return res.status(400).json({ error: (error as Error).message });
+      if (!code) console.error('[moyasar] invoice route failed', error);
+      res.status(502).json({ error: INVOICE_UPSTREAM });
     }
   });
 
@@ -141,7 +169,7 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     try {
       const payment = await fetchPayment(paymentId);
       if (payment.status === 'paid') {
-        bookings.markPaidFromMoyasar({
+        const settled = bookings.markPaidFromMoyasar({
           paymentId: payment.id,
           invoiceId: payment.invoice_id || payment.invoiceId,
           bookingId: payment.bookingId || payment.metadata?.order_id || payment.metadata?.bookingId,
@@ -150,11 +178,25 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
           amountHalalas: payment.amount,
           currency: payment.currency,
         });
+        if (!settled) {
+          // Invoices raised outside checkout settle nothing here; a 5xx would only make Moyasar retry.
+          console.warn('[moyasar] webhook: paid payment matches no booking', payment.id);
+          return res.json({ received: true, ignored: true });
+        }
         console.log('[moyasar] payment paid', payment.id, payment.metadata?.order_id || payment.bookingId || '');
       }
       res.json({ received: true });
     } catch (error) {
-      res.status(500).json({ error: (error as Error).message });
+      const code = moyasarErrorCode(error);
+      // Retrying cannot make an unknown (or malformed) payment id exist.
+      if (code === 'not_found' || code === 'invalid') {
+        console.warn('[moyasar] webhook: payment unknown to Moyasar', paymentId);
+        return res.json({ received: true, ignored: true });
+      }
+      if (!code) console.error('[moyasar] webhook failed', error);
+      // Our own faults stay 5xx so Moyasar retries once we are back.
+      if (code === 'not_configured') return res.status(503).json({ error: MOYASAR_NOT_CONFIGURED });
+      res.status(code ? 502 : 500).json({ error: code ? PAYMENT_UPSTREAM : 'internal error' });
     }
   });
 
@@ -163,19 +205,20 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     if (!isSafeMoyasarId(id)) {
       return res.status(400).json({ error: 'رقم عملية ميسر غير صالح.' });
     }
-    try {
-      const payment = await fetchPayment(id);
-      res.json({
-        id: payment.id,
-        status: payment.status,
-        // Moyasar works in halalas; this API surface is in riyals.
-        amount: payment.amount / 100,
-        description: payment.description,
-        metadata: payment.metadata,
-      });
-    } catch (error) {
-      res.status(502).json({ error: (error as Error).message });
+    const out = await fetchMoyasarPayment(id);
+    if (out.ok === false) {
+      const status = moyasarFailureStatus(out.code);
+      const error =
+        out.code === 'not_configured' ? MOYASAR_NOT_CONFIGURED : out.code === 'not_found' ? PAYMENT_NOT_FOUND : PAYMENT_UPSTREAM;
+      return res.status(status).json({ error });
     }
+    // Public (no login): only what the payment result page shows. The
+    // description and metadata carry order and customer details.
+    res.json({
+      status: out.payment.status,
+      // Moyasar works in halalas; this API surface is in riyals.
+      amount: out.payment.amount / 100,
+    });
   });
 
   /** Browser returning from the hosted invoice — verified server-side. */
@@ -185,7 +228,15 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
 
     const verified = await verifyMoyasarCheckout(moyasarId);
     if (verified.ok === false) {
-      return res.status(400).json({ success: false, error: verified.error });
+      const error =
+        verified.code === 'not_configured'
+          ? MOYASAR_NOT_CONFIGURED
+          : verified.code === 'upstream'
+            ? PAYMENT_UPSTREAM
+            : verified.code === 'not_found'
+              ? PAYMENT_NOT_FOUND
+              : verified.error;
+      return res.status(moyasarFailureStatus(verified.code)).json({ success: false, error });
     }
 
     const status = verified.kind === 'payment' ? verified.payment.status : verified.invoice.status;

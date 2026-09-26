@@ -29,7 +29,8 @@ export async function sendPasswordResetEmail(email: string, code: string): Promi
     'رمز استعادة الحساب على منصة يوصل.',
     '',
     `رمز التأكيد: ${code}`,
-    'صالح لمدة 30 دقيقة.',
+    // Must match RESET_CODE_TTL_MS in auth.ts.
+    'صالح لمدة 15 دقيقة.',
     '',
     'إذا لم تطلب استعادة الحساب فتجاهل هذه الرسالة. الرقم السري لا يتغيّر إلا بعد إدخال الرمز.',
   ].join('\n');
