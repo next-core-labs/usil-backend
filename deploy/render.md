@@ -21,14 +21,17 @@ Data lives on a persistent disk mounted at `/app/data`, the same place the VPS m
    - `GEMINI_API_KEY`: optional
    - SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`): add them under
      Environment if the VPS sets them.
-4. Wait for the first deploy, then open `https://usil.onrender.com/api/health`. Render
+4. Wait for the first deploy, then open `https://usil-emjc.onrender.com/api/health`. Render
    adds a suffix if `usil` is taken, so use the URL it shows, here and in step 3. The
    disk starts empty, so the site has no data yet.
 
+The service is `https://usil-emjc.onrender.com`.
+
 The frontend is built from the branch in `FRONTEND_REF` (default `main`). A push to
-`usil-frontend` does **not** redeploy on its own. Either press **Manual Deploy → Deploy
-latest commit**, or call the service's Deploy Hook (Settings → Deploy Hook) from a GitHub
-Action in the frontend repo.
+`usil-frontend` does **not** redeploy on its own. Either press **Manual Deploy → Clear
+build cache & deploy**, or call the service's Deploy Hook (Settings → Deploy Hook) from a
+GitHub Action in the frontend repo. Every backend deploy clones the frontend fresh; the
+build log prints `frontend <sha> <subject>` so you can confirm which commit shipped.
 
 ## 2. Move the data (downtime starts here)
 
@@ -57,8 +60,8 @@ already listed from `render.yaml`. Point Cloudflare at the target Render shows:
 
 | Name    | Type  | Target                | Proxy                           |
 |---------|-------|-----------------------|---------------------------------|
-| `@`     | CNAME | `usil.onrender.com`   | Proxied (orange)                |
-| `hooks` | CNAME | `usil.onrender.com`   | **DNS only** (grey), as before  |
+| `@`     | CNAME | `usil-emjc.onrender.com` | Proxied (orange)             |
+| `hooks` | CNAME | `usil-emjc.onrender.com` | **DNS only** (grey), as before |
 
 `hooks` has to stay grey: Bot Fight Mode blocks Moyasar's webhook on the proxied
 domain. The webhook URL doesn't change, so nothing needs re-registering with Moyasar.
