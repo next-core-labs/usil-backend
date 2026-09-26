@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  MoyasarError,
   createInvoice,
   createMoyasarInvoice,
   fetchMoyasarInvoice,
@@ -270,7 +271,7 @@ describe('moyasar hosted invoice + webhook', () => {
             backUrl: 'https://usil.app/payment/cancelled',
             callbackUrl: 'https://usil.app/api/payments/webhook',
           }),
-        /MOYASAR_SECRET_KEY/,
+        (error: unknown) => error instanceof MoyasarError && error.code === 'not_configured' && /ميسر غير مفعّل/.test(error.message),
       );
     } finally {
       if (prev === undefined) delete process.env.MOYASAR_SECRET_KEY;
@@ -339,6 +340,51 @@ describe('moyasar hosted invoice + webhook', () => {
       delete process.env.MOYASAR_SECRET_KEY;
       delete process.env.MOYASAR_WEBHOOK_SECRET;
       delete process.env.MOYASAR_WEBHOOK_URL;
+    }
+  });
+});
+
+describe('moyasar failure codes', () => {
+  const ID = '79cced57-9deb-4c4b-8f48-59c124f79688';
+  const answer = (status: number, body: unknown) =>
+    (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+
+  it('tells a missing payment apart from a provider fault, without Moyasar\'s raw text', async () => {
+    process.env.MOYASAR_SECRET_KEY = 'sk_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    try {
+      const missing = await fetchMoyasarPayment(ID, answer(404, { message: 'Object not found' }));
+      assert.equal(missing.ok, false);
+      if (!missing.ok) assert.equal(missing.code, 'not_found');
+
+      const broken = await fetchMoyasarPayment(ID, answer(500, { message: 'internal stack trace' }));
+      assert.equal(broken.ok, false);
+      if (!broken.ok) {
+        assert.equal(broken.code, 'upstream');
+        assert.doesNotMatch(broken.error, /stack trace/);
+      }
+
+      const neither = await verifyMoyasarCheckout(ID, answer(404, { message: 'Not found' }));
+      assert.equal(neither.ok, false);
+      if (!neither.ok) assert.equal(neither.code, 'not_found');
+    } finally {
+      delete process.env.MOYASAR_SECRET_KEY;
+    }
+  });
+
+  it('reports a missing key as not_configured', async () => {
+    const prev = process.env.MOYASAR_SECRET_KEY;
+    delete process.env.MOYASAR_SECRET_KEY;
+    delete process.env.MOYASAR_API_KEY;
+    delete process.env.PAYMENT_PROVIDER_SECRET_KEY;
+    try {
+      const out = await verifyMoyasarCheckout(ID);
+      assert.equal(out.ok, false);
+      if (!out.ok) assert.equal(out.code, 'not_configured');
+      const invoice = await createMoyasarInvoice({ amountSar: 10, description: 'x', bookingId: 'BK-1' });
+      assert.equal(invoice.ok, false);
+      if (!invoice.ok) assert.equal(invoice.code, 'not_configured');
+    } finally {
+      if (prev !== undefined) process.env.MOYASAR_SECRET_KEY = prev;
     }
   });
 });

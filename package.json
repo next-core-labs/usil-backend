@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
-    "build": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs",
-    "clean": "rm -rf dist",
+    "build": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=build/server.cjs",
+    "start": "node --enable-source-maps build/server.cjs",
+    "clean": "rm -rf dist build",
     "lint": "tsc --noEmit",
     "test": "node --import tsx --test $(find server core -name '*.test.ts' | sort)",
     "sync:web": "node scripts/sync-web-build.mjs",

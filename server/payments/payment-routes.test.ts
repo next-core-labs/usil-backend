@@ -186,13 +186,22 @@ describe('POST /api/payments/invoice with a booking id', () => {
     await close();
   });
 
-  it('still raises a plain invoice that names no booking', async () => {
+  it('raises a free-amount invoice only for an admin', async () => {
     const dir = tmpDir();
     const { url, close } = await listen(buildApp(dir));
-    const res = await call(url, 'POST', '/api/payments/invoice', '', { amount: 25, description: 'تبرع', metadata: { note: 'x' } });
-    assert.equal(res.status, 200);
-    assert.equal(invoicesRaised[invoicesRaised.length - 1].amount, 2_500);
-    await close();
+    try {
+      const before = invoicesRaised.length;
+      const body = { amount: 25, description: 'تبرع', metadata: { note: 'x' } };
+      assert.equal((await call(url, 'POST', '/api/payments/invoice', '', body)).status, 401);
+      assert.equal((await call(url, 'POST', '/api/payments/invoice', 'owner', body)).status, 403);
+      assert.equal((await call(url, 'POST', '/api/payments/invoice', 'vendor', body)).status, 403);
+      assert.equal(invoicesRaised.length, before);
+      const res = await call(url, 'POST', '/api/payments/invoice', 'admin', body);
+      assert.equal(res.status, 200);
+      assert.equal(invoicesRaised[invoicesRaised.length - 1].amount, 2_500);
+    } finally {
+      await close();
+    }
   });
 });
 
@@ -261,5 +270,112 @@ describe('settlement trusts only Moyasar\'s own amount', () => {
     assert.equal(res.status, 200);
     assert.equal(createBookingStore(dir).findById('BK-500001')?.paymentStatus, 'unpaid');
     await close();
+  });
+});
+
+describe('webhook for a payment we cannot settle', () => {
+  it('answers 200 ignored when Moyasar does not know the payment', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'POST', '/api/payments/webhook', '', {
+        secret_token: 'whsec-test',
+        data: { id: 'pay_ghost000001' },
+      });
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.json, { received: true, ignored: true });
+    } finally {
+      await close();
+    }
+  });
+
+  it('answers 200 ignored when a paid payment matches no booking', async () => {
+    const dir = tmpDir();
+    providerPayments.pay_orphan00001 = { id: 'pay_orphan00001', status: 'paid', amount: 5_000, currency: 'SAR' };
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'POST', '/api/payments/webhook', '', {
+        secret_token: 'whsec-test',
+        data: { id: 'pay_orphan00001' },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.ignored, true);
+    } finally {
+      await close();
+    }
+  });
+
+  it('stays 5xx when the fault is ours', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    const key = process.env.MOYASAR_SECRET_KEY;
+    delete process.env.MOYASAR_SECRET_KEY;
+    try {
+      const res = await call(url, 'POST', '/api/payments/webhook', '', {
+        secret_token: 'whsec-test',
+        data: { id: 'pay_ghost000001' },
+      });
+      assert.equal(res.status, 503);
+    } finally {
+      process.env.MOYASAR_SECRET_KEY = key;
+      await close();
+    }
+  });
+});
+
+describe('GET /api/payments/:id — public lookup', () => {
+  it('returns only the status and amount the result page shows', async () => {
+    const dir = tmpDir();
+    providerPayments.pay_public00001 = {
+      id: 'pay_public00001',
+      status: 'paid',
+      amount: 150_000,
+      currency: 'SAR',
+      description: 'طلب يوصل BK-500001 — ركن قهوة',
+      metadata: { bookingId: 'BK-500001', order_id: 'BK-500001' },
+    };
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'GET', '/api/payments/pay_public00001');
+      assert.equal(res.status, 200);
+      assert.deepEqual(res.json, { status: 'paid', amount: 1500 });
+    } finally {
+      await close();
+    }
+  });
+
+  it('answers 404 with a generic message for an unknown payment', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'GET', '/api/payments/pay_ghost000001');
+      assert.equal(res.status, 404);
+      assert.doesNotMatch(String(res.json.error), /not found/);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('Moyasar not configured', () => {
+  it('answers 503 with the same message on every payments route', async () => {
+    const dir = tmpDir();
+    createBookingStore(dir).add(row());
+    const { url, close } = await listen(buildApp(dir));
+    const key = process.env.MOYASAR_SECRET_KEY;
+    delete process.env.MOYASAR_SECRET_KEY;
+    try {
+      const responses = [
+        await call(url, 'GET', '/api/payments/pay_public00001'),
+        await call(url, 'POST', '/api/payments/moyasar/callback', '', { id: 'pay_public00001' }),
+        await call(url, 'POST', '/api/payments/invoice', 'owner', { metadata: { bookingId: 'BK-500001' } }),
+      ];
+      for (const res of responses) assert.equal(res.status, 503, JSON.stringify(res.json));
+      assert.equal(new Set(responses.map((res) => res.json.error)).size, 1);
+      assert.match(responses[0].json.error, /ميسر غير مفعّل/);
+    } finally {
+      process.env.MOYASAR_SECRET_KEY = key;
+      await close();
+    }
   });
 });

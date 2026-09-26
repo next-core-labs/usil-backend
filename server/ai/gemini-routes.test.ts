@@ -116,3 +116,37 @@ describe('gemini routes without a configured provider', () => {
     }
   });
 });
+
+describe('gemini routes log labels', () => {
+  it('names the active provider, not Gemini, when a text route fails', async () => {
+    const failing = {
+      activeProvider: () => 'anthropic',
+      settings: () => ({}),
+      textClient: () => ({
+        models: {
+          generateContent: async () => {
+            throw new Error('boom');
+          },
+        },
+      }),
+    };
+    const app = express();
+    app.use(express.json());
+    registerGeminiRoutes(app, { ai: failing as never });
+    const original = console.error;
+    const logged: string[] = [];
+    console.error = (...args: unknown[]) => {
+      logged.push(String(args[0]));
+    };
+    const { url, close } = await listen(app);
+    try {
+      const { status } = await post(url, '/api/gemini/chat', { messages: [{ role: 'user', content: 'مرحبا' }] });
+      assert.equal(status, 502);
+    } finally {
+      console.error = original;
+      await close();
+    }
+    assert.ok(logged.some((line) => line.includes('Anthropic')), logged.join('\n'));
+    assert.ok(!logged.some((line) => line.includes('Gemini')));
+  });
+});

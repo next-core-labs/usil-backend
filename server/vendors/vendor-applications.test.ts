@@ -30,7 +30,7 @@ const valid: VendorApplicationInput = {
   bankName: 'مصرف الراجحي',
   iban: 'SA0380000000608010167519',
   accountHolderName: 'نواف محمد المهيع',
-  password: 'Secret1',
+  password: 'Secret12',
   fulfillment: ['hour', 'same_day'],
   instagram: '@irth.diyafa',
   confirmedOwn: true,
@@ -79,6 +79,11 @@ describe('vendor-applications', () => {
     assert.equal(created.socials?.links[0]?.status, 'linked');
     assert.equal(store.statusForEmail(valid.email), 'pending');
     assert.throws(() => store.submit(valid, 'hash:demo'), /بانتظار موافقة/);
+  });
+
+  it('requires a password of at least 8 characters', () => {
+    assert.throws(() => validateVendorApplication({ ...valid, password: 'Secret1' }), /8 خانات/);
+    assert.doesNotThrow(() => validateVendorApplication({ ...valid, password: 'Secret12' }));
   });
 
   it('approves and rejects applications', () => {

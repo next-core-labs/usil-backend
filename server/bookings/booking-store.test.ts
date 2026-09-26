@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import {
   PLATFORM_BOOKING_STATUSES,
+  checkStatusTransition,
   createBookingStore,
   isPlatformBookingStatus,
   vendorOwnsWholeBooking,
@@ -142,12 +143,62 @@ describe('booking store', () => {
     const store = createBookingStore(tmpDir());
     const now = Date.parse('2026-09-11T10:05:00Z');
     store.add(booking({ id: 'BK-dup', userId: 'u-1', serviceId: 'lst-a', items: [{ id: 'lst-a' }], createdAt: '2026-09-11 10:00' }));
-    const query = { userId: 'u-1', listingIds: ['lst-a'], eventDate: '2026-10-01', windowMs: 10 * 60_000, now };
+    const query = {
+      userId: 'u-1',
+      phone: '0512345678',
+      listingIds: ['lst-a'],
+      eventDate: '2026-10-01',
+      windowMs: 10 * 60_000,
+      now,
+    };
     assert.equal(store.findRecentDuplicate(query)?.id, 'BK-dup');
     assert.equal(store.findRecentDuplicate({ ...query, eventDate: '2026-10-02' }), null);
     assert.equal(store.findRecentDuplicate({ ...query, listingIds: ['lst-a', 'lst-b'] }), null);
     assert.equal(store.findRecentDuplicate({ ...query, userId: 'u-2' }), null);
     assert.equal(store.findRecentDuplicate({ ...query, now: now + 20 * 60_000 }), null);
+  });
+
+  it('does not let a stranger who knows the phone block its owner', () => {
+    const store = createBookingStore(tmpDir());
+    const now = Date.parse('2026-09-11T10:05:00Z');
+    // Placed by someone else with the victim's phone, as a guest and as another account.
+    store.add(booking({ id: 'BK-guest-squat', email: 'attacker@x.sa', items: [{ id: 'lst-a' }], serviceId: 'lst-a' }));
+    store.add(booking({ id: 'BK-acct-squat', userId: 'u-attacker', email: '', items: [{ id: 'lst-a' }], serviceId: 'lst-a' }));
+    const base = { phone: '0512345678', listingIds: ['lst-a'], eventDate: '2026-10-01', windowMs: 10 * 60_000, now };
+
+    assert.equal(store.findRecentDuplicate({ ...base, userId: 'u-victim', email: 'victim@usil.sa' }), null);
+    assert.equal(store.findRecentDuplicate({ ...base, email: 'victim@usil.sa' }), null);
+    assert.equal(store.findRecentDuplicate(base), null);
+    // The genuine repeat — same phone and same email — is still caught.
+    assert.equal(store.findRecentDuplicate({ ...base, email: 'Attacker@x.sa' })?.id, 'BK-guest-squat');
+    assert.equal(store.findRecentDuplicate({ ...base, userId: 'u-attacker' })?.id, 'BK-acct-squat');
+    // Same account but a different phone is a different order.
+    assert.equal(store.findRecentDuplicate({ ...base, phone: '0599999999', userId: 'u-attacker' }), null);
+  });
+
+  it('checks status transitions: final stays final, nothing goes back to new, admins override', () => {
+    for (const final of ['ملغي', 'مرفوض من المورّد', 'مكتمل']) {
+      assert.deepEqual(checkStatusTransition(final, 'مؤكد', 'vendor'), { ok: false, reason: 'final' });
+      assert.deepEqual(checkStatusTransition(final, 'جديد', 'vendor'), { ok: false, reason: 'final' });
+      assert.deepEqual(checkStatusTransition(final, 'مؤكد', 'admin'), { ok: true, override: true });
+      // Re-saving the same status is a no-op, not a change.
+      assert.deepEqual(checkStatusTransition(final, final, 'vendor'), { ok: true, override: false });
+    }
+    assert.deepEqual(checkStatusTransition('مؤكد', 'جديد', 'vendor'), { ok: false, reason: 'back_to_new' });
+    assert.deepEqual(checkStatusTransition('بانتظار موافقة المورّد', 'جديد', 'vendor'), { ok: false, reason: 'back_to_new' });
+    assert.deepEqual(checkStatusTransition('مؤكد', 'جديد', 'admin'), { ok: true, override: true });
+    assert.deepEqual(checkStatusTransition('جديد', 'مؤكد', 'vendor'), { ok: true, override: false });
+    assert.deepEqual(checkStatusTransition('مؤكد', 'قيد التنفيذ', 'vendor'), { ok: true, override: false });
+    assert.deepEqual(checkStatusTransition('قيد التنفيذ', 'مكتمل', 'vendor'), { ok: true, override: false });
+    assert.deepEqual(checkStatusTransition('بانتظار موافقة المورّد', 'مرفوض من المورّد', 'vendor'), { ok: true, override: false });
+  });
+
+  it('enforces the transition rule in updateStatus too, vendor rule by default', () => {
+    const store = createBookingStore(tmpDir());
+    store.add(booking({ id: 'BK-done', status: 'مكتمل' }));
+    assert.equal(store.updateStatus('BK-done', 'جديد'), null);
+    assert.equal(statusOf(store, 'BK-done'), 'مكتمل');
+    assert.equal(store.updateStatus('BK-done', 'مؤكد', { by: 'admin' })?.status, 'مؤكد');
   });
 
   it('records a cancellation with its refund decision', () => {

@@ -56,16 +56,21 @@ export function registerMoyasarAdminRoutes(
       ? ''
       : incomingPublishable || previous.publishableKey;
 
+    // A pasted-but-wrong key is checked before "no key at all": otherwise a
+    // first-time admin who pastes pk_ only ever sees the generic prompt.
+    const pastedSecret = typeof req.body?.secretKey === 'string' ? req.body.secretKey.trim() : '';
+    if (pastedSecret && !incomingSecret) {
+      return res.status(400).json({
+        success: false,
+        error: pastedSecret.startsWith('pk_')
+          ? 'هذا المفتاح العام (Publishable Key يبدأ بـ pk_). الصق Secret Key الذي يبدأ بـ sk_live_ أو sk_test_ في هذا الحقل.'
+          : 'المفتاح ناقص أو فيه نجوم أو pk_. اضغط العين بجانب Secret Key وانسخ sk_ الكامل.',
+      });
+    }
     if (!secretKey) {
       return res.status(400).json({
         success: false,
         error: 'الصق Secret Key من لوحة ميسر (يبدأ بـ sk_live_ أو sk_test_). اضغط العين بجانب المفتاح وانسخه كاملاً بدون نجوم.',
-      });
-    }
-    if (req.body?.secretKey && !incomingSecret) {
-      return res.status(400).json({
-        success: false,
-        error: 'المفتاح ناقص أو فيه نجوم أو pk_. اضغط العين بجانب Secret Key وانسخ sk_ الكامل.',
       });
     }
     if (req.body?.publishableKey && !clearPublishable && !incomingPublishable) {

@@ -6,6 +6,7 @@ import path from 'path';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { registerVendorRoutes } from './vendor-routes.ts';
+import { createVendorStore } from './vendor-store.ts';
 import { roleAllowed } from '../auth/roles.ts';
 
 function tmpDir() {
@@ -620,6 +621,201 @@ describe('vendor-routes QA fixes', () => {
       assert.equal(fixedJson.vendorId, 'usr-vendor');
     } finally {
       await admin.close();
+    }
+  });
+});
+
+describe('vendor-routes QA round 2', () => {
+  const IMAGES = ['/uploads/listing-a.jpg', '/uploads/listing-b.jpg'];
+  const listing = (extra: Record<string, unknown> = {}) => ({
+    title: 'قهوة',
+    category: 'hospitality',
+    price: 70,
+    fulfillment: ['hour'],
+    images: IMAGES,
+    ...extra,
+  });
+  const link = (network: string, handle: string, url: string, status = 'linked') => ({
+    network,
+    handle,
+    url,
+    status,
+    confirmedOwn: true,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  });
+
+  async function serve(auth: unknown, dir: string) {
+    const app = express();
+    app.use(express.json({ limit: '2mb' }));
+    registerVendorRoutes(app, auth as any, dir);
+    const server = await listen(app);
+    const send = (method: string, route: string, body?: unknown) =>
+      fetch(`${server.url}${route}`, {
+        method,
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    return { ...server, send };
+  }
+
+  function writeApplications(dir: string, rows: unknown[]) {
+    fs.writeFileSync(path.join(dir, 'vendor-applications.json'), JSON.stringify(rows), 'utf-8');
+  }
+
+  it('verifying one network by application id keeps the vendor current socials', async () => {
+    const dir = tmpDir();
+    writeApplications(dir, [
+      {
+        id: 'vap-old',
+        email: 'v2@usil.sa',
+        firstName: 'قديم',
+        familyName: 'الطلب',
+        projectName: 'مشروع',
+        status: 'approved',
+        socials: {
+          confirmedOwn: true,
+          links: [
+            link('instagram', 'old.insta', 'https://www.instagram.com/old.insta'),
+            link('tiktok', 'old.tok', 'https://www.tiktok.com/@old.tok'),
+            link('whatsapp', '0500000001', 'https://wa.me/966500000001'),
+          ],
+        },
+      },
+    ]);
+    createVendorStore(dir).saveSocials('v2', {
+      instagram: '@new.insta',
+      tiktok: '@new.tok',
+      whatsapp: '0559998888',
+      confirmedOwn: true,
+    });
+    const synced: unknown[] = [];
+    const auth = {
+      ...fakeAuth('admin', 'usr-admin'),
+      findUserByEmail: (email: string) => (email === 'v2@usil.sa' ? { id: 'v2', email, role: 'vendor' } : null),
+      saveUserSocials: (_id: string, socials: unknown) => {
+        synced.push(socials);
+        return null;
+      },
+    };
+    const { send, close } = await serve(auth, dir);
+    try {
+      const res = await send('POST', '/api/admin/vendor-socials/vap-old/tiktok/verify');
+      assert.equal(res.status, 200);
+      const live = createVendorStore(dir).getSocials('v2');
+      const byNetwork = new Map(live.links.map((row) => [row.network, row]));
+      assert.equal(byNetwork.get('instagram')?.url, 'https://www.instagram.com/new.insta');
+      assert.equal(byNetwork.get('tiktok')?.url, 'https://www.tiktok.com/@new.tok');
+      assert.equal(byNetwork.get('whatsapp')?.handle, '0559998888');
+      // The admin reviewed @old.tok, not the vendor's current @new.tok.
+      assert.notEqual(byNetwork.get('tiktok')?.status, 'verified');
+      assert.equal(synced.length, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('shows an admin-created vendor account on its page and in the catalog, and keeps a vendor with a rejected later application in both', async () => {
+    const dir = tmpDir();
+    writeApplications(dir, [{ id: 'vap-rej', email: 'rej@usil.sa', projectName: 'مرفوض', status: 'rejected' }]);
+    const vendors = [
+      { id: 'usr-made', name: 'مورد الإدارة', email: 'made@usil.sa', role: 'vendor' },
+      { id: 'usr-rej', name: 'مورد مرفوض', email: 'rej@usil.sa', role: 'vendor' },
+    ];
+    for (const vendor of vendors) {
+      const owner = await serve(fakeAuth('vendor', vendor.id, { vendors }), dir);
+      try {
+        assert.equal((await owner.send('POST', '/api/vendor/listings', listing({ title: `منتج ${vendor.id}` }))).status, 201);
+      } finally {
+        await owner.close();
+      }
+    }
+    const guest = await serve(fakeAuth(null, 'usr-guest', { vendors }), dir);
+    try {
+      const catalog = (await (await guest.send('GET', '/api/catalog/listings')).json()).data;
+      const catalogVendors = new Set(catalog.map((item: { vendorId?: string; provider?: { id?: string } }) => item.vendorId || item.provider?.id));
+      assert.ok(catalogVendors.has('usr-made'));
+      assert.ok(catalogVendors.has('usr-rej'));
+
+      const page = await guest.send('GET', '/api/vendors/usr-made');
+      assert.equal(page.status, 200);
+      const file = (await page.json()).data;
+      assert.equal(file.projectName, 'مورد الإدارة');
+      assert.equal(file.listings.length, 1);
+      assert.equal((await guest.send('GET', '/api/vendors/usr-rej')).status, 200);
+    } finally {
+      await guest.close();
+    }
+  });
+
+  it('hides leftovers of an already-rejected application from the admin lists, never a vendor account', async () => {
+    const dir = tmpDir();
+    writeApplications(dir, [
+      {
+        id: 'vap-rej',
+        email: 'rej@usil.sa',
+        firstName: 'مرفوض',
+        familyName: 'الطلب',
+        projectName: 'مرفوض',
+        status: 'rejected',
+        socials: { confirmedOwn: true, links: [link('instagram', 'rej.brand', 'https://www.instagram.com/rej.brand')] },
+      },
+    ]);
+    const store = createVendorStore(dir);
+    store.addListing('usr-applicant', listing({ title: 'منتج مرفوض' }));
+    store.saveSocials('usr-applicant', { instagram: '@rej.brand', confirmedOwn: true });
+    store.addListing('usr-ok', listing({ title: 'منتج معتمد' }));
+    const auth = {
+      ...fakeAuth('admin', 'usr-admin', { vendors: [{ id: 'usr-ok', name: 'معتمد', email: 'ok@usil.sa', role: 'vendor' }] }),
+      findUserByEmail: (email: string) => (email === 'rej@usil.sa' ? { id: 'usr-applicant', email, role: 'client' } : null),
+    };
+    const { send, close } = await serve(auth, dir);
+    try {
+      const listings = (await (await send('GET', '/api/admin/listings')).json()).data;
+      assert.deepEqual(listings.map((row: { vendorId: string }) => row.vendorId), ['usr-ok']);
+      const socials = (await (await send('GET', '/api/admin/vendor-socials')).json()).data;
+      assert.ok(!socials.some((row: { vendorId: string }) => row.vendorId === 'usr-applicant' || row.vendorId === 'vap-rej'));
+      const hubs = (await (await send('GET', '/api/admin/vendor-hubs')).json()).data;
+      assert.ok(!hubs.some((row: { vendorId: string }) => row.vendorId === 'usr-applicant'));
+      assert.equal(hubs.find((row: { vendorId: string }) => row.vendorId === 'usr-ok')?.listingCount, 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('includes a paid, confirmed platform order in the vendor summary', async () => {
+    const dir = tmpDir();
+    fs.writeFileSync(
+      path.join(dir, 'bookings.json'),
+      JSON.stringify([
+        {
+          id: 'bk-1',
+          name: 'عميل',
+          phone: '0501234567',
+          email: 'c@usil.sa',
+          serviceName: 'قهوة',
+          notes: '',
+          city: 'الرياض',
+          eventDate: '2099-01-01',
+          paymentMethod: 'moyasar',
+          settlement: '',
+          items: [],
+          vendorIds: ['usr-vendor'],
+          totalAmount: 1200,
+          bookingMode: 'instant',
+          status: 'مؤكد',
+          paymentStatus: 'paid',
+          createdAt: '2026-09-01 10:00',
+        },
+      ]),
+      'utf-8',
+    );
+    const { send, close } = await serve(fakeAuth('vendor'), dir);
+    try {
+      const summary = (await (await send('GET', '/api/vendor/summary')).json()).data;
+      assert.equal(summary.revenue, 1200);
+      assert.equal(summary.bookingCount, 1);
+    } finally {
+      await close();
     }
   });
 });

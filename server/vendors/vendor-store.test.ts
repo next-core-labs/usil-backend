@@ -551,3 +551,124 @@ describe('vendor-store', () => {
     assert.equal(store.updateListingAdmin('lst-none', { price: 1 }), null);
   });
 });
+
+describe('vendor-store QA round 2', () => {
+  function writeOrders(dir: string, rows: unknown[]) {
+    fs.writeFileSync(path.join(dir, 'bookings.json'), JSON.stringify(rows), 'utf-8');
+  }
+
+  const order = (extra: Record<string, unknown>) => ({
+    id: `bk-${Math.random().toString(16).slice(2)}`,
+    name: 'عميل',
+    phone: '0501234567',
+    email: 'c@usil.sa',
+    serviceName: 'طلب',
+    notes: '',
+    city: 'الرياض',
+    eventDate: '2099-01-01',
+    paymentMethod: 'moyasar',
+    settlement: '',
+    items: [],
+    totalAmount: 0,
+    bookingMode: 'instant',
+    status: 'مؤكد',
+    paymentStatus: 'paid',
+    createdAt: '2026-09-01 10:00',
+    ...extra,
+  });
+
+  it('counts the vendor platform orders in the summary, only their own share and revenue statuses', () => {
+    const dir = tmpDir();
+    const store = createVendorStore(dir);
+    store.saveWorkspace('v1', { listings: [goodListing({ id: 'lst-v1' })] });
+    store.addBooking('v1', { customerName: 'يدوي', customerPhone: '0501111111', totalAmount: 100 });
+    writeOrders(dir, [
+      // The QA case: a paid, confirmed 1200 SAR order for this vendor alone.
+      order({ vendorIds: ['v1'], items: [{ id: 'lst-v1', title: 'قهوة', quantity: 1, price: 1200, vendorId: 'v1' }], totalAmount: 1200 }),
+      // Mixed cart: only v1's lines (2 × 300) are theirs.
+      order({
+        vendorIds: ['v1', 'v2'],
+        items: [
+          { id: 'lst-v1', title: 'قهوة', quantity: 2, price: 300, vendorId: 'v1' },
+          { id: 'lst-v2', title: 'ورد', quantity: 1, price: 500, vendorId: 'v2' },
+        ],
+        totalAmount: 1100,
+      }),
+      // Rows from before vendor stamping match on the listing id.
+      order({ serviceId: 'lst-v1', status: 'مكتمل', totalAmount: 250 }),
+      order({ vendorIds: ['v1'], status: 'ملغي', totalAmount: 900 }),
+      order({ vendorIds: ['v1'], status: 'مرفوض', totalAmount: 700 }),
+      order({ vendorIds: ['v2'], totalAmount: 5000 }),
+    ]);
+    const sum = store.summary('v1');
+    assert.equal(sum.revenue, 100 + 1200 + 600 + 250);
+    assert.equal(sum.platformRevenue, 1200 + 600 + 250);
+    assert.equal(sum.bookingCount, 1 + 5);
+    assert.equal(sum.platformBookingCount, 5);
+    assert.equal(store.listSummaries().v1.revenue, 2150);
+  });
+
+  it('takes the platform orders from an injected lookup when one is given', () => {
+    const store = createVendorStore(tmpDir(), {
+      listPlatformBookings: () => [order({ vendorIds: ['v1'], totalAmount: 1200 })] as never,
+    });
+    assert.equal(store.summary('v1').revenue, 1200);
+    assert.equal(store.summary('v2').revenue, 0);
+  });
+
+  it('refuses a manual booking with an invalid customer phone and stores a valid one normalized', () => {
+    const store = createVendorStore(tmpDir());
+    assert.throws(() => store.addBooking('v1', { customerName: 'نواف', customerPhone: 'abc' }), /جوال العميل غير صالح/);
+    assert.throws(() => store.addBooking('v1', { customerName: 'نواف', customerPhone: '12345' }), /جوال العميل غير صالح/);
+    assert.throws(() => store.addBooking('v1', { customerName: 'نواف', customerPhone: '' }), /مطلوبان/);
+    const ok = store.addBooking('v1', { customerName: 'نواف', customerPhone: '+966 50 123 4567' });
+    assert.equal(ok.customerPhone, '0501234567');
+  });
+
+  it('shows the new project name on existing listings after a rename', () => {
+    const store = createVendorStore(tmpDir());
+    store.saveVendorWorkspace('v1', { profile: { projectName: 'الاسم القديم' } });
+    const listing = store.addListing('v1', goodListing());
+    assert.equal(listing.vendorName, 'الاسم القديم');
+    store.saveVendorWorkspace('v1', { profile: { projectName: 'الاسم الجديد' } });
+    assert.equal(store.getWorkspace('v1').listings[0].vendorName, 'الاسم الجديد');
+    const [row] = store.listAllListings();
+    assert.equal(row.vendorName, 'الاسم الجديد');
+    assert.equal(store.listingToPublicService(row).provider.name, 'الاسم الجديد');
+  });
+
+  it('merges one reviewed network into the live socials without replacing the others', () => {
+    const store = createVendorStore(tmpDir());
+    store.saveSocials('v2', { instagram: '@new.insta', tiktok: '@same.tok', whatsapp: '0551112222', confirmedOwn: true });
+    const application = {
+      confirmedOwn: true,
+      links: [
+        { network: 'instagram', handle: 'old.insta', url: 'https://www.instagram.com/old.insta', status: 'verified', confirmedOwn: true, updatedAt: 't', verifiedAt: 't', verifiedBy: 'إدارة' },
+        { network: 'tiktok', handle: 'same.tok', url: 'https://www.tiktok.com/@same.tok', status: 'verified', confirmedOwn: true, updatedAt: 't', verifiedAt: 't', verifiedBy: 'إدارة' },
+        { network: 'x', handle: 'app.x', url: 'https://x.com/app.x', status: 'linked', confirmedOwn: true, updatedAt: 't' },
+      ],
+    } as const;
+    const saved = store.mergeReviewedSocial('v2', 'tiktok', application as never);
+    const byNetwork = new Map(saved.links.map((link) => [link.network, link]));
+    assert.deepEqual([...byNetwork.keys()].sort(), ['instagram', 'tiktok', 'whatsapp']);
+    assert.equal(byNetwork.get('tiktok')?.status, 'verified');
+    assert.equal(byNetwork.get('instagram')?.url, 'https://www.instagram.com/new.insta');
+    assert.equal(byNetwork.get('instagram')?.status, 'linked');
+    assert.equal(byNetwork.get('whatsapp')?.handle, '0551112222');
+    // The vendor has since changed instagram: the review of the old URL does not apply.
+    const unchanged = store.mergeReviewedSocial('v2', 'instagram', application as never);
+    assert.equal(unchanged.links.find((link) => link.network === 'instagram')?.status, 'linked');
+    // A network the vendor never linked is copied across from the application.
+    const added = store.mergeReviewedSocial('v2', 'x', application as never);
+    assert.equal(added.links.find((link) => link.network === 'x')?.url, 'https://x.com/app.x');
+    assert.equal(added.links.length, 4);
+  });
+
+  it('removes a whole workspace on request and reports a missing one', () => {
+    const store = createVendorStore(tmpDir());
+    store.addListing('usr-applicant', goodListing());
+    assert.equal(store.removeWorkspace('usr-applicant'), true);
+    assert.equal(store.hasWorkspace('usr-applicant'), false);
+    assert.equal(store.removeWorkspace('usr-applicant'), false);
+  });
+});

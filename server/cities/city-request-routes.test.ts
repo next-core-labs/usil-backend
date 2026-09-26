@@ -40,7 +40,8 @@ const payload = {
   phone: '0501234567',
   city: 'فيفا',
   occasion: 'عرس',
-  eventDate: '2026-10-12',
+  // Far enough ahead that the "no past dates" rule never trips this fixture.
+  eventDate: '2099-10-12',
   notes: 'ضيافة نساء فقط',
 };
 
@@ -51,6 +52,40 @@ describe('city demand requests', () => {
     const good = validateCityDemandInput(payload);
     assert.equal(good.ok, true);
     if (good.ok) assert.equal(good.value.phone, '0501234567');
+  });
+
+  it('rejects impossible and past event dates, using today in Riyadh', () => {
+    // 2026-09-27 21:30 UTC is already 2026-09-28 in Riyadh.
+    const now = new Date('2026-09-27T21:30:00Z');
+    for (const eventDate of ['2026-99-99', '2026-02-30', '2026-13-01', '27-09-2026', 'غداً']) {
+      const bad = validateCityDemandInput({ ...payload, eventDate }, now);
+      assert.equal(bad.ok, false, eventDate);
+      if (bad.ok === false) assert.match(bad.error, /غير صحيح/);
+    }
+    const past = validateCityDemandInput({ ...payload, eventDate: '2026-09-27' }, now);
+    assert.equal(past.ok, false);
+    if (past.ok === false) assert.match(past.error, /مضى/);
+    assert.equal(validateCityDemandInput({ ...payload, eventDate: '2026-09-28' }, now).ok, true);
+    assert.equal(validateCityDemandInput({ ...payload, eventDate: '2028-02-29' }, now).ok, true);
+    // The date stays optional.
+    assert.equal(validateCityDemandInput({ ...payload, eventDate: '' }, now).ok, true);
+  });
+
+  it('refuses a past event date over HTTP', async () => {
+    const app = express();
+    app.use(express.json());
+    registerCityRequestRoutes(app, fakeAuth(null) as any, tmpDir());
+    const { url, close } = await listen(app);
+    try {
+      const res = await fetch(`${url}/api/city-requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, eventDate: '2020-01-01' }),
+      });
+      assert.equal(res.status, 400);
+    } finally {
+      await close();
+    }
   });
 
   it('saves a public request and lists it for admin', async () => {

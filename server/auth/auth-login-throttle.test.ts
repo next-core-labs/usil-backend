@@ -95,6 +95,52 @@ describe('حدّ محاولات تسجيل الدخول', () => {
     }
   });
 
+  it('تغيير الـ IP ما يفتح التخمين: حدّ ثانٍ على البريد وحده بعد 30 محاولة', async () => {
+    const dir = tmpDir();
+    seedUser(dir);
+    // Tests reach the server from 127.0.0.1; a trusted header stands in for many callers.
+    const previous = process.env.CLIENT_IP_HEADER;
+    process.env.CLIENT_IP_HEADER = 'x-test-ip';
+    const server = await listen(appWithAuth(dir));
+    const from = (ip: string, body: Record<string, unknown>) =>
+      fetch(`${server.url}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-test-ip': ip },
+        body: JSON.stringify(body),
+      });
+    try {
+      const statuses: number[] = [];
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const res = await from(`198.51.100.${attempt + 1}`, {
+          email: 'throttle@usil.sa',
+          phone: '0591112233',
+          password: 'wrong-guess',
+        });
+        statuses.push(res.status);
+      }
+      assert.deepEqual([...new Set(statuses)], [401], 'كل IP جديد تحت حدّه، فالثلاثون كلها 401');
+
+      const fresh = await from('203.0.113.77', {
+        email: 'throttle@usil.sa',
+        phone: '0591112233',
+        password: 'secret12',
+      });
+      assert.equal(fresh.status, 429, 'المحاولة 31 من IP جديد تُرفض حتى بالرقم الصحيح');
+
+      // حساب آخر من نفس الـ IP الجديد ما يتأثر.
+      const other = await from('203.0.113.77', {
+        email: 'someone-else@usil.sa',
+        phone: '0590000000',
+        password: 'wrong-guess',
+      });
+      assert.equal(other.status, 401);
+    } finally {
+      if (previous === undefined) delete process.env.CLIENT_IP_HEADER;
+      else process.env.CLIENT_IP_HEADER = previous;
+      await server.close();
+    }
+  });
+
   it('الحدّ لكل بريد على حدة، فحساب غيرك ما يتعطّل بسببك', async () => {
     const dir = tmpDir();
     seedUser(dir);

@@ -5,6 +5,13 @@ import { readJsonFile, writeJsonFile } from '../shared/json-file.ts';
 import { parseDataUrl, saveUpload, UPLOAD_MAX_BYTES } from '../auth/avatar';
 import { isAllowedListingImage, isStockMediaUrl } from '../../core/utils/catalogMedia';
 import type { BookingStatus } from '../../core/types';
+import { normalizeSaudiMobile } from '../shared/booking-guards';
+import {
+  createBookingStore,
+  vendorHasBooking,
+  vendorViewOfBooking,
+  type PlatformBooking,
+} from '../bookings/booking-store';
 import {
   BOOKING_NEW_STATUS,
   BOOKING_PENDING_APPROVAL_STATUS,
@@ -294,8 +301,17 @@ const LISTING_EDIT_FIELDS = [
 
 const PROFILE_TEXT_LIMIT = 120;
 
-export function createVendorStore(dataDir: string) {
+export type VendorStoreOptions = {
+  /**
+   * Platform orders (read-only) for the revenue summary. Defaults to the
+   * bookings file in the same data dir, which is what the booking store writes.
+   */
+  listPlatformBookings?: () => PlatformBooking[];
+};
+
+export function createVendorStore(dataDir: string, options: VendorStoreOptions = {}) {
   const file = path.join(dataDir, 'vendor-workspaces.json');
+  const listPlatformBookings = options.listPlatformBookings || (() => createBookingStore(dataDir).list());
   const uploadsRoot = path.resolve(dataDir, 'uploads');
   const IMAGE_INVALID_AR = 'صورة المنتج غير صالحة — ارفع الصورة من جهازك';
 
@@ -311,6 +327,21 @@ export function createVendorStore(dataDir: string) {
     return Boolean(readFile().workspaces[vendorId]);
   }
 
+  /**
+   * Listings carry a copy of the vendor name from when they were saved. The
+   * workspace project name wins at read time, so a rename shows on every
+   * listing at once (and the next write stores it).
+   */
+  function withOwner(listings: unknown, vendorId: string, profile?: VendorWorkspaceProfile): VendorListing[] {
+    if (!Array.isArray(listings)) return [];
+    const current = String(profile?.projectName || '').trim();
+    return (listings as VendorListing[]).map((item) => ({
+      ...item,
+      vendorId,
+      ...(current ? { vendorName: current } : {}),
+    }));
+  }
+
   function getWorkspace(vendorId: string): VendorWorkspace {
     const data = readFile();
     const stored = data.workspaces[vendorId] || emptyWorkspace();
@@ -322,7 +353,7 @@ export function createVendorStore(dataDir: string) {
       inventoryItems: Array.isArray(stored.inventoryItems) ? stored.inventoryItems : [],
       contracts: Array.isArray(stored.contracts) ? stored.contracts : [],
       // The workspace key is the owner — a stored row can never point at another vendor.
-      listings: Array.isArray(stored.listings) ? stored.listings.map((item) => ({ ...item, vendorId })) : [],
+      listings: withOwner(stored.listings, vendorId, stored.profile),
       socials: stored.socials && Array.isArray(stored.socials.links) ? sanitizeSocials(stored.socials) : emptyVendorSocials(),
       profile: stored.profile && stored.profile.projectName ? stored.profile : undefined,
     };
@@ -698,10 +729,13 @@ export function createVendorStore(dataDir: string) {
   function addBooking(vendorId: string, input: unknown, now = new Date()): VendorBookingRecord {
     const body = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
     const customerName = cleanText(body.customerName, 120);
-    const customerPhone = cleanText(body.customerPhone, 40);
-    if (!customerName || !customerPhone) {
+    const rawPhone = cleanText(body.customerPhone, 40);
+    if (!customerName || !rawPhone) {
       throw new VendorStoreError('اسم العميل ورقم الجوال مطلوبان');
     }
+    // Same Saudi mobile rule as checkout, so the vendor can actually call the client back.
+    const customerPhone = normalizeSaudiMobile(rawPhone);
+    if (!customerPhone) throw new VendorStoreError('رقم جوال العميل غير صالح — اكتبه بصيغة 05xxxxxxxx');
     const ws = getWorkspace(vendorId);
 
     let serviceId = 'srv-custom';
@@ -908,12 +942,7 @@ export function createVendorStore(dataDir: string) {
 
   function listAllListings(): VendorListing[] {
     const data = readFile();
-    return Object.entries(data.workspaces).flatMap(([vendorId, ws]) =>
-      (Array.isArray(ws.listings) ? ws.listings : []).map((item) => ({
-        ...item,
-        vendorId,
-      })),
-    );
+    return Object.entries(data.workspaces).flatMap(([vendorId, ws]) => withOwner(ws.listings, vendorId, ws.profile));
   }
 
   function updateListingAdmin(id: string, input: VendorListingInput): VendorListing | null {
@@ -946,6 +975,39 @@ export function createVendorStore(dataDir: string) {
     return clean;
   }
 
+  /**
+   * An admin reviewed one network on the application. Only that network's
+   * verification carries over: the vendor's other links stay as they are now.
+   * A link the vendor has since changed is left alone — the review was of the
+   * old URL, not the current one.
+   */
+  function mergeReviewedSocial(vendorId: string, network: SocialNetwork, reviewed: VendorSocials | null | undefined): VendorSocials {
+    const current = getSocials(vendorId);
+    const incoming = sanitizeSocials(reviewed).links.find((link) => link.network === network);
+    if (!incoming) return current;
+    const own = current.links.find((link) => link.network === network);
+    if (own && own.url !== incoming.url) return current;
+    const merged: VendorSocials = own
+      ? {
+          ...current,
+          links: current.links.map((link) =>
+            link.network === network
+              ? {
+                  ...link,
+                  status: incoming.status,
+                  verifiedAt: incoming.verifiedAt,
+                  verifiedBy: incoming.verifiedBy,
+                  updatedAt: incoming.updatedAt || link.updatedAt,
+                }
+              : link,
+          ),
+        }
+      : { ...current, links: [...current.links, incoming] };
+    const clean = sanitizeSocials(merged);
+    patchWorkspace(vendorId, { socials: clean });
+    return clean;
+  }
+
   function verifySocial(vendorId: string, network: SocialNetwork, verified: boolean, actorName: string): VendorSocials {
     const socials = setSocialVerification(getSocials(vendorId), network, verified, actorName);
     patchWorkspace(vendorId, { socials });
@@ -974,28 +1036,71 @@ export function createVendorStore(dataDir: string) {
     };
   }
 
-  function summary(vendorId: string) {
+  function readPlatformBookings(): PlatformBooking[] {
+    try {
+      const rows = listPlatformBookings();
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Manual bookings plus the platform orders that belong to this vendor. A
+   * mixed-vendor order counts only this vendor's own lines (the same trimmed
+   * view the vendor sees), and both kinds follow the same revenue statuses.
+   */
+  function summary(vendorId: string, platformBookings: PlatformBooking[] = readPlatformBookings()) {
     const ws = getWorkspace(vendorId);
-    const revenue = ws.bookings
+    const ownListingIds = new Set(ws.listings.map((item) => String(item.id)));
+    const orders = platformBookings
+      .filter((row) => row && vendorHasBooking(vendorId, ownListingIds, row))
+      .map((row) => vendorViewOfBooking(vendorId, ownListingIds, row));
+    const manualRevenue = ws.bookings
       .filter((b) => isRevenueBookingStatus(b.status))
       .reduce((sum, b) => sum + Number(b.totalAmount || 0), 0);
+    const platformRevenue = orders
+      .filter((row) => isRevenueBookingStatus(row.status))
+      .reduce((sum, row) => {
+        const amount = Number(row.totalAmount);
+        return Number.isFinite(amount) && amount > 0 ? sum + amount : sum;
+      }, 0);
     return {
-      bookingCount: ws.bookings.length,
+      bookingCount: ws.bookings.length + orders.length,
+      manualBookingCount: ws.bookings.length,
+      platformBookingCount: orders.length,
       blockedDateCount: ws.blockedDates.length,
       inventoryCount: ws.inventoryItems.length,
       listingCount: ws.listings.length,
-      revenue,
+      revenue: manualRevenue + platformRevenue,
+      platformRevenue,
       updatedAt: ws.updatedAt,
     };
   }
 
   function listSummaries(): Record<string, ReturnType<typeof summary>> {
     const data = readFile();
+    const platformBookings = readPlatformBookings();
     const out: Record<string, ReturnType<typeof summary>> = {};
     for (const vendorId of Object.keys(data.workspaces)) {
-      out[vendorId] = summary(vendorId);
+      out[vendorId] = summary(vendorId, platformBookings);
     }
     return out;
+  }
+
+  /* ── Leftovers of rejected applications ───────────────────────── */
+
+  /**
+   * Drops a whole workspace. Only for a rejected application's leftovers —
+   * the caller checks the owner is not a vendor account.
+   */
+  function removeWorkspace(vendorId: string): boolean {
+    if (!vendorId) return false;
+    const data = readFile();
+    if (!data.workspaces[vendorId]) return false;
+    delete data.workspaces[vendorId];
+    writeFile(data);
+    return true;
   }
 
   return {
@@ -1028,9 +1133,11 @@ export function createVendorStore(dataDir: string) {
     getSocials,
     saveSocials,
     replaceSocials,
+    mergeReviewedSocial,
     verifySocial,
     listSocials,
-    summary,
+    summary: (vendorId: string) => summary(vendorId),
     listSummaries,
+    removeWorkspace,
   };
 }

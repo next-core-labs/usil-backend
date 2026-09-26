@@ -268,6 +268,13 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
         String(req.body?.reason || 'رفض إداري'),
       );
       if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+      // Submitting seeded a workspace and a listing under the application id or
+      // the applicant's new client account. A rejected applicant keeps neither;
+      // a vendor or staff account that applied again is never touched.
+      const account = auth.findUserByEmail?.(row.email);
+      const leftovers = [row.id];
+      if (account && account.role === 'client') leftovers.push(account.id);
+      for (const id of leftovers) workspaces.removeWorkspace(id);
       res.json({ success: true, application: publicApplication(row) });
     } catch (error) {
       res.status(400).json({

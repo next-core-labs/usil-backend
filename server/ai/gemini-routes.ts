@@ -11,7 +11,7 @@ import {
 } from './catalog-match';
 import type { AiRouter } from './ai-providers';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
-import { effectiveKey } from './integrations-store';
+import { effectiveKey, PROVIDER_LABEL_AR } from './integrations-store';
 import { createVendorStore } from '../vendors/vendor-store';
 import { listApprovedCatalogServices, vendorUsersFromDataDir } from '../shared/approved-catalog';
 
@@ -124,6 +124,12 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
 
   const activeTextProvider = () => (deps.ai ? deps.ai.activeProvider() : geminiKey() ? 'gemini' : null);
 
+  /** Log label for text routes: they run on whichever provider the admin picked, not always Gemini. */
+  const textProviderLabel = () => {
+    const provider = activeTextProvider();
+    return provider ? PROVIDER_LABEL_AR[provider] : 'AI provider';
+  };
+
   app.post('/api/gemini/generate-review', async (req, res) => {
     try {
       const { role, partyName, serviceTitle, rating = 5, highlights = '', tone = 'friendly' } = req.body;
@@ -169,7 +175,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         aiGenerated: true,
       });
     } catch (error: any) {
-      console.error('Error generating review with Gemini:', error);
+      console.error(`Error generating review with ${textProviderLabel()}:`, error);
       return providerFailed(res);
     }
   });
@@ -219,7 +225,7 @@ export function registerGeminiRoutes(app: Express, deps: GeminiRouteDeps = {}) {
         aiGenerated: true,
       });
     } catch (error: any) {
-      console.error('Error analyzing reviews with Gemini:', error);
+      console.error(`Error analyzing reviews with ${textProviderLabel()}:`, error);
       return providerFailed(res);
     }
   });
@@ -353,7 +359,7 @@ ${compactCatalogForPrompt(cards) || 'لا توجد منتجات معتمدة ف�
         return providerFailed(res, 'لم يرجع المساعد رداً مفهوماً. أعد صياغة طلبك أو حاول بعد قليل.');
       }
     } catch (error: any) {
-      console.error('Error in Voice AI assistant:', error);
+      console.error(`Error in Voice AI assistant (${textProviderLabel()}):`, error);
       return providerFailed(res);
     }
   });
@@ -684,7 +690,7 @@ ${compactCatalogForPrompt(chatCards) || 'لا توجد منتجات معتمدة
         aiGenerated: true,
       });
     } catch (error: any) {
-      console.error('Error in Gemini Chatbot:', error);
+      console.error(`Error in ${textProviderLabel()} chatbot:`, error);
       return providerFailed(res);
     }
   });
@@ -814,7 +820,7 @@ ${compactCatalogForPrompt(cards)}
         bundles: attachServices(bundles),
       });
     } catch (error) {
-      console.error('Error matching packages with Gemini:', error);
+      console.error(`Error matching packages with ${textProviderLabel()}:`, error);
       return res.json({
         success: true,
         aiAvailable: true,

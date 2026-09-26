@@ -36,6 +36,8 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
+# the server bundle lives outside dist/ so express.static never serves it
+COPY --from=builder /app/build ./build
 COPY --from=builder /app/public ./public
 # data/ is the Render persistent disk, mounted at /app/data. Render sets PORT.
-CMD ["node", "dist/server.cjs"]
+CMD ["node", "--enable-source-maps", "build/server.cjs"]

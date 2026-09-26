@@ -2,6 +2,7 @@ import path from 'path';
 import { isSaudiPlaceName } from '../../core/data/saudiPlaces';
 import { isValidSaudiMobile, normalizeSaudiMobile } from '../shared/booking-guards';
 import { readJsonArray, writeJsonFile } from '../shared/json-file.ts';
+import { isIsoDate, todayInRiyadh } from '../vendors/vendor-store';
 import {
   type DemandOccasion,
   type DemandStatus,
@@ -38,7 +39,7 @@ export function validateCityDemandInput(input: {
   occasion?: unknown;
   eventDate?: unknown;
   notes?: unknown;
-}): { ok: true; value: Omit<CityDemandRequest, 'id' | 'status' | 'createdAt' | 'updatedAt'> } | { ok: false; error: string } {
+}, now = new Date()): { ok: true; value: Omit<CityDemandRequest, 'id' | 'status' | 'createdAt' | 'updatedAt'> } | { ok: false; error: string } {
   const name = String(input.name || '').trim();
   const phone = normalizeSaudiMobile(String(input.phone || ''));
   const city = String(input.city || '').trim();
@@ -50,7 +51,9 @@ export function validateCityDemandInput(input: {
   if (!phone || !isValidSaudiMobile(phone)) return { ok: false, error: 'أدخل جوالاً سعودياً بصيغة 05xxxxxxxx.' };
   if (!isSaudiPlaceName(city)) return { ok: false, error: 'اختر مدينة أو محافظة أو قرية من قائمة المملكة.' };
   if (!isDemandOccasion(occasion)) return { ok: false, error: 'اختر نوع المناسبة.' };
-  if (eventDate && !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return { ok: false, error: 'تاريخ المناسبة غير صحيح.' };
+  // A real calendar day (no 2026-02-30), and not already past in Riyadh — events are in Saudi.
+  if (eventDate && !isIsoDate(eventDate)) return { ok: false, error: 'تاريخ المناسبة غير صحيح.' };
+  if (eventDate && eventDate < todayInRiyadh(now)) return { ok: false, error: 'تاريخ المناسبة مضى — اختر تاريخاً قادماً.' };
 
   return { ok: true, value: { name, phone, city, occasion, eventDate, notes } };
 }

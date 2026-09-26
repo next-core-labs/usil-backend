@@ -33,13 +33,25 @@ import { isKnownSpaPath } from '../core/utils/siteRoutes.ts';
  */
 
 // Paths resolve against the working directory, not this file: the bundled
-// server runs as `node dist/server.cjs` from the project root, so `data/`,
+// server runs as `node build/server.cjs` from the project root, so `data/`,
 // `dist/` and `public/` sit beside the process, not beside the source.
 const rootDir = process.cwd();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(rootDir, 'data');
+const isProduction = process.env.NODE_ENV === 'production';
+
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // Nothing embeds Usil in a frame; refusing it rules out clickjacking the checkout and admin screens.
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+  if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  next();
+});
 
 // Product images travel as base64 data URLs, so the cap must clear 5MB × ~1.37 overhead.
 app.use(express.json({ limit: '16mb' }));
@@ -148,7 +160,24 @@ app.use(
   '/uploads',
   express.static(path.join(DATA_DIR, 'uploads'), { fallthrough: false, setHeaders: setUploadsHeaders }),
 );
-app.use(express.static(path.join(rootDir, 'dist'), { etag: false, lastModified: false, index: false }));
+// The server bundle used to be built into dist/ and was downloadable with its source map.
+// It now lives in build/; this keeps a stale copy in an old dist/ from ever being served.
+app.use(/^\/server\.cjs(\.map)?$/, (_req: Request, res: Response) => {
+  res.status(404).json({ success: false, error: 'Not found' });
+});
+app.use(
+  express.static(path.join(rootDir, 'dist'), {
+    etag: false,
+    lastModified: false,
+    index: false,
+    setHeaders: (res, filePath) => {
+      // Vite content-hashes everything under assets/, so a changed file always gets a new name.
+      if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+    },
+  }),
+);
 app.use(express.static(path.join(rootDir, 'public')));
 
 // Retired AI studio / smart bundles — old links land on the store.

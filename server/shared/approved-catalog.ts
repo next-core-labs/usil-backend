@@ -20,11 +20,31 @@ export type ApprovedCatalogStore = {
   listingToPublicService: (listing: VendorListing) => ServiceItem;
 };
 
+export type VendorAccountLike = { id: string; email?: string; role?: string };
+
+/**
+ * The one rule for «this vendor is public», shared by the catalog, the vendor
+ * page, its socials, the sitemap, SEO and the AI catalog: an account with role
+ * `vendor`. The role is the approval — admin-created vendors have no application
+ * at all, and a vendor whose later application was rejected is still a vendor.
+ * Rejected applicants never get the role, and their leftovers are removed on rejection.
+ */
+export function isPublicVendorAccount(user: VendorAccountLike | null | undefined): boolean {
+  if (!user || !user.id) return false;
+  return user.role === undefined || user.role === 'vendor';
+}
+
+export function publicVendorAccounts<T extends VendorAccountLike>(users: T[]): T[] {
+  return users.filter((user) => isPublicVendorAccount(user));
+}
+
 export function listApprovedCatalogServices(
   store: ApprovedCatalogStore,
-  listVendorUsers: () => Array<{ id: string }>,
+  listVendorUsers: () => VendorAccountLike[],
 ): ServiceItem[] {
-  const approvedIds = new Set(listVendorUsers().map((user) => user.id));
+  const approvedIds = new Set(
+    publicVendorAccounts(listVendorUsers()).map((user) => user.id),
+  );
   const listings = store.listAllListings().filter((listing) => approvedIds.has(listing.vendorId));
   return enrichVendorServices(listings.map((listing) => store.listingToPublicService(listing))).filter(
     isPublicMarketplaceListing,
@@ -35,11 +55,11 @@ export function listApprovedCatalogServices(
  * Approved vendor accounts read straight from `users.json`, for callers that do
  * not hold the auth API. Mirrors `auth.listVendorUsers()` (role === 'vendor').
  */
-export function vendorUsersFromDataDir(dataDir: string): () => Array<{ id: string }> {
+export function vendorUsersFromDataDir(dataDir: string): () => Array<{ id: string; email: string; role: 'vendor' }> {
   return () =>
-    readJsonArray<{ id?: string; role?: string }>(path.join(dataDir, 'users.json'))
+    readJsonArray<{ id?: string; role?: string; email?: string }>(path.join(dataDir, 'users.json'))
       .filter((user) => user.role === 'vendor' && typeof user.id === 'string' && user.id)
-      .map((user) => ({ id: String(user.id) }));
+      .map((user) => ({ id: String(user.id), email: String(user.email || ''), role: 'vendor' as const }));
 }
 
 /** Share metadata for one approved listing, or null when it is not in the public catalog. */

@@ -46,12 +46,13 @@ npm run dev            # tsx server/index.ts, PORT from .env (43147)
 Production:
 
 ```bash
-npm run build          # bundles to dist/server.cjs
+npm run build          # bundles to build/server.cjs
 npm run sync:web       # copies the frontend build from ../usil/dist into dist/
 npm start
 ```
 
-`sync:web` never overwrites `dist/server.cjs`. Point it elsewhere with
+`dist/` is served publicly, so the server bundle is kept out of it in `build/`.
+`sync:web` replaces everything in `dist/`. Point it elsewhere with
 `WEB_DIST=/path/to/dist npm run sync:web`.
 
 ## Checks

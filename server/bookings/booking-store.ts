@@ -24,7 +24,8 @@ export type PlatformBookingItem = {
 
 export type BookingCancellation = {
   cancelledAt: string;
-  cancelledBy: 'client';
+  /** `admin` covers supervisors; a vendor may only cancel or reject an unpaid order. */
+  cancelledBy: 'client' | 'vendor' | 'admin';
   /** Percent of the paid amount owed back, from `refund-policy.ts`. */
   refundPercent: 100 | 50 | 0;
   /** Owed back in halalas. Moyasar's confirmed refund stays the amount of record. */
@@ -107,6 +108,33 @@ export const CLOSED_BOOKING_STATUSES: readonly string[] = [
   BOOKING_REJECTED_STATUS,
   BOOKING_COMPLETED_STATUS,
 ];
+
+/** Statuses that end an order without it happening — the ones that owe a paid customer a refund. */
+export const CANCELLING_BOOKING_STATUSES: readonly string[] = [BOOKING_CANCELLED_STATUS, BOOKING_REJECTED_STATUS];
+
+export type StatusChanger = 'vendor' | 'admin';
+
+export type StatusTransition =
+  | { ok: true; /** An admin did what the vendor rule forbids — worth recording. */ override: boolean }
+  | { ok: false; reason: 'final' | 'back_to_new' };
+
+/**
+ * Status rule. Cancelled, rejected and completed are final, and no order goes
+ * back to «جديد» (that would put a handled order back in the new queue).
+ * Admins may override either rule to fix a mistake; the result says so.
+ * Re-saving the current status is always a no-op.
+ */
+export function checkStatusTransition(from: string, to: string, by: StatusChanger): StatusTransition {
+  if (from === to) return { ok: true, override: false };
+  const reason = CLOSED_BOOKING_STATUSES.includes(from)
+    ? 'final'
+    : to === BOOKING_NEW_STATUS
+      ? 'back_to_new'
+      : null;
+  if (!reason) return { ok: true, override: false };
+  if (by === 'admin') return { ok: true, override: true };
+  return { ok: false, reason };
+}
 
 const PAID_SETTLEMENT_LABEL = 'ميسر — دفع إلكتروني';
 
@@ -245,6 +273,11 @@ export function createBookingStore(dataDir: string) {
   /**
    * An unpaid, uncancelled order for the same buyer, listings and date placed
    * within `windowMs` — a double-tapped checkout, not a second order.
+   *
+   * "Same buyer" is the phone plus the same account or the same email. Phone
+   * alone is not enough: anyone who knows a number could type it at checkout
+   * and lock its owner out for the whole window. Guests with neither are
+   * caught by the route's per-device check instead.
    */
   function findRecentDuplicate(input: {
     userId?: string;
@@ -266,21 +299,30 @@ export function createBookingStore(dataDir: string) {
         if (bookedListingIds(row).sort().join('|') !== wanted) return false;
         const age = now - bookingCreatedAtMs(row.createdAt);
         if (age < 0 || age > input.windowMs) return false;
-        const sameUser = Boolean(input.userId) && row.userId === input.userId;
-        const sameEmail = Boolean(email) && String(row.email || '').trim().toLowerCase() === email;
-        const samePhone = Boolean(input.phone) && row.phone === input.phone;
-        return sameUser || sameEmail || samePhone;
+        if (!input.phone || row.phone !== input.phone) return false;
+        if (input.userId && row.userId) return row.userId === input.userId;
+        return Boolean(email) && String(row.email || '').trim().toLowerCase() === email;
       }) || null
     );
   }
 
-  /** Callers validate `status` with `isPlatformBookingStatus`; a bad one is refused here too. */
-  function updateStatus(id: string, status: string): PlatformBooking | null {
+  /**
+   * Callers validate `status` with `isPlatformBookingStatus` and
+   * `checkStatusTransition`; a bad status or a refused change is `null` here
+   * too. `by` defaults to the stricter vendor rule.
+   */
+  function updateStatus(
+    id: string,
+    status: string,
+    options: { by?: StatusChanger; cancellation?: BookingCancellation } = {},
+  ): PlatformBooking | null {
     if (!isPlatformBookingStatus(status)) return null;
     const rows = list();
     const item = rows.find((row) => row.id === id);
     if (!item) return null;
+    if (!checkStatusTransition(item.status, status, options.by || 'vendor').ok) return null;
     item.status = status;
+    if (options.cancellation) item.cancellation = options.cancellation;
     save(rows);
     return item;
   }
@@ -357,9 +399,9 @@ export function createBookingStore(dataDir: string) {
     if (invoiceId && !item.moyasarInvoiceId) item.moyasarInvoiceId = invoiceId;
     item.paymentStatus = 'paid';
     item.settlement = PAID_SETTLEMENT_LABEL;
-    // Paid after the customer had already cancelled an unpaid order: the whole
+    // Paid after the order was already cancelled or rejected unpaid: the whole
     // payment is owed back, whatever tier the date falls in.
-    if (item.status === BOOKING_CANCELLED_STATUS && item.cancellation?.refundStatus === 'not_applicable') {
+    if (CANCELLING_BOOKING_STATUSES.includes(item.status) && item.cancellation?.refundStatus === 'not_applicable') {
       item.cancellation = {
         ...item.cancellation,
         refundPercent: 100,
