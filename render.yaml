@@ -41,3 +41,8 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      # first admin, created on boot only while no admin exists (see server/auth/auth.ts)
+      - key: OWNER_EMAIL
+        sync: false
+      - key: OWNER_PASSWORD
+        sync: false

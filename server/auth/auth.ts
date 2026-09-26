@@ -4,7 +4,7 @@ import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
 import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from './avatar';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
-import { FOUNDER_ADMIN_EMAIL, purgeLiveDummyData, wipeAllVendorsAndDummyMedia } from './dummy-accounts';
+import { FOUNDER_ADMIN_EMAIL, isDummyEmail, purgeLiveDummyData, wipeAllVendorsAndDummyMedia } from './dummy-accounts';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
 import { notifyPasswordChanged, sendPasswordResetEmail, sendVerificationEmail } from '../shared/optional-mail';
 import { emptyVendorSocials, type VendorSocials } from '../vendors/vendor-socials';
@@ -218,7 +218,7 @@ export class ApplicantAccountConflictError extends Error {
   }
 }
 
-export function createAuth(dataDir: string) {
+export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env) {
   const forgotLimiter = createSlidingWindowLimiter(FORGOT_LIMIT, FORGOT_WINDOW_MS);
   const resetLimiter = createSlidingWindowLimiter(FORGOT_LIMIT * 2, FORGOT_WINDOW_MS);
   const loginLimiter = createSlidingWindowLimiter(LOGIN_LIMIT, LOGIN_WINDOW_MS);
@@ -288,6 +288,46 @@ export function createAuth(dataDir: string) {
   }
 
   seedUsers();
+  ensureOwnerAccount();
+
+  /**
+   * The first admin, for a host with no shell to edit users.json on (Render Free).
+   * With OWNER_EMAIL and OWNER_PASSWORD set, boot creates that admin — but only while
+   * no admin exists, so a restart never resets a changed password, and the variables
+   * go inert once a real user store with its own admins is in place.
+   */
+  function ensureOwnerAccount() {
+    const email = normalizeEmail(env.OWNER_EMAIL || '');
+    const password = String(env.OWNER_PASSWORD || '');
+    if (!email && !password) return;
+    const users = seedUsers();
+    if (users.some((item) => item.role === 'admin')) return;
+    if (!email.includes('@') || password.length < 8) {
+      console.warn('OWNER_EMAIL / OWNER_PASSWORD ignored: needs a valid email and a password of 8+ characters.');
+      return;
+    }
+    // A reserved or dummy address would be refused or purged on the next boot.
+    if (isFounderEmail(email) || isDummyEmail(email)) {
+      console.warn(`OWNER_EMAIL ignored: ${email} is a reserved address.`);
+      return;
+    }
+    if (users.some((item) => item.email === email)) {
+      console.warn(`OWNER_EMAIL ignored: ${email} already has a non-admin account.`);
+      return;
+    }
+    users.push({
+      id: newUserId(),
+      name: 'مالك يوصل',
+      email,
+      phone: normalizePhone(env.OWNER_PHONE || ''),
+      role: 'admin',
+      passwordHash: hashPassword(password),
+      avatarUrl: '',
+      emailVerified: true,
+    });
+    saveUsers(users);
+    console.log(`Created the owner admin ${email} from OWNER_EMAIL.`);
+  }
 
   function loadUsers(): StoredUser[] {
     return seedUsers();
