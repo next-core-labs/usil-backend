@@ -10,7 +10,14 @@ ARG FRONTEND_REF=main
 ARG GITHUB_TOKEN
 WORKDIR /web
 RUN test -n "$GITHUB_TOKEN" || (echo "GITHUB_TOKEN is not set: it needs read access to $FRONTEND_REPO" && exit 1)
-RUN git clone --depth 1 --branch "$FRONTEND_REF" "https://x-access-token:${GITHUB_TOKEN}@${FRONTEND_REPO}" . \
+# The clone command's text never changes, so the layer cache would keep shipping an old
+# frontend. Tying the step to the deploying backend commit (Render passes
+# RENDER_GIT_COMMIT) and to FRONTEND_CACHEBUST (set it to anything new to force a fresh
+# clone) makes every deploy clone the current $FRONTEND_REF.
+ARG RENDER_GIT_COMMIT
+ARG FRONTEND_CACHEBUST
+RUN echo "backend ${RENDER_GIT_COMMIT:-unknown} cachebust ${FRONTEND_CACHEBUST:-none}" \
+  && git clone --depth 1 --branch "$FRONTEND_REF" "https://x-access-token:${GITHUB_TOKEN}@${FRONTEND_REPO}" . \
   && git log -1 --format='frontend %h %s' \
   && rm -rf .git
 RUN npm ci && npm run build
