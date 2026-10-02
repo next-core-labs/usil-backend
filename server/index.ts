@@ -10,6 +10,7 @@ import { brandedAvatarSvg, setUploadsHeaders, uploadsDir } from './auth/avatar.t
 import { registerGeminiRoutes } from './ai/gemini-routes.ts';
 import { registerIntegrationsRoutes } from './ai/integrations-routes.ts';
 import { registerBookingRoutes } from './bookings/booking-routes.ts';
+import { registerChatRoutes } from './chat/chat-routes.ts';
 import { registerExternalBookingRoutes, type CourierOption } from './bookings/external-booking-routes.ts';
 import { registerCityRequestRoutes } from './cities/city-request-routes.ts';
 import { registerCourierApplicationRoutes } from './couriers/courier-application-routes.ts';
@@ -19,10 +20,11 @@ import { applyMoyasarRuntime } from './payments/moyasar-store.ts';
 import { registerPaymentRoutes } from './payments/payment-routes.ts';
 import { registerSeoRoutes } from './seo/seo-routes.ts';
 import { registerSupportRoutes } from './support/support-routes.ts';
+import { registerTrendingRoutes } from './catalog/trending-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
 import { registerVendorRoutes } from './vendors/vendor-routes.ts';
 import { SERVICES as CATALOG_SERVICES } from '../core/data/services.ts';
-import { listApprovedCatalogServices, serviceSeoFrom } from './shared/approved-catalog.ts';
+import { listApprovedCatalogServices, publicVendorAccounts, serviceSeoFrom } from './shared/approved-catalog.ts';
 import { isKnownSpaPath } from '../core/utils/siteRoutes.ts';
 
 /**
@@ -81,6 +83,16 @@ vendorStore.stripCatalogClonedListings(
 );
 registerVendorApplicationRoutes(app, auth, DATA_DIR);
 
+// Chat threads are only opened with approved vendors, named as the storefront names them.
+registerChatRoutes(app, auth, DATA_DIR, {
+  findVendor: (vendorId) => {
+    const user = publicVendorAccounts(auth.listVendorUsers()).find((item) => item.id === vendorId);
+    if (!user) return null;
+    const projectName = String(vendorStore.getWorkspace(user.id).profile?.projectName || '').trim();
+    return { id: user.id, name: projectName || user.name };
+  },
+});
+
 // Bookings must know which listings need vendor approval before checkout.
 const bookingStore = registerBookingRoutes(app, auth, DATA_DIR, {
   listListings: () => vendorStore.listAllListings(),
@@ -88,6 +100,13 @@ const bookingStore = registerBookingRoutes(app, auth, DATA_DIR, {
 
 // Payments settle against platform bookings.
 registerPaymentRoutes(app, { bookings: bookingStore, port: PORT });
+
+// «ترند هالأسبوع»: the public catalog ranked by this week's bookings and product views.
+registerTrendingRoutes(app, DATA_DIR, {
+  listServices: () => listApprovedCatalogServices(vendorStore, () => auth.listVendorUsers()),
+  listListings: () => vendorStore.listAllListings(),
+  listBookings: () => bookingStore.list(),
+});
 
 const courierStore = registerCourierApplicationRoutes(app, auth, DATA_DIR);
 registerExternalBookingRoutes(app, auth, DATA_DIR, {
