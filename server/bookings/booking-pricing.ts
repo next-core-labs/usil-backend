@@ -21,7 +21,21 @@ export const NO_REAL_PRICE =
   'ثبّت سعر المنتج قبل الدفع الإلكتروني. ميسر ما يخصم إلا بعد سعر حقيقي من المورّد.';
 
 export type PricedListing = Pick<VendorListing, 'id' | 'vendorId' | 'title' | 'price'> &
-  Partial<Pick<VendorListing, 'bookingMode' | 'images' | 'image' | 'fulfillment' | 'priceUnit' | 'cities'>>;
+  Partial<Pick<VendorListing, 'bookingMode' | 'images' | 'image' | 'fulfillment' | 'priceUnit' | 'cities'>> & {
+    /** Smallest quantity the vendor sells (the storefront's `minQuantity`); 1 when absent. */
+    minQuantity?: number;
+  };
+
+/** Below the listing's minimum order — the storefront never offers it, so this is a stale or forged cart. */
+export function belowMinQuantity(title: string, min: number): string {
+  return `أقل كمية لطلب «${title}» هي ${min}. عدّل الكمية وحاول مرة أخرى.`;
+}
+
+/** The listing's minimum quantity: a whole number from 1 up, anything else counts as 1. */
+export function listingMinQuantity(listing: Pick<PricedListing, 'minQuantity'>): number {
+  const min = Number(listing.minQuantity);
+  return Number.isInteger(min) && min > 1 && min <= MAX_LINE_QUANTITY ? min : 1;
+}
 
 export type BookingQuote =
   | {
@@ -110,6 +124,8 @@ export function quoteBooking(input: {
     }
     const price = Number(listing.price);
     if (!hasCheckoutPrice(price)) return { ok: false, error: NO_REAL_PRICE };
+    const min = listingMinQuantity(listing);
+    if (quantity < min) return { ok: false, error: belowMinQuantity(listing.title, min) };
     if (requiresVendorApproval(listing.bookingMode)) needsVendorApproval = true;
     lines.push({ id, title: listing.title, quantity, price, vendorId: String(listing.vendorId) });
     total += price * quantity;

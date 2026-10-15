@@ -1,4 +1,4 @@
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import type { Express, Request, Response } from 'express';
 import {
@@ -8,6 +8,7 @@ import {
   validateVendorApplication,
 } from './vendor-applications';
 import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
+import { notifyVendorApplicationDecision, notifyVendorApplicationReceived } from '../shared/optional-mail';
 import { parseDataUrl, saveUpload, UPLOAD_MAX_BYTES, uploadsDir } from '../auth/avatar';
 import { createVendorStore } from './vendor-store';
 import { persistListingImages } from './listing-media';
@@ -15,6 +16,12 @@ import { personNameFromParts, profileFromApplication, publicVendorFile } from '.
 import { parseVendorSocials, type VendorSocials } from './vendor-socials';
 import { LISTING_MIN_IMAGES, validateVendorListing } from './vendor-listings';
 import { isStockMediaUrl } from '../../core/utils/catalogMedia';
+import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
+
+/** Each application can write ~16 MB of photos and emails the address it names. */
+const APPLY_LIMIT = 10;
+const APPLY_WINDOW_MS = 60 * 60 * 1000;
+const APPLY_RATE_LIMITED = 'طلبات كثيرة من هذا الجهاز. انتظر ساعة ثم أعد المحاولة.';
 
 const LISTING_PHOTOS_REQUIRED = 'أضف صورتين حقيقيتين للمنتج من جهازك — ما نعرض صور وهمية';
 
@@ -80,8 +87,12 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   const store = createVendorApplicationStore(dataDir);
   const workspaces = createVendorStore(dataDir);
   const adminOnly = auth.requireRole(['admin']);
+  const applyLimiter = createSlidingWindowLimiter(APPLY_LIMIT, APPLY_WINDOW_MS);
 
   app.post('/api/vendor-applications', (req: Request, res: Response) => {
+    if (!applyLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
+      return res.status(429).json({ success: false, error: APPLY_RATE_LIMITED });
+    }
     // Uploads written during this request, removed again if it fails.
     const written: string[] = [];
     try {
@@ -164,6 +175,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       workspaces.seedWorkspaceFromApplication(vendorId, created);
       const listing = workspaces.addListing(vendorId, listingDraft, created.projectName);
       const profile = profileFromApplication(created, vendorId, { listingCount: 1 });
+      notifyVendorApplicationReceived(created.email, created.projectName);
       res.status(201).json({
         success: true,
         application: publicApplication(created),
@@ -240,6 +252,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
         workspaces.moveWorkspace(previous.id, user.id);
       }
       const workspace = workspaces.seedWorkspaceFromApplication(user.id, row);
+      notifyVendorApplicationDecision(row.email, row.projectName, 'approved');
       res.json({
         success: true,
         application: publicApplication(row),
@@ -275,6 +288,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       const leftovers = [row.id];
       if (account && account.role === 'client') leftovers.push(account.id);
       for (const id of leftovers) workspaces.removeWorkspace(id);
+      notifyVendorApplicationDecision(row.email, row.projectName, 'rejected', row.rejectReason);
       res.json({ success: true, application: publicApplication(row) });
     } catch (error) {
       res.status(400).json({

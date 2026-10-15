@@ -6,3 +6,6 @@ build/
 !.env.example
 /data/
 integrations.json
+.cf-assets/
+.wrangler/
+.dev.vars

@@ -261,3 +261,41 @@ describe('courier-application-routes', () => {
     await close();
   });
 });
+
+describe('courier approval — external bookings follow the account', () => {
+  it('moves rows filed against the application id onto the linked account', async () => {
+    const dir = tmpDir();
+    writeUsers(dir, [{ id: 'usr-9', email: 'me@gmail.com', phone: '0559990000', role: 'client', name: 'أنا' }]);
+    const applicant = { id: 'usr-9', email: 'me@gmail.com', phone: '0559990000', role: 'client', name: 'أنا' };
+    resetCourierApplyLimiter();
+    const app = express();
+    app.use(express.json());
+    registerCourierApplicationRoutes(app, adminWithApplicant(applicant) as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      const created = await fetch(`${url}/api/couriers/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const appId = ((await created.json()) as { application: { id: string } }).application.id;
+      fs.writeFileSync(
+        path.join(dir, 'external-bookings.json'),
+        JSON.stringify([
+          { id: 'EXB-1', courierId: appId, courierName: 'سعد' },
+          { id: 'EXB-2', courierId: 'usr-someone-else', courierName: 'غيره' },
+        ]),
+      );
+      const approved = await fetch(`${url}/api/admin/couriers/${appId}/approve`, { method: 'POST' });
+      assert.equal(approved.status, 200);
+      const rows = JSON.parse(fs.readFileSync(path.join(dir, 'external-bookings.json'), 'utf-8')) as Array<{
+        id: string;
+        courierId: string;
+      }>;
+      assert.equal(rows.find((row) => row.id === 'EXB-1')?.courierId, 'usr-9');
+      assert.equal(rows.find((row) => row.id === 'EXB-2')?.courierId, 'usr-someone-else');
+    } finally {
+      await close();
+    }
+  });
+});

@@ -1,4 +1,5 @@
-import fs from 'fs';
+import type { WriteFileOptions } from 'fs';
+import { fs } from './data-fs.ts';
 import path from 'path';
 
 /**
@@ -85,7 +86,7 @@ export function readJsonArray<T>(file: string): T[] {
 export function writeJsonFile(file: string, value: unknown, options: WriteJsonOptions = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  const writeOptions: fs.WriteFileOptions =
+  const writeOptions: WriteFileOptions =
     options.mode === undefined ? 'utf-8' : { encoding: 'utf-8', mode: options.mode };
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), writeOptions);
   try {

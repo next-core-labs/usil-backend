@@ -14,6 +14,19 @@ import { isVendorSupervisor } from '../auth/roles';
 import { buildVendorHubs } from './vendor-hubs';
 import { publicVendorAccounts } from '../shared/approved-catalog';
 import type { VendorProfileSource } from './vendor-profile';
+import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
+import { riyadhToday } from '../bookings/booking-pricing.ts';
+
+/** How far ahead the public availability calendar looks. */
+export const PUBLIC_BLOCKED_DATES_DAYS = 180;
+const AVAILABILITY_LIMIT = 60;
+const AVAILABILITY_WINDOW_MS = 60_000;
+
+/** `YYYY-MM-DD` plus whole days, on the calendar (no time zone involved). */
+function addDays(isoDate: string, days: number): string {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
 
 type AuthApi = {
   userFromRequest: (req: Request) => { id: string; role: string; name?: string; email?: string } | null;
@@ -44,7 +57,10 @@ function vendorIdFrom(req: Request): string | null {
   return user.id;
 }
 
-export type VendorRouteOptions = VendorStoreOptions;
+export type VendorRouteOptions = VendorStoreOptions & {
+  /** Clock for the public availability window; tests pin it. */
+  now?: () => Date;
+};
 
 export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: string, options: VendorRouteOptions = {}) {
   const store = createVendorStore(dataDir, options);
@@ -113,7 +129,7 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
   app.get('/api/vendor/workspace', guard, (req: Request, res: Response) => {
     const vendorId = vendorIdFrom(req);
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-    res.json({ success: true, data: store.getWorkspace(vendorId) });
+    res.json({ success: true, data: store.getWorkspaceWithOffice(vendorId) });
   });
 
   app.put('/api/vendor/workspace', guard, (req: Request, res: Response) => {
@@ -232,6 +248,32 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
         error: error instanceof Error ? error.message : 'تعذر حفظ حسابات التواصل',
       });
     }
+  });
+
+  const availabilityLimiter = createSlidingWindowLimiter(AVAILABILITY_LIMIT, AVAILABILITY_WINDOW_MS);
+
+  /**
+   * Public availability: the days a vendor is closed, from today (Riyadh) for
+   * the next 180 days — dates only, never the vendor's reason or type. An
+   * unknown or unapproved vendor answers with no dates.
+   */
+  app.get('/api/vendors/:id/blocked-dates', (req: Request, res: Response) => {
+    if (!availabilityLimiter.allow(clientIp(req))) {
+      return res.status(429).json({ success: false, error: 'تجاوزت حد الطلبات. انتظر دقيقة ثم أعد المحاولة.' });
+    }
+    const { vendorId } = publicVendor(String(req.params.id || ''));
+    if (!vendorId) return res.json({ success: true, data: { dates: [] } });
+    const from = riyadhToday(options.now?.() || new Date());
+    const until = addDays(from, PUBLIC_BLOCKED_DATES_DAYS);
+    const dates = Array.from(
+      new Set(
+        store
+          .getWorkspace(vendorId)
+          .blockedDates.map((row) => String(row?.date || '').slice(0, 10))
+          .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && date >= from && date <= until),
+      ),
+    ).sort();
+    res.json({ success: true, data: { dates } });
   });
 
   app.get('/api/vendors/:id/socials', (req: Request, res: Response) => {
@@ -445,5 +487,18 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     }
   });
 
-  return store;
+  /** Title, description and logo for `/vendor/<id>` — null when the page would 404. */
+  function publicVendorSeo(id: string): { title: string; description: string; image: string } | null {
+    const { vendorId, source } = publicVendor(String(id || '').trim());
+    const file = vendorId ? store.getPublicFile(vendorId, source) : null;
+    if (!file?.projectName) return null;
+    const kind = file.projectType ? `${file.projectType} — ` : '';
+    return {
+      title: file.projectName,
+      description: `${kind}${file.projectName} على يوصل: اطلب منتجاته واحجز لمناسبتك مباشرة.`,
+      image: file.logoUrl || '',
+    };
+  }
+
+  return Object.assign(store, { publicVendorSeo });
 }

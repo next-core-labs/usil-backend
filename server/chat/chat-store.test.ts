@@ -78,6 +78,17 @@ describe('chat store', () => {
     assert.notEqual(clientThread(store, otherClient.userId).id, first.id);
   });
 
+  it('drops every thread of a deleted account, on either side', () => {
+    const store = createChatStore(tmpDir());
+    clientThread(store);
+    clientThread(store, otherClient.userId);
+    store.open({ kind: 'vendor_owner', vendorId: vendor.userId, vendorName: 'قهوة' });
+    store.open({ kind: 'vendor_owner', vendorId: 'usr-other-vendor', vendorName: 'خيام' });
+    assert.equal(store.removeForUser(vendor.userId), 3);
+    assert.equal(store.hasPair({ kind: 'vendor_owner', vendorId: 'usr-other-vendor' }), true);
+    assert.equal(store.removeForUser(vendor.userId), 0);
+  });
+
   it('reuses one owner thread per vendor', () => {
     const store = createChatStore(tmpDir());
     const a = store.open({ kind: 'vendor_owner', vendorId: vendor.userId, vendorName: 'قهوة' });

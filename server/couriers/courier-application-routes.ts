@@ -3,6 +3,7 @@ import { createCourierApplicationStore, publicCourierApplication } from './couri
 import type { PublicUser } from '../auth/auth';
 import { clientIp, normalizeSaudiMobile } from '../shared/booking-guards';
 import { courierAccountNote, grantCourierRole, type CourierAccountOutcome } from './courier-role';
+import { createExternalBookingStore } from '../bookings/external-bookings';
 
 type AuthApi = {
   userFromRequest: (req: Request) => PublicUser | null;
@@ -98,11 +99,20 @@ export function registerCourierApplicationRoutes(app: Express, auth: AuthApi, da
           message: 'تم اعتماد الطلب، لكن تعذر تحديث دور الحساب. غيّر الدور يدوياً من إدارة الحسابات.',
         });
       }
+      const accountLinked = account.status === 'promoted' || account.status === 'already_courier';
+      if (accountLinked && 'userId' in account) {
+        // External bookings filed against the application now belong to the account.
+        try {
+          createExternalBookingStore(dataDir).reassignCourier(row.id, account.userId);
+        } catch (moveError) {
+          console.warn('[couriers] could not move external bookings to the courier account', moveError);
+        }
+      }
       res.json({
         success: true,
         application: publicCourierApplication(row, { revealId: true }),
         account,
-        accountLinked: account.status === 'promoted' || account.status === 'already_courier',
+        accountLinked,
         message: courierAccountNote(account),
       });
     } catch (error) {

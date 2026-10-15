@@ -1,0 +1,40 @@
+// usil.app on Cloudflare Workers. See deploy/cloudflare.md.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "usil-backend",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // body-parser 1.x ships iconv-lite 0.4, whose stream shim breaks the Workers bundle; 0.6 has the same API.
+  "alias": { "iconv-lite": "iconv-lite-cf" },
+  "assets": {
+    // public/ + the SPA build, assembled by `npm run cf:assets`
+    "directory": "./.cf-assets",
+    "binding": "ASSETS",
+    // worker/index.ts decides: files from assets, page routes from the app (SEO-rendered shell)
+    "run_worker_first": true,
+    "html_handling": "none",
+    "not_found_handling": "none"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "APP", "class_name": "UsilApp" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UsilApp"] }],
+  // hooks.usil.app is the Moyasar webhook address already registered with Moyasar.
+  // Bot Fight Mode must stay off for usil.app, or it challenges Moyasar and the native apps.
+  "routes": [
+    { "pattern": "usil.app", "custom_domain": true },
+    { "pattern": "hooks.usil.app", "custom_domain": true }
+  ],
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "vars": {
+    "NODE_ENV": "production",
+    "PUBLIC_SITE_URL": "https://usil.app",
+    "APP_URL": "https://usil.app",
+    "VENDOR_CONSOLE_URL": "https://vendor.usil.app",
+    "MOYASAR_WEBHOOK_URL": "https://hooks.usil.app/api/payments/webhook"
+  }
+  // Secrets (wrangler secret put <NAME>): OWNER_EMAIL, OWNER_PASSWORD, RESEND_API_KEY, MAIL_FROM,
+  // MOYASAR_SECRET_KEY, MOYASAR_PUBLISHABLE_KEY, MOYASAR_WEBHOOK_SECRET, GEMINI_API_KEY
+}

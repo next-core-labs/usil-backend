@@ -33,6 +33,20 @@ describe('booking-guards', () => {
     assert.equal(limiter.allow('1.2.3.4', t0 + 60_001), true);
   });
 
+  it('forgets callers whose window has emptied, so the key map does not grow forever', () => {
+    const limiter = createSlidingWindowLimiter(3, 60_000);
+    const t0 = 5_000_000;
+    for (let i = 0; i < 50; i++) limiter.allow(`10.0.0.${i}`, t0 + i);
+    assert.equal(limiter.size(), 50);
+    // A minute later every old key is empty; the next call sweeps them out.
+    assert.equal(limiter.allow('10.9.9.9', t0 + 120_000), true);
+    assert.equal(limiter.size(), 1);
+    // A key still inside its window survives the sweep and keeps its count.
+    for (let i = 0; i < 3; i++) limiter.allow('10.1.1.1', t0 + 130_000 + i);
+    assert.equal(limiter.allow('10.1.1.1', t0 + 185_000), false);
+    assert.equal(limiter.size(), 1);
+  });
+
   it('never trusts a raw X-Forwarded-For — falls back to the TCP peer', () => {
     const spoofed = { headers: { 'x-forwarded-for': '10.1.2.3, 10.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } };
     assert.equal(clientIp(spoofed, {}), '127.0.0.1');

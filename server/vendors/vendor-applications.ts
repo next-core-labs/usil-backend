@@ -1,5 +1,6 @@
 import path from 'path';
 import { readJsonArray, writeJsonFile } from '../shared/json-file.ts';
+import { normalizeSaudiMobile } from '../shared/booking-guards';
 import {
   emptyVendorSocials,
   parseVendorSocials,
@@ -176,6 +177,12 @@ export function validateVendorApplication(input: Partial<VendorApplicationInput>
       throw new Error('أكمل كل الحقول المطلوبة في صفحتي التسجيل');
     }
   }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(input.email).trim())) {
+    throw new Error('اكتب بريداً إلكترونياً صحيحاً');
+  }
+  if (!normalizeSaudiMobile(String(input.phone))) {
+    throw new Error('اكتب جوالاً سعودياً صحيحاً بصيغة 05xxxxxxxx');
+  }
   if (!isValidNationalId(String(input.nationalId))) {
     throw new Error('رقم الهوية أو الإقامة يجب أن يكون 10 أرقام ويبدأ بـ 1 أو 2');
   }
@@ -240,7 +247,7 @@ export function createVendorApplicationStore(dataDir: string) {
       projectName: input.projectName.trim(),
       nationalId: String(input.nationalId).replace(/\s+/g, ''),
       email,
-      phone: input.phone.trim(),
+      phone: normalizeSaudiMobile(input.phone) || input.phone.trim(),
       commercialRegister: input.commercialRegister?.trim() || undefined,
       projectType,
       projectTypeOther: input.projectType === 'أخرى' ? input.projectTypeOther?.trim() : undefined,

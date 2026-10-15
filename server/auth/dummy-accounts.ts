@@ -1,7 +1,8 @@
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import { isAllowedListingImage, isStockMediaUrl } from '../../core/utils/catalogMedia';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
+import { createVendorOfficeStore } from '../vendors/vendor-office.ts';
 
 export const FOUNDER_ADMIN_EMAIL = 'nawafalmuhayya@gmail.com';
 
@@ -308,6 +309,8 @@ export function wipeAllVendorsAndDummyMedia(
     wipedWorkspaces = workspaces && typeof workspaces === 'object' ? Object.keys(workspaces).length : 0;
     writeJson(workspaceFile, { workspaces: {} });
   }
+  // The vendors' back offices go with their workspaces.
+  createVendorOfficeStore(dataDir).wipeAll();
 
   const keepUploads = new Set<string>(['avatar-usr-nawaf-admin.svg', 'avatar-supervisor.svg']);
   for (const user of keptUsers) {

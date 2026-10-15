@@ -1,4 +1,4 @@
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
 import { isMoyasarSecretKey, moyasarPublishableKey, moyasarSecretKey } from './moyasar';

@@ -11,7 +11,10 @@ import {
 import { ensureMoyasarWebhook, moyasarWebhookUrl, verifyMoyasarSecretKey } from './moyasar';
 
 type AuthLike = {
-  requireRole: (roles: Array<'client' | 'vendor' | 'admin'>) => (
+  requireRole: (
+    roles: Array<'client' | 'vendor' | 'admin'>,
+    options?: { exact?: boolean },
+  ) => (
     req: Request,
     res: Response,
     next: () => void,
@@ -29,6 +32,8 @@ export function registerMoyasarAdminRoutes(
   options: MoyasarAdminRouteOptions = {},
 ) {
   const requireAdmin = auth.requireRole(['admin']);
+  /** The payment keys move money, so changing them is for «مدير كل الحسابات» only. */
+  const requireOwnerAdmin = auth.requireRole(['admin'], { exact: true });
   const saveLimiter = createSlidingWindowLimiter(8, 60_000);
   const fetchImpl = options.fetchImpl;
 
@@ -39,7 +44,7 @@ export function registerMoyasarAdminRoutes(
     res.json({ success: true, data: publicMoyasarStatus(dataDir, moyasarWebhookUrl()) });
   });
 
-  app.put('/api/admin/moyasar', requireAdmin, async (req: Request, res: Response) => {
+  app.put('/api/admin/moyasar', requireOwnerAdmin, async (req: Request, res: Response) => {
     if (!saveLimiter.allow('admin-moyasar-save')) {
       return res.status(429).json({
         success: false,

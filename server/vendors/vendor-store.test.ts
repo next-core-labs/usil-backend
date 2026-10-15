@@ -145,7 +145,7 @@ describe('vendor-store', () => {
   it('blocks dates and reports a summary', () => {
     const store = createVendorStore(tmpDir());
     store.addBooking('usr-vendor', { customerName: 'أ', customerPhone: '0501111111', totalAmount: 1000 });
-    store.addBlockedDate('usr-vendor', { date: '2026-09-01', reason: 'صيانة', type: 'maintenance' });
+    store.addBlockedDate('usr-vendor', { date: '2099-09-01', reason: 'صيانة', type: 'maintenance' });
     const sum = store.summary('usr-vendor');
     assert.equal(sum.bookingCount, 1);
     assert.equal(sum.blockedDateCount, 1);
@@ -486,11 +486,13 @@ describe('vendor-store', () => {
     for (const bad of ['garbage', '2026-13-01', '2026-02-30', '2026-9-1', '01-10-2026', 20261001]) {
       assert.throws(() => store.addBlockedDate('v1', { date: bad }), /YYYY-MM-DD/, String(bad));
     }
-    assert.throws(() => store.addBlockedDate('v1', { date: '2026-10-01', type: 'nope' }), /نوع/);
-    const first = store.blockDate('v1', { date: '2026-10-01', type: 'holiday', id: 'blk-client' });
+    assert.throws(() => store.addBlockedDate('v1', { date: '2099-10-01', type: 'nope' }), /نوع/);
+    assert.throws(() => store.blockDate('v1', { date: '2020-01-01' }), /مضى/);
+    assert.equal(store.getWorkspace('v1').blockedDates.length, 0);
+    const first = store.blockDate('v1', { date: '2099-10-01', type: 'holiday', id: 'blk-client' });
     assert.equal(first.created, true);
     assert.notEqual(first.blockedDate.id, 'blk-client');
-    const again = store.blockDate('v1', { date: '2026-10-01', type: 'custom' });
+    const again = store.blockDate('v1', { date: '2099-10-01', type: 'custom' });
     assert.equal(again.created, false);
     assert.equal(again.blockedDate.id, first.blockedDate.id);
     assert.equal(store.getWorkspace('v1').blockedDates.length, 1);
@@ -670,5 +672,38 @@ describe('vendor-store QA round 2', () => {
     assert.equal(store.removeWorkspace('usr-applicant'), true);
     assert.equal(store.hasWorkspace('usr-applicant'), false);
     assert.equal(store.removeWorkspace('usr-applicant'), false);
+  });
+});
+
+describe('vendor-store — deleted vendor', () => {
+  it('drops the workspace and the photos nothing else still points at', () => {
+    const dir = tmpDir();
+    const store = createVendorStore(dir);
+    const uploads = path.join(dir, 'uploads');
+    fs.mkdirSync(uploads, { recursive: true });
+    for (const name of ['listing-own.jpg', 'listing-shared.jpg', 'other-vendor.jpg']) {
+      fs.writeFileSync(path.join(uploads, name), 'x');
+    }
+    fs.writeFileSync(
+      store.file,
+      JSON.stringify({
+        workspaces: {
+          'usr-gone': {
+            ...emptyWorkspace(),
+            listings: [{ id: 'lst-1', images: ['/uploads/listing-own.jpg', '/uploads/listing-shared.jpg'] }],
+          },
+          'usr-stays': { ...emptyWorkspace(), listings: [{ id: 'lst-2', images: ['/uploads/other-vendor.jpg'] }] },
+        },
+      }),
+    );
+    // The application row still shows this photo in the admin list.
+    fs.writeFileSync(path.join(dir, 'vendor-applications.json'), JSON.stringify([{ logoUrl: '/uploads/listing-shared.jpg' }]));
+
+    assert.equal(store.purgeVendor('usr-gone'), true);
+    assert.equal(store.hasWorkspace('usr-gone'), false);
+    assert.equal(fs.existsSync(path.join(uploads, 'listing-own.jpg')), false);
+    assert.equal(fs.existsSync(path.join(uploads, 'listing-shared.jpg')), true);
+    assert.equal(fs.existsSync(path.join(uploads, 'other-vendor.jpg')), true);
+    assert.equal(store.purgeVendor('usr-gone'), false);
   });
 });

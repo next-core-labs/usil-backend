@@ -46,7 +46,14 @@ function buildApp(dir: string) {
       return (actors() as Record<string, { id: string; name: string; role: string }>)[key] || null;
     },
   };
-  registerExternalBookingRoutes(app, auth, dir, { listCourierOptions: () => COURIERS });
+  registerExternalBookingRoutes(app, auth, dir, {
+    listCourierOptions: () => COURIERS,
+    listVendorOptions: () => [
+      { id: 'usr-v2', name: 'خيام الرياض' },
+      { id: 'usr-v1', name: 'ركن القهوة' },
+      { id: 'usr-v3', name: '  ' },
+    ],
+  });
   return app;
 }
 
@@ -166,5 +173,25 @@ describe('external-booking-routes', () => {
     assert.equal(res.status, 400);
     assert.match((await res.json()).error, /05xxxxxxxx/);
     await close();
+  });
+});
+
+describe('GET /api/external-bookings/vendors', () => {
+  it('gives couriers and supervisors the approved vendors by name, and nobody else', async () => {
+    const { url, close } = await listen(buildApp(tmpDir()));
+    try {
+      for (const actor of ['courier', 'admin']) {
+        const res = await fetch(`${url}/api/external-bookings/vendors`, { headers: { 'x-test-actor': actor } });
+        assert.equal(res.status, 200, actor);
+        const json = (await res.json()) as { success: boolean; data: Array<{ id: string; name: string }> };
+        assert.equal(json.success, true);
+        assert.deepEqual(json.data.map((row) => row.id).sort(), ['usr-v1', 'usr-v2']);
+        assert.deepEqual(Object.keys(json.data[0]).sort(), ['id', 'name']);
+      }
+      assert.equal((await fetch(`${url}/api/external-bookings/vendors`, { headers: { 'x-test-actor': 'client' } })).status, 403);
+      assert.equal((await fetch(`${url}/api/external-bookings/vendors`)).status, 401);
+    } finally {
+      await close();
+    }
   });
 });

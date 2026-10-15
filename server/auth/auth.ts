@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
 import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from './avatar';
@@ -197,7 +197,7 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_ACCOUNT_LIMIT = 30;
 const LOGIN_RATE_LIMIT = 'حدّ محاولات الدخول. انتظر 15 دقيقة ثم أعد المحاولة.';
 /** One answer for unknown email, wrong phone and wrong password — no account probing. */
-const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والجوال والرقم السري.';
+const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والرقم السري.';
 /** Checked only when a password is set, so older shorter passwords still log in. */
 const PASSWORD_MIN_LENGTH = 8;
 const WEAK_PASSWORD = `الرقم السري ضعيف. استخدم ${PASSWORD_MIN_LENGTH} خانات على الأقل.`;
@@ -240,7 +240,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   if (isProduction() && !hasMailConfig() && !warnedNoMail) {
     warnedNoMail = true;
     console.warn(
-      'SMTP is not configured: verification and password-reset codes cannot be delivered, and production never returns them in API responses.',
+      'Mail is not configured (RESEND_API_KEY or SMTP): verification and password-reset codes cannot be delivered, and production never returns them in API responses.',
     );
   }
   const forgotLimiter = createSlidingWindowLimiter(FORGOT_LIMIT, FORGOT_WINDOW_MS);
@@ -249,6 +249,11 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   const loginAccountLimiter = createSlidingWindowLimiter(LOGIN_ACCOUNT_LIMIT, LOGIN_WINDOW_MS);
   const resendLimiter = createSlidingWindowLimiter(EMAIL_RESEND_LIMIT, EMAIL_RESEND_WINDOW_MS);
   const verifyAttemptLimiter = createSlidingWindowLimiter(EMAIL_VERIFY_ATTEMPT_LIMIT, EMAIL_VERIFY_ATTEMPT_WINDOW_MS);
+  /** Other modules clean up what a deleted account owned (workspace, photos, chats). */
+  const userDeletedListeners: Array<(user: PublicUser) => void> = [];
+  function onUserDeleted(listener: (user: PublicUser) => void) {
+    userDeletedListeners.push(listener);
+  }
 
   function publicUser(user: StoredUser): PublicUser {
     const avatarUrl = resolveUserAvatar(dataDir, user);
@@ -323,7 +328,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   ensureOwnerAccount();
 
   /**
-   * The first admin, for a host with no shell to edit users.json on (Render Free).
+   * The first admin, for a host with no shell to edit users.json on (Cloudflare).
    * With OWNER_EMAIL and OWNER_PASSWORD set, boot creates that admin — but only while
    * no admin exists, so a restart never resets a changed password, and the variables
    * go inert once a real user store with its own admins is in place.
@@ -441,11 +446,11 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     return user ? publicUser(user) : null;
   }
 
-  function requireRole(roles: AccountRole[]) {
+  function requireRole(roles: AccountRole[], options: RoleGuardOptions = {}) {
     return (req: Request, res: Response, next: NextFunction) => {
       const user = userFromRequest(req);
       if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-      if (!roleAllowed(user.role, roles)) {
+      if (!roleGuardAllows(user.role, roles, options)) {
         return res.status(403).json({ success: false, error: 'ليست لديك صلاحية هذا الإجراء.' });
       }
       (req as Request & { user: PublicUser }).user = user;
@@ -467,7 +472,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (!email || !password) {
         return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
       }
-      if (!phone && !String(req.body?.identifier || '').includes('@')) {
+      if (!phone && !email.includes('@')) {
         return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
       }
 
@@ -499,6 +504,9 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         return res.status(401).json({ success: false, error: LOGIN_INVALID });
       }
 
+      // Only failures count: a person signing in often must never lock themselves out.
+      loginLimiter.reset(`${clientIp(req)}:${email}`);
+      loginAccountLimiter.reset(email);
       startSession(res, user.id, parseRemember(req.body?.remember));
       const published = publicUser(user);
       res.json({
@@ -520,8 +528,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (!email || !phone || !password || !name) {
         return res.status(400).json({ success: false, error: 'الاسم والبريد والجوال والرقم السري مطلوبة.' });
       }
-      if (!email.includes('@')) {
-        return res.status(400).json({ success: false, error: 'أدخل بريداً إلكترونياً صحيحاً.' });
+      if (!isPlausibleContact(email, phone)) {
+        return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
       }
       if (password.length < PASSWORD_MIN_LENGTH) {
         return res.status(400).json({ success: false, error: WEAK_PASSWORD });
@@ -817,11 +825,15 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       role: 'client',
       passwordHash: input.passwordHash,
       avatarUrl: input.avatarUrl || '',
-      emailVerified: true,
     };
     user.avatarUrl = input.avatarUrl || resolveUserAvatar(dataDir, user);
+    // Typing an email on an application proves nothing about owning it, and a
+    // verified email unlocks guest orders placed with it — so the applicant
+    // confirms it with a code like any sign-up.
+    const issued = issueEmailVerification(user);
     users.push(user);
     saveUsers(users);
+    void sendVerificationEmail(user.email, issued.code, issued.token).catch(() => undefined);
     return publicUser(user);
   }
 
@@ -858,12 +870,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       passwordHash: input.passwordHash,
       avatarUrl: input.avatarUrl || '',
       socials: input.socials || emptyVendorSocials(),
-      emailVerified: true,
     };
     if (input.avatarDataUrl) attachAvatarFromBody(user, input);
     else user.avatarUrl = resolveUserAvatar(dataDir, user);
+    // Approval vouches for the business, not the mailbox (see ensureApplicantUser).
+    const issued = issueEmailVerification(user);
     users.push(user);
     saveUsers(users);
+    void sendVerificationEmail(user.email, issued.code, issued.token).catch(() => undefined);
     return publicUser(user);
   }
 
@@ -907,12 +921,20 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     if (user.role === 'admin' && users.filter((item) => item.role === 'admin').length <= 1) {
       return res.status(400).json({ success: false, error: 'لا يمكن حذف آخر مدير لكل الحسابات.' });
     }
+    const removed = publicUser(user);
     saveUsers(users.filter((item) => item.id !== id));
     const sessions = loadSessions();
     for (const [token, userId] of Object.entries(sessions)) {
       if (userId === id) delete sessions[token];
     }
     saveSessions(sessions);
+    for (const listener of userDeletedListeners) {
+      try {
+        listener(removed);
+      } catch (error) {
+        console.warn('[auth] cleanup after deleting', id, 'failed:', (error as Error)?.message || error);
+      }
+    }
     res.json({ success: true });
   }
 
@@ -1186,6 +1208,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     createUserHandler,
     updateUserHandler,
     deleteUserHandler,
+    onUserDeleted,
     addVendorUser,
     checkApplicantAccount,
     ensureApplicantUser,
@@ -1201,6 +1224,24 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     resendVerificationHandler,
     verifyEmailTokenHandler,
   };
+}
+
+export type RoleGuardOptions = {
+  /**
+   * Only the listed roles pass — `accounts_manager` no longer counts as
+   * `admin`. For money and platform-key settings that stay with the owner.
+   */
+  exact?: boolean;
+};
+
+/** `requireRole`'s check. Without `exact` it is `roleAllowed` (accounts_manager passes for admin). */
+export function roleGuardAllows(
+  userRole: string | null | undefined,
+  roles: readonly string[],
+  options: RoleGuardOptions = {},
+): boolean {
+  if (options.exact) return Boolean(userRole) && roles.includes(String(userRole));
+  return roleAllowed(userRole, roles);
 }
 
 export function parseCookies(req: { headers: { cookie?: string } }): Record<string, string> {
