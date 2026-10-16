@@ -1,8 +1,12 @@
+import { randomInt } from 'node:crypto';
 import type { Express, Request, Response } from 'express';
 import {
+  BOOKING_COMPLETED_STATUS,
+  BOOKING_CONFIRMED_STATUS,
   BOOKING_IN_PROGRESS_STATUS,
   CANCELLING_BOOKING_STATUSES,
   CLOSED_BOOKING_STATUSES,
+  bookingRefundPending,
   bookingTotalHalalas,
   checkStatusTransition,
   clientOwnsBooking,
@@ -13,6 +17,7 @@ import {
   vendorOwnsWholeBooking,
   type BookingCancellation,
   type BookingStore,
+  type MoyasarSettlement,
   type PlatformBooking,
 } from './booking-store.ts';
 import { clientIp, createSlidingWindowLimiter, normalizeSaudiMobile } from '../shared/booking-guards.ts';
@@ -26,20 +31,29 @@ import {
   BOOKING_PENDING_APPROVAL_STATUS,
 } from '../vendors/vendor-listings.ts';
 import { createVendorStore } from '../vendors/vendor-store.ts';
-import { MOYASAR_NOT_CONFIGURED, createMoyasarInvoice } from '../payments/moyasar.ts';
+import { MOYASAR_NOT_CONFIGURED, cancelMoyasarInvoice, createMoyasarInvoice } from '../payments/moyasar.ts';
 import { isIsoDate, quoteBooking, riyadhToday, type PricedListing } from './booking-pricing.ts';
+import { notifyBookingApproved, notifyBookingRejected, notifyVendorNewOrder } from '../shared/optional-mail.ts';
 
 export type BookingActor = { id: string; role: string; email?: string; phone?: string; emailVerified?: boolean };
 
 type AuthApi = {
   userFromRequest: (req: Request) => BookingActor | null;
-  requireRole: (roles: Array<'client' | 'vendor' | 'admin'>) => (
+  requireRole: (
+    roles: Array<'client' | 'vendor' | 'admin'>,
+    options?: { exact?: boolean },
+  ) => (
     req: Request,
     res: Response,
     next: () => void,
   ) => void;
-  /** Approved vendor accounts — the same source the public catalog filters on. */
-  listVendorUsers?: () => Array<{ id: string }>;
+  /**
+   * Approved vendor accounts — the same source the public catalog filters on.
+   * A vendor's id is its account id, so this is also where their email is.
+   */
+  listVendorUsers?: () => Array<{ id: string; email?: string }>;
+  /** Whether an email belongs to an account, so a guest cannot file orders into it. */
+  findUserByEmail?: (email: string) => { id: string } | null;
 };
 
 type Deps = {
@@ -88,6 +102,19 @@ const BAD_FIELDS = 'بيانات الطلب غير صالحة. تأكد من ا�
 const BAD_ITEMS = 'محتوى السلة غير صالح. حدّث الصفحة وأعد إضافة المنتجات.';
 const STATUS_FINAL = 'الطلب ملغي أو مرفوض أو مكتمل، ولا يمكن تغيير حالته. تواصل مع إدارة يوصل إن كان هناك خطأ.';
 const STATUS_BACK_TO_NEW = 'لا يمكن إرجاع الطلب إلى «جديد». اختر حالة تالية.';
+const APPROVAL_NEEDS_LOGIN =
+  'طلبك يشمل منتجاً بموافقة المورّد، والدفع يكون بعد موافقته. سجّل الدخول لنبلغك ونرسل لك رابط الدفع.';
+const EMAIL_HAS_ACCOUNT = 'هذا البريد مسجّل لحساب في يوصل. سجّل الدخول لإكمال الطلب.';
+const UNPAID_NOT_STARTED = 'الطلب لم يُدفع بعد. ابدأ التنفيذ أو أكمله بعد دفع العميل.';
+const UNPAID_INSTANT_CONFIRM = 'الطلب الفوري يتأكد تلقائياً بعد دفع العميل.';
+const BAD_EVENT_TIME = 'اختر وقت المناسبة بصيغة صحيحة (HH:mm) بين 00:00 و23:59.';
+const VENDOR_BACK_TO_PENDING = 'لا يمكن إرجاع الطلب إلى «بانتظار موافقة المورّد». وافق عليه أو ارفضه.';
+const CONFIRM_PAST_DATE = 'موعد المناسبة مضى، ولا يمكن تأكيد الطلب. ارفضه أو ألغه.';
+const CONFIRM_BLOCKED_DATE = 'تاريخ المناسبة مغلق في تقويم المورّد. افتح التاريخ من التقويم أولاً أو ارفض الطلب.';
+const NO_PENDING_REFUND = 'لا يوجد استرجاع معلّق على هذا الطلب.';
+const DELETE_PAID_OR_REFUND =
+  'لا يمكن حذف طلب مدفوع أو عليه استرجاع معلّق — يبقى سجلّه للمحاسبة. ألغِه بدلاً من حذفه.';
+const ADMIN_ONLY = 'هذا الإجراء لمدير كل الحسابات فقط.';
 const PAID_NEEDS_ADMIN =
   'الطلب مدفوع، وإلغاؤه أو رفضه يحتاج استرجاع المبلغ للعميل. تواصل مع إدارة يوصل لإتمام ذلك.';
 
@@ -107,6 +134,42 @@ function isSupervisor(role?: string): boolean {
   return role === 'admin' || role === 'accounts_manager';
 }
 
+/** `HH:mm` on a 24-hour clock. */
+export function isClockTime(value: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+/** A 6-digit `BK-` id; a 9-digit one only if the short space is somehow crowded. */
+function bookingIdCandidate(attempt: number): string {
+  return attempt < 20 ? `BK-${randomInt(100000, 1000000)}` : `BK-${randomInt(100000000, 1000000000)}`;
+}
+
+/**
+ * A booking id no stored or in-flight order has. Six random digits collide
+ * often enough at scale that the store must be checked, not trusted.
+ */
+export function uniqueBookingId(
+  isTaken: (id: string) => boolean,
+  candidate: (attempt: number) => string = bookingIdCandidate,
+): string {
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    const id = candidate(attempt);
+    if (!isTaken(id)) return id;
+  }
+  throw new Error('could not allocate a booking id');
+}
+
+/** What a duplicate checkout answer carries, so the client can resume the first order. */
+function duplicateSummary(row: PlatformBooking) {
+  const awaitingApproval = row.status === BOOKING_PENDING_APPROVAL_STATUS;
+  return {
+    id: row.id,
+    status: row.status,
+    paymentUrl: awaitingApproval ? null : row.paymentUrl || null,
+    awaitingApproval,
+  };
+}
+
 type CheckoutFields = {
   name: string;
   phone: string;
@@ -116,6 +179,8 @@ type CheckoutFields = {
   notes: string;
   city: string;
   eventDate: string;
+  /** `HH:mm`, or '' when the customer gave no time. */
+  eventTime: string;
   items?: Array<Record<string, unknown>>;
 };
 
@@ -144,10 +209,13 @@ export function readCheckoutFields(body: unknown): { ok: true; fields: CheckoutF
   const city = text('city', MAX_CITY);
   // Not truncated to 10, so "2026-10-10junk" still fails the date check.
   const eventDate = text('eventDate', 40);
+  const eventTime = text('eventTime', 20);
   if ([name, phone, email, serviceId, serviceName, notes, city, eventDate].some((value) => value === null)) {
     return { ok: false, error: BAD_FIELDS };
   }
   if (!name || !phone) return { ok: false, error: NAME_AND_PHONE };
+  // Optional; when sent it must be a real time, not free text.
+  if (eventTime === null || (eventTime && !isClockTime(eventTime))) return { ok: false, error: BAD_EVENT_TIME };
 
   let items: Array<Record<string, unknown>> | undefined;
   if (raw.items !== undefined && raw.items !== null) {
@@ -176,6 +244,7 @@ export function readCheckoutFields(body: unknown): { ok: true; fields: CheckoutF
       notes: notes!,
       city: city!,
       eventDate: eventDate!,
+      eventTime: eventTime || '',
       items,
     },
   };
@@ -220,6 +289,46 @@ export function registerBookingRoutes(
         .map((listing) => String(listing.id)),
     );
 
+  /** Ids handed out to checkouts still raising their invoice — not yet in the store. */
+  const reservedIds = new Set<string>();
+  const newBookingId = () => uniqueBookingId((id) => reservedIds.has(id) || Boolean(store.findById(id)));
+
+  /** A vendor's id is their account id; their account email is where order notices go. */
+  function vendorEmail(vendorId: string): string {
+    const user = (auth.listVendorUsers?.() || []).find((row) => String(row.id) === vendorId);
+    return String(user?.email || '').trim();
+  }
+
+  /** Tells every vendor on the order about it, naming only their own lines. */
+  function notifyVendorsOfOrder(booking: PlatformBooking, needsApproval: boolean) {
+    for (const vendorId of booking.vendorIds || []) {
+      const email = vendorEmail(vendorId);
+      if (!email) continue;
+      const own = (Array.isArray(booking.items) ? booking.items : [])
+        .filter((line) => (line as { vendorId?: unknown })?.vendorId === vendorId)
+        .map((line) => String((line as { title?: unknown })?.title || ''))
+        .filter(Boolean);
+      notifyVendorNewOrder(email, booking.id, own.join(' + ') || booking.serviceName, needsApproval);
+    }
+  }
+
+  /**
+   * An order cancelled before payment: close its Moyasar invoice so the old
+   * link cannot take money for it. Best-effort — the cancellation stands
+   * whatever Moyasar answers.
+   */
+  function cancelUnpaidInvoice(booking: PlatformBooking) {
+    if (booking.paymentStatus === 'paid' || !booking.moyasarInvoiceId) return;
+    const invoiceId = booking.moyasarInvoiceId;
+    void cancelMoyasarInvoice(invoiceId)
+      .then((out) => {
+        if (out.ok === false && out.code !== 'not_configured') {
+          console.warn('[bookings] could not cancel the Moyasar invoice of', booking.id, invoiceId, out.code);
+        }
+      })
+      .catch(() => undefined);
+  }
+
   function canRead(actor: BookingActor | null, booking: PlatformBooking): boolean {
     if (!actor) return false;
     if (isSupervisor(actor.role)) return true;
@@ -231,7 +340,17 @@ export function registerBookingRoutes(
   app.get('/api/bookings', (req: Request, res: Response) => {
     const user = auth.userFromRequest(req);
     if (!user) return res.status(401).json({ success: false, error: NEEDS_LOGIN });
-    if (isSupervisor(user.role)) return res.json({ success: true, data: store.list() });
+    if (isSupervisor(user.role)) {
+      // Supervising one vendor's back office: exactly the rows (and trimmed
+      // view) that vendor would see.
+      const vendorId = typeof req.query.vendorId === 'string' ? req.query.vendorId.trim() : '';
+      if (vendorId) {
+        const own = ownListingIds(vendorId);
+        const rows = store.listForVendor(vendorId, own).map((row) => vendorViewOfBooking(vendorId, own, row));
+        return res.json({ success: true, data: rows });
+      }
+      return res.json({ success: true, data: store.list() });
+    }
     if (user.role === 'client') return res.json({ success: true, data: store.listForClient(user) });
     if (user.role === 'vendor') {
       const own = ownListingIds(user.id);
@@ -264,7 +383,7 @@ export function registerBookingRoutes(
     if (parsed.ok === false) {
       return res.status(400).json({ success: false, error: parsed.error });
     }
-    const { name, phone, email, serviceId, serviceName, notes, city, eventDate: date, items } = parsed.fields;
+    const { name, phone, email, serviceId, serviceName, notes, city, eventDate: date, eventTime, items } = parsed.fields;
     const totalAmount = req.body?.totalAmount;
     const saudiPhone = normalizeSaudiMobile(phone);
     if (!saudiPhone) {
@@ -304,7 +423,18 @@ export function registerBookingRoutes(
     }
 
     const sessionUser = auth.userFromRequest(req);
-    const orderEmail = String(email || sessionUser?.email || '').trim();
+    // Approval orders are paid after the vendor accepts, through the account
+    // that placed them — a guest would have no way back to the pay link.
+    if (quote.needsVendorApproval && !sessionUser) {
+      return res.status(401).json({ success: false, error: APPROVAL_NEEDS_LOGIN, needsLogin: true });
+    }
+    // A signed-in order carries its own account email. A guest may not type an
+    // email that belongs to an account: verified emails see orders placed with
+    // them, so that would file a stranger's order into someone's account.
+    if (!sessionUser && email && auth.findUserByEmail?.(email)) {
+      return res.status(409).json({ success: false, error: EMAIL_HAS_ACCOUNT, needsLogin: true });
+    }
+    const orderEmail = String(sessionUser?.email || email || '').trim();
     const listingIds = quote.lines.map((line) => line.id);
     const nowMs = now().getTime();
 
@@ -314,15 +444,25 @@ export function registerBookingRoutes(
       phone: saudiPhone,
       listingIds,
       eventDate: date,
+      eventTime: eventTime || '',
+      quantities: quote.lines.map((line) => ({ id: line.id, quantity: line.quantity })),
       windowMs: DUPLICATE_WINDOW_MS,
       now: nowMs,
     });
     if (duplicate) {
-      // Only the account that placed it gets the row (and its pay link) back.
+      const summary = duplicateSummary(duplicate);
+      // Only the account that placed it gets the full row back.
       if (sessionUser && duplicate.userId === sessionUser.id) {
-        return res.json({ success: true, booking: duplicate, duplicate: true });
+        return res.json({
+          success: true,
+          booking: duplicate,
+          duplicate: true,
+          ...(summary.awaitingApproval ? { awaitingApproval: true } : {}),
+        });
       }
-      return res.status(409).json({ success: false, error: DUPLICATE_ORDER });
+      // Same phone and email (or device) as the first order: enough to resume
+      // it — its id, status and pay link — but not the stored row.
+      return res.status(409).json({ success: false, error: DUPLICATE_ORDER, duplicate: true, booking: summary });
     }
     const anonymous = !sessionUser && !orderEmail;
     const buyerKey = sessionUser?.id || orderEmail.toLowerCase() || `${clientIp(req)}|${saudiPhone}`;
@@ -335,14 +475,18 @@ export function registerBookingRoutes(
       const earlier = recentGuestCheckouts.get(flightKey);
       const earlierRow = earlier ? store.findById(earlier.bookingId) : null;
       if (earlierRow && earlierRow.paymentStatus === 'unpaid' && !CLOSED_BOOKING_STATUSES.includes(earlierRow.status)) {
-        return res.status(409).json({ success: false, error: DUPLICATE_ORDER });
+        return res
+          .status(409)
+          .json({ success: false, error: DUPLICATE_ORDER, duplicate: true, booking: duplicateSummary(earlierRow) });
       }
     }
+    const bookingId = newBookingId();
+    reservedIds.add(bookingId);
     inFlight.add(flightKey);
 
     try {
       const booking: PlatformBooking = {
-        id: `BK-${Math.floor(100000 + Math.random() * 900000)}`,
+        id: bookingId,
         userId: sessionUser?.id || undefined,
         name,
         phone: saudiPhone,
@@ -352,6 +496,7 @@ export function registerBookingRoutes(
         notes,
         city,
         eventDate: date,
+        ...(eventTime ? { eventTime } : {}),
         paymentMethod: 'moyasar',
         settlement: SETTLEMENT_LABEL,
         items: quote.lines,
@@ -362,6 +507,14 @@ export function registerBookingRoutes(
         paymentStatus: 'unpaid',
         createdAt: now().toISOString().replace('T', ' ').substring(0, 16),
       };
+
+      // Nothing is charged before the vendor accepts: the invoice is raised on
+      // approval (see the PATCH route) and the client pays from «طلباتي».
+      if (quote.needsVendorApproval) {
+        store.add(booking);
+        notifyVendorsOfOrder(booking, true);
+        return res.status(201).json({ success: true, booking, awaitingApproval: true });
+      }
 
       // The invoice is raised before the row is stored, so a provider failure
       // leaves no unpayable booking behind. Its amount is the server quote.
@@ -384,6 +537,7 @@ export function registerBookingRoutes(
       res.status(201).json({ success: true, booking });
     } finally {
       inFlight.delete(flightKey);
+      reservedIds.delete(bookingId);
     }
   });
 
@@ -428,11 +582,12 @@ export function registerBookingRoutes(
 
     const updated = store.cancel(booking.id, cancellation);
     if (!updated) return res.status(404).json({ success: false, error: NOT_FOUND });
+    cancelUnpaidInvoice(updated);
     res.json({ success: true, booking: updated, refund: { percent: refundPercent, amountSar: refundHalalas / 100 } });
   });
 
   // تحديث حالة الحجز
-  app.patch('/api/bookings/:id', auth.requireRole(['vendor', 'admin']), (req: Request, res: Response) => {
+  app.patch('/api/bookings/:id', auth.requireRole(['vendor', 'admin']), async (req: Request, res: Response) => {
     const user = auth.userFromRequest(req);
     if (!user) return res.status(401).json({ success: false, error: NEEDS_LOGIN });
 
@@ -460,6 +615,45 @@ export function registerBookingRoutes(
         .status(409)
         .json({ success: false, error: transition.reason === 'final' ? STATUS_FINAL : STATUS_BACK_TO_NEW });
     }
+    // «بانتظار موافقة المورّد» is where checkout puts an approval order — a
+    // vendor moving an instant order there could then «approve» it unpaid.
+    if (by === 'vendor' && status === BOOKING_PENDING_APPROVAL_STATUS && current.status !== status) {
+      return res.status(409).json({ success: false, error: VENDOR_BACK_TO_PENDING });
+    }
+
+    // Confirming commits the vendor to the date: it must still be ahead and
+    // open in their calendar (it may have been blocked since checkout).
+    const confirming =
+      status === BOOKING_CONFIRMED_STATUS &&
+      (current.status === BOOKING_PENDING_APPROVAL_STATUS || current.status === BOOKING_NEW_STATUS);
+    if (confirming) {
+      if (isIsoDate(current.eventDate) && current.eventDate < riyadhToday(now())) {
+        return res.status(409).json({ success: false, error: CONFIRM_PAST_DATE });
+      }
+      const day = String(current.eventDate || '').slice(0, 10);
+      const blocked = (current.vendorIds || []).some((vendorId) =>
+        blockedDatesFor(vendorId).some((row) => String(row?.date || '').slice(0, 10) === day),
+      );
+      if (blocked) return res.status(409).json({ success: false, error: CONFIRM_BLOCKED_DATE });
+    }
+
+    // Unpaid orders: work starts only after payment, and an instant order is
+    // confirmed by its payment, not by hand. Approving an approval order is
+    // the one confirmation that comes before money. Admins may override.
+    let paymentOverride = false;
+    if (current.paymentStatus !== 'paid' && status !== current.status) {
+      const startsWork = status === BOOKING_IN_PROGRESS_STATUS || status === BOOKING_COMPLETED_STATUS;
+      // Only a real approval order (checkout put it in pending) is confirmed before payment.
+      const approvingApprovalOrder =
+        current.status === BOOKING_PENDING_APPROVAL_STATUS && current.bookingMode !== 'instant';
+      const confirmsUnpaidInstant = status === BOOKING_CONFIRMED_STATUS && !approvingApprovalOrder;
+      if (startsWork || confirmsUnpaidInstant) {
+        if (by === 'vendor') {
+          return res.status(409).json({ success: false, error: startsWork ? UNPAID_NOT_STARTED : UNPAID_INSTANT_CONFIRM });
+        }
+        paymentOverride = true;
+      }
+    }
 
     // Ending an order records who ended it and what is owed, in the same shape
     // a client cancellation uses, so a refund is never lost. A paid order owes
@@ -485,22 +679,84 @@ export function registerBookingRoutes(
       };
     }
 
-    const booking = store.updateStatus(current.id, status, { by, cancellation });
+    let booking = store.updateStatus(current.id, status, { by, cancellation });
     if (!booking) return res.status(404).json({ success: false, error: NOT_FOUND });
     // Rows carry no status history; the log is the record of an admin override.
-    if (transition.override) {
+    if (transition.override || paymentOverride) {
       console.warn('[bookings] admin status override', booking.id, current.status, '->', status, 'by', user.id);
+    }
+    if (cancellation) {
+      cancelUnpaidInvoice(booking);
+      notifyBookingRejected(booking.email, booking.id, booking.serviceName);
+    }
+
+    // Approved: now the client can pay. Raise the invoice and tell them; if
+    // Moyasar is down the approval stands and «طلباتي» raises it on demand.
+    const approved =
+      current.status === BOOKING_PENDING_APPROVAL_STATUS &&
+      status === BOOKING_CONFIRMED_STATUS &&
+      booking.paymentStatus !== 'paid';
+    if (approved) {
+      if (!booking.paymentUrl) {
+        const invoice = await createMoyasarInvoice({
+          amountSar: Number(booking.totalAmount),
+          description: `طلب يوصل ${booking.id} — ${booking.serviceName}`,
+          bookingId: booking.id,
+        });
+        if (invoice.ok) booking = store.attachInvoice(booking.id, invoice.invoice) || booking;
+      }
+      notifyBookingApproved(booking.email, booking.id, booking.serviceName, booking.paymentUrl);
     }
     res.json({ success: true, booking });
   });
 
-  // حذف حجز
-  app.delete('/api/bookings/:id', auth.requireRole(['admin']), (req: Request, res: Response) => {
-    if (!store.remove(String(req.params.id))) {
+  /**
+   * The refund was sent by hand from the Moyasar dashboard: close the pending
+   * refund so the order stops showing money owed. (Refunds Moyasar reports
+   * through the webhook close themselves.)
+   */
+  app.post('/api/bookings/:id/refund-done', auth.requireRole(['admin']), (req: Request, res: Response) => {
+    const user = auth.userFromRequest(req);
+    if (!user) return res.status(401).json({ success: false, error: NEEDS_LOGIN });
+    if (!isSupervisor(user.role)) return res.status(403).json({ success: false, error: FORBIDDEN });
+    const current = store.findById(String(req.params.id));
+    if (!current) return res.status(404).json({ success: false, error: NOT_FOUND });
+    const booking = store.markRefundDone(current.id, now());
+    if (!booking) return res.status(409).json({ success: false, error: NO_PENDING_REFUND });
+    console.warn('[bookings] refund marked done by hand', booking.id, 'by', user.id);
+    res.json({ success: true, booking });
+  });
+
+  // حذف حجز — لمدير كل الحسابات فقط، ولا يُحذف طلب فيه مال.
+  app.delete('/api/bookings/:id', auth.requireRole(['admin'], { exact: true }), (req: Request, res: Response) => {
+    const user = auth.userFromRequest(req);
+    if (!user) return res.status(401).json({ success: false, error: NEEDS_LOGIN });
+    if (user.role !== 'admin') return res.status(403).json({ success: false, error: ADMIN_ONLY });
+    const current = store.findById(String(req.params.id));
+    if (!current) return res.status(404).json({ success: false, error: NOT_FOUND });
+    if (current.paymentStatus === 'paid' || bookingRefundPending(current)) {
+      return res.status(409).json({ success: false, error: DELETE_PAID_OR_REFUND });
+    }
+    if (!store.remove(current.id)) {
       return res.status(404).json({ success: false, error: NOT_FOUND });
     }
     res.json({ success: true });
   });
 
-  return Object.assign(store, { actorFromRequest: auth.userFromRequest, canRead });
+  /**
+   * Settlement goes through the store; an instant order that has just become
+   * paid is now a confirmed order, so its vendors hear about it here.
+   */
+  // Captured before the service below replaces it with this wrapper.
+  const settleInStore = store.markPaidFromMoyasar;
+  function markPaidFromMoyasar(input: MoyasarSettlement): PlatformBooking | null {
+    const before = store.findForMoyasar(input);
+    const after = settleInStore(input);
+    if (before && after && before.paymentStatus !== 'paid' && after.paymentStatus === 'paid') {
+      if (after.bookingMode === 'instant') notifyVendorsOfOrder(after, false);
+    }
+    return after;
+  }
+
+  return Object.assign(store, { actorFromRequest: auth.userFromRequest, canRead, markPaidFromMoyasar });
 }

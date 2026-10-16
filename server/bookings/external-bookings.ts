@@ -217,5 +217,24 @@ export function createExternalBookingStore(dataDir: string) {
     return true;
   }
 
-  return { file, list: readAll, listFor, findById, create, update, remove };
+  /**
+   * A courier filed against before they had an account (their approved
+   * application's id) now has one: move those rows onto the account so the
+   * courier sees them. Returns how many rows moved.
+   */
+  function reassignCourier(fromId: string, toId: string): number {
+    if (!fromId || !toId || fromId === toId) return 0;
+    const rows = readAll();
+    let moved = 0;
+    for (const row of rows) {
+      if (row.courierId !== fromId) continue;
+      row.courierId = toId;
+      row.updatedAt = new Date().toISOString();
+      moved += 1;
+    }
+    if (moved) writeAll(rows);
+    return moved;
+  }
+
+  return { file, list: readAll, listFor, findById, create, update, remove, reassignCourier };
 }

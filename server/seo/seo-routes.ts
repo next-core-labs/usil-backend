@@ -14,7 +14,10 @@ import { publicVendorAccounts, vendorUsersFromDataDir, type VendorAccountLike } 
 
 type AuthLike = {
   userFromRequest: (req: Request) => { role?: string } | null;
-  requireRole: (roles: Array<'client' | 'vendor' | 'admin'>) => (
+  requireRole: (
+    roles: Array<'client' | 'vendor' | 'admin'>,
+    options?: { exact?: boolean },
+  ) => (
     req: Request,
     res: Response,
     next: () => void,
@@ -35,8 +38,22 @@ export type SeoRouteOptions = {
    * public-vendor rule as `/api/vendors/:id`, read from this data dir.
    */
   getVendorEntries?: () => Array<{ id: string; updatedAt?: string }>;
+  /** Title, description and logo for `/vendor/<id>`; null when the vendor is not public. */
+  getVendorSeo?: (id: string) => ServicePageSeo | null;
   indexHtmlPath?: string;
+  /** The SPA shell's HTML, where there is no file to read it from (Cloudflare). Wins over `indexHtmlPath`. */
+  readIndexHtml?: () => string;
 };
+
+function vendorIdFromPath(pathname: string): string {
+  const match = /^\/vendor\/([^/]+)\/?$/.exec(pathname);
+  if (!match) return '';
+  try {
+    return decodeURIComponent(match[1]).trim();
+  } catch {
+    return '';
+  }
+}
 
 function serviceIdFromPath(pathname: string): string {
   const match = /^\/service\/([^/]+)\/?$/.exec(pathname);
@@ -57,6 +74,8 @@ function isoDate(value: unknown): string | undefined {
 export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string, options: SeoRouteOptions = {}) {
   const store = createSeoStore(dataDir);
   const requireAdmin = auth.requireRole(['admin']);
+  /** Site-wide SEO (robots, canonical, verification tags) is changed by «مدير كل الحسابات» only. */
+  const requireOwnerAdmin = auth.requireRole(['admin'], { exact: true });
 
   const defaultVendorEntries = () => {
     const vendors = createVendorStore(dataDir);
@@ -98,7 +117,7 @@ export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string,
     res.json({ success: true, data: store.load() });
   });
 
-  app.put('/api/admin/seo', requireAdmin, (req: Request, res: Response) => {
+  app.put('/api/admin/seo', requireOwnerAdmin, (req: Request, res: Response) => {
     const patch = pickSeoPatch(req.body);
     if (!patch) {
       return res.status(400).json({ success: false, error: 'لا توجد حقول صالحة لحفظها في إعدادات الظهور.' });
@@ -137,9 +156,35 @@ export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string,
 
   return {
     store,
-    sendSpa: (req: Request, res: Response) =>
-      sendSeoSpa(res, store.load(), options.indexHtmlPath, req.path, lookupServiceSeo(req.path)),
+    sendSpa: (req: Request, res: Response) => {
+      const vendorId = vendorIdFromPath(req.path);
+      const page = vendorId ? lookupVendorSeo(vendorId) : lookupServiceSeo(req.path);
+      // A product or vendor that is not public is a 404 for crawlers too; the
+      // SPA still renders its own «غير موجود» page.
+      if (vendorId ? options.getVendorSeo && !page : !page && isUnknownService(req.path)) res.status(404);
+      sendSeoSpa(res, store.load(), options.readIndexHtml || options.indexHtmlPath, req.path, page);
+    },
   };
+
+  function lookupVendorSeo(vendorId: string): ServicePageSeo | null {
+    if (!options.getVendorSeo) return null;
+    try {
+      return options.getVendorSeo(vendorId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** `/service/<id>` naming nothing in the catalog (live listings or the built-in one). */
+  function isUnknownService(pathname: string): boolean {
+    const id = serviceIdFromPath(pathname);
+    if (!id || !options.getServiceEntries) return false;
+    try {
+      return !options.getServiceEntries().some((item) => String(item.id || '').trim() === id);
+    } catch {
+      return false;
+    }
+  }
 
   function lookupServiceSeo(pathname: string): ServicePageSeo | null {
     const id = serviceIdFromPath(pathname);
@@ -155,13 +200,14 @@ export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string,
 export function sendSeoSpa(
   res: Response,
   settings: SeoSettings,
-  indexHtmlPath: string | undefined,
+  indexHtml: string | (() => string) | undefined,
   pathname: string,
   service?: ServicePageSeo | null,
 ) {
-  const indexPath = indexHtmlPath || path.join(process.cwd(), 'dist', 'index.html');
+  const indexPath = typeof indexHtml === 'string' ? indexHtml : path.join(process.cwd(), 'dist', 'index.html');
   try {
-    const html = injectSeoIntoHtml(fs.readFileSync(indexPath, 'utf-8'), settings, pathname, service);
+    const raw = typeof indexHtml === 'function' ? indexHtml() : fs.readFileSync(indexPath, 'utf-8');
+    const html = injectSeoIntoHtml(raw, settings, pathname, service);
     res.setHeader('Cache-Control', 'no-store');
     res.type('html').send(html);
   } catch {

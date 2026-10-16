@@ -1,11 +1,12 @@
 import crypto from 'crypto';
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import { readJsonFile, writeJsonFile } from '../shared/json-file.ts';
 import { parseDataUrl, saveUpload, UPLOAD_MAX_BYTES } from '../auth/avatar';
 import { isAllowedListingImage, isStockMediaUrl } from '../../core/utils/catalogMedia';
 import type { BookingStatus } from '../../core/types';
 import { normalizeSaudiMobile } from '../shared/booking-guards';
+import { riyadhToday } from '../bookings/booking-pricing.ts';
 import {
   createBookingStore,
   vendorHasBooking,
@@ -41,6 +42,15 @@ import {
   type VendorPublicFile,
   type VendorWorkspaceProfile,
 } from './vendor-profile';
+import {
+  OFFICE_INVALID,
+  OFFICE_MAX_BYTES,
+  OFFICE_TOO_LARGE,
+  createVendorOfficeStore,
+  officeBytes,
+  sanitizeOffice,
+  type VendorOffice,
+} from './vendor-office';
 
 export type VendorBookingRecord = {
   id: string;
@@ -89,6 +99,11 @@ export type VendorWorkspace = {
   listings: VendorListing[];
   socials?: VendorSocials;
   profile?: VendorWorkspaceProfile;
+  /**
+   * The vendor's back office (see `vendor-office.ts`). Stored apart from the
+   * workspace and only filled in by the workspace routes.
+   */
+  office?: VendorOffice;
   updatedAt: string;
 };
 
@@ -288,6 +303,7 @@ function normalizeListings(raw: unknown, vendorId: string): VendorListing[] {
 /** Fields a vendor may edit on a listing — used to tell an untouched row from an edit. */
 const LISTING_EDIT_FIELDS = [
   'title',
+  'audiences',
   'category',
   'shortDesc',
   'price',
@@ -314,6 +330,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   const listPlatformBookings = options.listPlatformBookings || (() => createBookingStore(dataDir).list());
   const uploadsRoot = path.resolve(dataDir, 'uploads');
   const IMAGE_INVALID_AR = 'صورة المنتج غير صالحة — ارفع الصورة من جهازك';
+  const offices = createVendorOfficeStore(dataDir);
 
   function readFile(): VendorStoreFile {
     return readJsonFile<VendorStoreFile>(file, { workspaces: {} });
@@ -486,6 +503,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   }
 
   function wipeAllWorkspaces(): number {
+    offices.wipeAll();
     const data = readFile();
     const count = Object.keys(data.workspaces || {}).length;
     if (!count) return 0;
@@ -496,6 +514,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   /** When approval creates a new user id, keep the applicant's uploaded listings. */
   function moveWorkspace(fromId: string, toId: string): VendorWorkspace | null {
     if (!fromId || !toId || fromId === toId) return hasWorkspace(toId) ? getWorkspace(toId) : null;
+    offices.move(fromId, toId);
     const data = readFile();
     const source = data.workspaces[fromId];
     if (!source) return hasWorkspace(toId) ? getWorkspace(toId) : null;
@@ -662,6 +681,16 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     const patch = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
     const current = getWorkspace(vendorId);
     const next: Partial<VendorWorkspace> = {};
+    // Checked before anything is written, so a refused office saves nothing.
+    // Present = replace the whole office; absent = keep it as stored.
+    let office: VendorOffice | undefined;
+    if (patch.office !== undefined) {
+      if (!patch.office || typeof patch.office !== 'object' || Array.isArray(patch.office)) {
+        throw new VendorStoreError(OFFICE_INVALID);
+      }
+      office = sanitizeOffice(patch.office);
+      if (officeBytes(office) > OFFICE_MAX_BYTES) throw new VendorStoreError(OFFICE_TOO_LARGE, 413);
+    }
     if (Array.isArray(patch.inventoryItems)) next.inventoryItems = patch.inventoryItems as InventoryRecord[];
     if (Array.isArray(patch.contracts)) next.contracts = patch.contracts as ContractRecord[];
     if (patch.socials !== undefined) {
@@ -707,7 +736,13 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
       }
       next.listings = listings;
     }
-    return patchWorkspace(vendorId, next);
+    const saved = patchWorkspace(vendorId, next);
+    return { ...saved, office: office ? offices.save(vendorId, office) : offices.get(vendorId) };
+  }
+
+  /** The workspace as the vendor console loads it: with its back office. */
+  function getWorkspaceWithOffice(vendorId: string): VendorWorkspace {
+    return { ...getWorkspace(vendorId), office: offices.get(vendorId) };
   }
 
   /* ── Bookings ─────────────────────────────────────────────────── */
@@ -843,6 +878,8 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     const body = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
     if (body.date === undefined || body.date === null || body.date === '') throw new VendorStoreError('التاريخ مطلوب');
     if (!isIsoDate(body.date)) throw new VendorStoreError('اكتب التاريخ بصيغة YYYY-MM-DD');
+    // Nobody can book a past date, so closing one only clutters the calendar.
+    if (body.date < riyadhToday()) throw new VendorStoreError('التاريخ مضى. اختر تاريخاً من اليوم فصاعداً.');
     const type = body.type === undefined || body.type === '' ? 'custom' : String(body.type);
     if (!(BLOCKED_DATE_TYPES as readonly string[]).includes(type)) throw new VendorStoreError('نوع الإغلاق غير معروف');
     const ws = getWorkspace(vendorId);
@@ -909,6 +946,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
       images: imagesGiven ? body.images : current.images ?? (current.image ? [current.image] : []),
       image: imagesGiven ? body.image : undefined,
       fulfillment: body.fulfillment ?? current.fulfillment,
+      audiences: body.audiences ?? current.audiences,
       bookingMode: body.bookingMode ?? current.bookingMode,
       vendorName: body.vendorName || vendorName || current.vendorName,
     };
@@ -1059,8 +1097,9 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     const manualRevenue = ws.bookings
       .filter((b) => isRevenueBookingStatus(b.status))
       .reduce((sum, b) => sum + Number(b.totalAmount || 0), 0);
+    // Money only counts once Moyasar confirmed it; an unpaid order marked done is not revenue.
     const platformRevenue = orders
-      .filter((row) => isRevenueBookingStatus(row.status))
+      .filter((row) => row.paymentStatus === 'paid' && isRevenueBookingStatus(row.status))
       .reduce((sum, row) => {
         const amount = Number(row.totalAmount);
         return Number.isFinite(amount) && amount > 0 ? sum + amount : sum;
@@ -1096,6 +1135,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
    */
   function removeWorkspace(vendorId: string): boolean {
     if (!vendorId) return false;
+    offices.remove(vendorId);
     const data = readFile();
     if (!data.workspaces[vendorId]) return false;
     delete data.workspaces[vendorId];
@@ -1103,9 +1143,54 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     return true;
   }
 
+  /**
+   * A deleted vendor account: its workspace goes, and so do the photos it
+   * uploaded — unless another record (an application, an order, another
+   * workspace) still points at the same file.
+   */
+  function purgeVendor(vendorId: string): boolean {
+    if (!vendorId) return false;
+    const office = offices.get(vendorId);
+    const hadOffice = offices.remove(vendorId);
+    const data = readFile();
+    const workspace = data.workspaces[vendorId];
+    if (!workspace) return hadOffice;
+    const owned = new Set<string>();
+    JSON.stringify([workspace, office], (_key, value) => {
+      if (typeof value === 'string' && /^\/uploads\/[\w.-]+$/.test(value)) owned.add(value);
+      return value;
+    });
+    delete data.workspaces[vendorId];
+    writeFile(data);
+
+    const stillUsed = fs
+      .readdirSync(dataDir)
+      .filter((name) => name.endsWith('.json'))
+      .map((name) => {
+        try {
+          return fs.readFileSync(path.join(dataDir, name), 'utf-8');
+        } catch {
+          return '';
+        }
+      })
+      .join('\n');
+    for (const url of owned) {
+      if (stillUsed.includes(url)) continue;
+      try {
+        fs.unlinkSync(path.join(dataDir, 'uploads', path.basename(url)));
+      } catch {
+        /* already gone */
+      }
+    }
+    return true;
+  }
+
   return {
+    purgeVendor,
     file,
     getWorkspace,
+    getWorkspaceWithOffice,
+    getOffice: (vendorId: string) => offices.get(vendorId),
     hasWorkspace,
     ensureEmptyWorkspace,
     seedWorkspaceFromApplication,

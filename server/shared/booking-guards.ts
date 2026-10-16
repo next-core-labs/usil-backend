@@ -28,9 +28,8 @@ function firstHeaderValue(value: unknown): string {
 }
 
 /**
- * The caller's IP, for rate-limit keys. Production runs on Render, which sits
- * behind Cloudflare (responses carry `server: cloudflare` and `cf-ray`), and
- * Cloudflare overwrites `cf-connecting-ip` with the real caller — so that is
+ * The caller's IP, for rate-limit keys. Production runs on Cloudflare Workers,
+ * and Cloudflare overwrites `cf-connecting-ip` with the real caller — so that is
  * the production default. The raw `X-Forwarded-For` is caller-controlled and
  * never read here: trusting it let anyone reset their rate-limit budget per
  * request.
@@ -57,8 +56,22 @@ export function clientIp(
 
 export function createSlidingWindowLimiter(limit: number, windowMs: number) {
   const hits = new Map<string, number[]>();
+  let lastSweep = 0;
+  /**
+   * Keys are mostly IPs, so a long-running process would otherwise keep one
+   * entry per caller forever. Once per window, drop every key whose hits have
+   * all aged out — an empty window and a missing key mean the same thing.
+   */
+  function sweep(now: number) {
+    if (now - lastSweep < windowMs) return;
+    lastSweep = now;
+    for (const [key, times] of hits) {
+      if (!times.some((t) => now - t < windowMs)) hits.delete(key);
+    }
+  }
   return {
     allow(key: string, now = Date.now()): boolean {
+      sweep(now);
       const next = (hits.get(key) || []).filter((t) => now - t < windowMs);
       if (next.length >= limit) {
         hits.set(key, next);
@@ -67,6 +80,14 @@ export function createSlidingWindowLimiter(limit: number, windowMs: number) {
       next.push(now);
       hits.set(key, next);
       return true;
+    },
+    /** Forgets a key's hits — e.g. after a successful login, so only failures count. */
+    reset(key: string): void {
+      hits.delete(key);
+    },
+    /** Keys currently tracked — for tests and diagnostics. */
+    size(): number {
+      return hits.size;
     },
   };
 }

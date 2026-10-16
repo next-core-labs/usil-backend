@@ -330,7 +330,7 @@ describe('email verification API', () => {
 
   it('never returns the verification code in production when mail fails', async () => {
     const saved = { NODE_ENV: process.env.NODE_ENV, warn: console.warn };
-    const mailVars = ['SMTP_HOST', 'MAIL_HOST', 'SMTP_URL', 'MAIL_URL', 'SMTP_SERVER'];
+    const mailVars = ['RESEND_API_KEY', 'SMTP_HOST', 'MAIL_HOST', 'SMTP_URL', 'MAIL_URL', 'SMTP_SERVER'];
     const savedMail = mailVars.map((key) => [key, process.env[key]] as const);
     const warnings: string[] = [];
     process.env.NODE_ENV = 'production';
@@ -341,7 +341,7 @@ describe('email verification API', () => {
     try {
       const dir = tmpDir();
       const { app } = mount(dir);
-      assert.ok(warnings.some((line) => /SMTP is not configured/.test(line)), 'warns once at startup');
+      assert.ok(warnings.some((line) => /Mail is not configured/.test(line)), 'warns once at startup');
       const { url, close } = await listen(app);
       const email = 'prod.nomail@usil.sa';
       const phone = '0591231234';

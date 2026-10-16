@@ -11,8 +11,12 @@ type AuthApi = {
 
 export type CourierOption = { id: string; name: string; source: 'account' | 'application' };
 
+export type ExternalVendorOption = { id: string; name: string };
+
 type Deps = {
   listCourierOptions: () => CourierOption[];
+  /** Approved vendors, by project name — what the external booking form offers. */
+  listVendorOptions?: () => ExternalVendorOption[];
 };
 
 const WRITE_LIMIT = 20;
@@ -49,6 +53,18 @@ export function registerExternalBookingRoutes(app: Express, auth: AuthApi, dataD
       return res.json({ success: true, data: [{ id: actor.id, name: actor.name, source: 'account' }] });
     }
     res.json({ success: true, data: deps.listCourierOptions() });
+  });
+
+  // The form's vendor picker. Couriers cannot read /api/admin/vendor-hubs, so
+  // they get just the names here.
+  app.get('/api/external-bookings/vendors', (req: Request, res: Response) => {
+    const actor = actorOf(req, res);
+    if (!actor) return;
+    const vendors = (deps.listVendorOptions?.() || [])
+      .map((row) => ({ id: String(row.id), name: String(row.name || '').trim() }))
+      .filter((row) => row.id && row.name)
+      .sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+    res.json({ success: true, data: vendors });
   });
 
   app.get('/api/external-bookings', (req: Request, res: Response) => {

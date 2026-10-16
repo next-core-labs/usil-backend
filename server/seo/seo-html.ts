@@ -86,8 +86,9 @@ export function resolvePageSeo(
   const builtIn = defaultSeoSettings().pages[pageKey];
   // خريطة الميتا تُطابق المسار الكامل، فتغطي صفحات الخدمات التي لا مفتاح أدمن لها
   const meta = seoMetaForPath(normalized);
-  // منتج مورّد معتمد على /service/<id>: عنوانه ووصفه وصورته هو، لا عنوان الرئيسية
-  const listing = normalized.startsWith('/service/') && service?.title?.trim() ? service : null;
+  // منتج مورّد معتمد على /service/<id> أو ملف مورّد على /vendor/<id>: عنوانه ووصفه وصورته هو، لا عنوان الرئيسية
+  const listing =
+    (normalized.startsWith('/service/') || normalized.startsWith('/vendor/')) && service?.title?.trim() ? service : null;
 
   const useAdmin = adminOverrideApplies(normalized, pageKey);
   const title = listing

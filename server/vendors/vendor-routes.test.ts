@@ -158,7 +158,7 @@ describe('vendor-routes', () => {
     const created = await fetch(`${url}/api/vendor/blocked-dates`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ date: '2026-10-01', reason: 'إجازة', type: 'holiday' }),
+      body: JSON.stringify({ date: '2099-10-01', reason: 'إجازة', type: 'holiday' }),
     });
     assert.equal(created.status, 201);
     const id = (await created.json()).blockedDate.id;
@@ -814,6 +814,147 @@ describe('vendor-routes QA round 2', () => {
       const summary = (await (await send('GET', '/api/vendor/summary')).json()).data;
       assert.equal(summary.revenue, 1200);
       assert.equal(summary.bookingCount, 1);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('vendor back office — persisted with the workspace', () => {
+  async function send(url: string, method: string, body?: unknown) {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, json: (await res.json()) as Record<string, any> };
+  }
+
+  it('stores a whitelisted office, keeps it when a save omits it, and replaces it when sent', async () => {
+    const dir = tmpDir();
+    const app = express();
+    app.use(express.json({ limit: '16mb' }));
+    registerVendorRoutes(app, fakeAuth('vendor') as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      const empty = await send(`${url}/api/vendor/workspace`, 'GET');
+      assert.deepEqual(empty.json.data.office, {});
+
+      const saved = await send(`${url}/api/vendor/workspace`, 'PUT', {
+        office: {
+          invoices: [{ id: 'inv-1', total: 500 }],
+          crewMembers: [{ id: 'c-1', name: 'خالد' }],
+          brandSettings: { color: '#0A1A33' },
+          expenses: 'not-a-list',
+          hacker: [{ x: 1 }],
+        },
+      });
+      assert.equal(saved.status, 200);
+      assert.deepEqual(saved.json.data.office, {
+        invoices: [{ id: 'inv-1', total: 500 }],
+        crewMembers: [{ id: 'c-1', name: 'خالد' }],
+        brandSettings: { color: '#0A1A33' },
+      });
+
+      // A save without `office` (e.g. the inventory screen) leaves it alone.
+      const other = await send(`${url}/api/vendor/workspace`, 'PUT', { inventoryItems: [{ id: 'i-1' }] });
+      assert.equal(other.json.data.office.invoices.length, 1);
+      const reread = await send(`${url}/api/vendor/workspace`, 'GET');
+      assert.equal(reread.json.data.office.crewMembers[0].name, 'خالد');
+      assert.equal(reread.json.data.inventoryItems.length, 1);
+
+      // Sent: it replaces the whole office.
+      const replaced = await send(`${url}/api/vendor/workspace`, 'PUT', { office: { payouts: [{ id: 'p-1' }] } });
+      assert.deepEqual(replaced.json.data.office, { payouts: [{ id: 'p-1' }] });
+
+      // The catalog file stays free of office data.
+      const raw = fs.readFileSync(path.join(dir, 'vendor-workspaces.json'), 'utf-8');
+      assert.equal(raw.includes('p-1'), false);
+    } finally {
+      await close();
+    }
+  });
+
+  it('refuses an office over 1.5 MB with 413 and a non-object with 400, saving nothing', async () => {
+    const app = express();
+    app.use(express.json({ limit: '16mb' }));
+    registerVendorRoutes(app, fakeAuth('vendor') as any, tmpDir());
+    const { url, close } = await listen(app);
+    try {
+      await send(`${url}/api/vendor/workspace`, 'PUT', { office: { invoices: [{ id: 'keep' }] } });
+      const big = await send(`${url}/api/vendor/workspace`, 'PUT', {
+        inventoryItems: [{ id: 'should-not-save' }],
+        office: { invoices: [{ id: 'x', blob: 'x'.repeat(1.6 * 1024 * 1024) }] },
+      });
+      assert.equal(big.status, 413);
+      assert.match(big.json.error, /1\.5/);
+      assert.equal((await send(`${url}/api/vendor/workspace`, 'PUT', { office: [1, 2] })).status, 400);
+      const after = await send(`${url}/api/vendor/workspace`, 'GET');
+      assert.deepEqual(after.json.data.office, { invoices: [{ id: 'keep' }] });
+      assert.equal(after.json.data.inventoryItems.length, 0);
+    } finally {
+      await close();
+    }
+  });
+
+  it('lets a supervisor read and write a vendor office with ?vendorId, and purging the vendor removes it', async () => {
+    const dir = tmpDir();
+    const app = express();
+    app.use(express.json());
+    registerVendorRoutes(app, fakeAuth('accounts_manager', 'usr-accounts') as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      await send(`${url}/api/vendor/workspace?vendorId=usr-other`, 'PUT', { office: { posSales: [{ id: 's-1' }] } });
+      const theirs = await send(`${url}/api/vendor/workspace?vendorId=usr-other`, 'GET');
+      assert.equal(theirs.json.data.office.posSales[0].id, 's-1');
+      const own = await send(`${url}/api/vendor/workspace`, 'GET');
+      assert.deepEqual(own.json.data.office, {});
+
+      const store = createVendorStore(dir);
+      store.purgeVendor('usr-other');
+      assert.deepEqual(store.getOffice('usr-other'), {});
+
+      await send(`${url}/api/vendor/workspace?vendorId=usr-third`, 'PUT', { office: { workLogs: [{ id: 'w' }] } });
+      store.removeWorkspace('usr-third');
+      assert.deepEqual(store.getOffice('usr-third'), {});
+      await send(`${url}/api/vendor/workspace?vendorId=usr-fourth`, 'PUT', { office: { attendance: [{ id: 'a' }] } });
+      store.wipeAllWorkspaces();
+      assert.deepEqual(store.getOffice('usr-fourth'), {});
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('GET /api/vendors/:id/blocked-dates — public availability', () => {
+  it('lists only dates, from today (Riyadh) through the next 180 days', async () => {
+    const dir = tmpDir();
+    const store = createVendorStore(dir);
+    store.saveWorkspace('usr-shop', {
+      blockedDates: ['2026-10-14', '2026-10-15', '2026-12-01', '2027-04-13', '2027-04-14', '2026-12-01'].map((date, i) => ({
+        id: `blk-${i}`,
+        date,
+        reason: 'صيانة سرية',
+        type: 'maintenance' as const,
+      })),
+    });
+    const app = express();
+    app.use(express.json());
+    registerVendorRoutes(
+      app,
+      fakeAuth(null, 'x', { vendors: [{ id: 'usr-shop', name: 'متجر', email: 'shop@usil.sa', role: 'vendor' }] }) as any,
+      dir,
+      // 23:30 UTC on the 14th is already the 15th in Riyadh.
+      { now: () => new Date('2026-10-14T23:30:00Z') },
+    );
+    const { url, close } = await listen(app);
+    try {
+      const res = await fetch(`${url}/api/vendors/usr-shop/blocked-dates`);
+      assert.equal(res.status, 200);
+      const json = (await res.json()) as { success: boolean; data: { dates: string[] } };
+      assert.deepEqual(json, { success: true, data: { dates: ['2026-10-15', '2026-12-01', '2027-04-13'] } });
+      const unknown = await fetch(`${url}/api/vendors/usr-nobody/blocked-dates`);
+      assert.deepEqual(await unknown.json(), { success: true, data: { dates: [] } });
     } finally {
       await close();
     }

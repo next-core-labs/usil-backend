@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MoyasarError,
+  cancelMoyasarInvoice,
   createInvoice,
   createMoyasarInvoice,
   fetchMoyasarInvoice,
@@ -385,6 +386,31 @@ describe('moyasar failure codes', () => {
       if (!invoice.ok) assert.equal(invoice.code, 'not_configured');
     } finally {
       if (prev !== undefined) process.env.MOYASAR_SECRET_KEY = prev;
+    }
+  });
+
+  it('cancels an unpaid invoice with PUT /v1/invoices/:id/cancel, and reports failures without throwing', async () => {
+    process.env.MOYASAR_SECRET_KEY = 'sk_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const calls: Array<{ url: string; method?: string }> = [];
+    try {
+      const ok = await cancelMoyasarInvoice('inv_abcdef123', (async (url: string, init?: RequestInit) => {
+        calls.push({ url: String(url), method: init?.method });
+        return new Response(JSON.stringify({ id: 'inv_abcdef123', status: 'canceled' }), { status: 200 });
+      }) as unknown as typeof fetch);
+      assert.deepEqual(ok, { ok: true });
+      assert.deepEqual(calls, [{ url: 'https://api.moyasar.com/v1/invoices/inv_abcdef123/cancel', method: 'PUT' }]);
+
+      const refused = await cancelMoyasarInvoice('inv_abcdef123', answer(400, { message: 'already paid' }));
+      assert.equal(refused.ok, false);
+      if (!refused.ok) assert.equal(refused.code, 'upstream');
+      const bad = await cancelMoyasarInvoice('../x');
+      assert.equal(bad.ok, false);
+      const offline = await cancelMoyasarInvoice('inv_abcdef123', (async () => {
+        throw new Error('network down');
+      }) as unknown as typeof fetch);
+      assert.equal(offline.ok, false);
+    } finally {
+      delete process.env.MOYASAR_SECRET_KEY;
     }
   });
 });

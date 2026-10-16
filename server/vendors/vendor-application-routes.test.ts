@@ -183,6 +183,28 @@ describe('vendor-application-routes', () => {
     await close();
   });
 
+  it('caps applications per IP, since each one writes photos and sends an email', async () => {
+    const app = express();
+    app.use(express.json());
+    registerVendorApplicationRoutes(app, fakeAuth(null) as any, tmpDir());
+    const { url, close } = await listen(app);
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i += 1) {
+        const res = await fetch(`${url}/api/vendor-applications`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        statuses.push(res.status);
+      }
+      assert.deepEqual(statuses.slice(0, 10), Array(10).fill(400));
+      assert.equal(statuses[10], 429);
+    } finally {
+      await close();
+    }
+  });
+
   it('hashes passwords with the same scrypt format as login', () => {
     const hashed = hashPassword('Secret1');
     assert.match(hashed, /^[a-f0-9]+:[a-f0-9]+$/);
@@ -289,7 +311,7 @@ describe('vendor-application-routes — account takeover and orphan uploads', ()
     const json = await res.json();
     assert.match(json.user.id, /^usr-\d+-[0-9a-f]{8}$/);
     assert.equal(readUsers(dir).length, 1);
-    assert.match(res.headers.get('set-cookie') || '', /midyaf_sid=/);
+    assert.match(res.headers.get('set-cookie') || '', /usil_sid=/);
     await close();
   });
 

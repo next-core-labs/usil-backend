@@ -30,9 +30,29 @@ export type BookingCancellation = {
   refundPercent: 100 | 50 | 0;
   /** Owed back in halalas. Moyasar's confirmed refund stays the amount of record. */
   refundHalalas: number;
-  /** `pending` = owed, not yet sent through Moyasar. Nothing here moves money. */
-  refundStatus: 'pending' | 'none' | 'not_applicable';
+  /**
+   * `pending` = owed, not yet sent through Moyasar; `refunded` = Moyasar
+   * reported the refund, or an admin marked a dashboard refund as done.
+   * Nothing here moves money.
+   */
+  refundStatus: 'pending' | 'refunded' | 'none' | 'not_applicable';
+  /** When the refund was confirmed (`refundStatus: 'refunded'`). */
+  refundedAt?: string;
   note: string;
+};
+
+/**
+ * A second payment that arrived for an order that was already paid (two
+ * invoices, both paid). It is owed back in full; the row keeps the first.
+ */
+export type DuplicatePayment = {
+  paymentId: string;
+  invoiceId?: string;
+  /** Riyals, as Moyasar reported it. */
+  amount: number;
+  at: string;
+  refundStatus: 'pending' | 'refunded';
+  refundedAt?: string;
 };
 
 export type PlatformBooking = {
@@ -47,6 +67,8 @@ export type PlatformBooking = {
   notes: string;
   city: string;
   eventDate: string;
+  /** Optional start time on the event date, `HH:mm` (Riyadh). */
+  eventTime?: string;
   paymentMethod: string;
   settlement: string;
   items: unknown[];
@@ -61,6 +83,8 @@ export type PlatformBooking = {
   moyasarPaymentId?: string;
   paymentUrl?: string;
   cancellation?: BookingCancellation;
+  /** Extra payments for an already-paid order — each owes a refund. */
+  duplicatePayments?: DuplicatePayment[];
 };
 
 /** Identifiers a Moyasar callback or webhook can arrive with. */
@@ -220,7 +244,7 @@ export function vendorViewOfBooking(
     const amount = Number(item.price) * Number(item.quantity || 1);
     return Number.isFinite(amount) ? sum + amount : sum;
   }, 0);
-  const { moyasarInvoiceId: _invoice, moyasarPaymentId: _payment, ...rest } = row;
+  const { moyasarInvoiceId: _invoice, moyasarPaymentId: _payment, duplicatePayments: _duplicates, ...rest } = row;
   const headlineIsOwn = ownListingIds.has(String(row.serviceId ?? ''));
   return {
     ...rest,
@@ -229,6 +253,14 @@ export function vendorViewOfBooking(
     totalAmount: subtotal,
     ...(headlineIsOwn ? {} : { serviceId: undefined, serviceName: '' }),
   };
+}
+
+/** A refund is still owed on this order — its cancellation or a duplicate payment. */
+export function bookingRefundPending(booking: Pick<PlatformBooking, 'cancellation' | 'duplicatePayments'>): boolean {
+  return (
+    booking.cancellation?.refundStatus === 'pending' ||
+    (booking.duplicatePayments || []).some((row) => row.refundStatus === 'pending')
+  );
 }
 
 export function createBookingStore(dataDir: string) {
@@ -285,18 +317,31 @@ export function createBookingStore(dataDir: string) {
     phone?: string;
     listingIds: string[];
     eventDate: string;
+    /** "HH:mm" or empty. A different time or quantity is a different order, not a double tap. */
+    eventTime?: string;
+    quantities?: Array<{ id: string; quantity: number }>;
     windowMs: number;
     now?: number;
   }): PlatformBooking | null {
     const now = input.now ?? Date.now();
     const wanted = [...input.listingIds].sort().join('|');
     const email = String(input.email || '').trim().toLowerCase();
+    const qtyKey = (lines: Array<{ id?: unknown; quantity?: unknown }>) =>
+      lines
+        .map((line) => `${String(line?.id ?? '')}:${Number(line?.quantity) || 1}`)
+        .sort()
+        .join('|');
+    const wantedQty = input.quantities ? qtyKey(input.quantities) : null;
     return (
       list().find((row) => {
         if (row.paymentStatus !== 'unpaid') return false;
         if (CLOSED_BOOKING_STATUSES.includes(row.status)) return false;
         if (row.eventDate !== input.eventDate) return false;
+        if (input.eventTime !== undefined && (row.eventTime || '') !== (input.eventTime || '')) return false;
         if (bookedListingIds(row).sort().join('|') !== wanted) return false;
+        if (wantedQty !== null && Array.isArray(row.items) && qtyKey(row.items as Array<{ id?: unknown; quantity?: unknown }>) !== wantedQty) {
+          return false;
+        }
         const age = now - bookingCreatedAtMs(row.createdAt);
         if (age < 0 || age > input.windowMs) return false;
         if (!input.phone || row.phone !== input.phone) return false;
@@ -371,21 +416,75 @@ export function createBookingStore(dataDir: string) {
    * Returns `null` when no row matches, which is normal: invoices are also
    * raised for things that are not platform bookings.
    */
-  function markPaidFromMoyasar(input: MoyasarSettlement): PlatformBooking | null {
+  /**
+   * The booking a Moyasar payment, invoice or booking id points at — the
+   * lookup order the webhook and callback settle with.
+   */
+  function matchMoyasar(
+    rows: PlatformBooking[],
+    input: Pick<MoyasarSettlement, 'paymentId' | 'invoiceId' | 'bookingId'>,
+  ): PlatformBooking | null {
     const bookingId = String(input.bookingId || '').trim();
+    const paymentId = String(input.paymentId || '').trim();
+    const invoiceId = String(input.invoiceId || '').trim();
+    return (
+      (invoiceId && rows.find((row) => row.moyasarInvoiceId === invoiceId)) ||
+      (paymentId &&
+        rows.find(
+          (row) =>
+            row.moyasarInvoiceId === paymentId ||
+            row.moyasarPaymentId === paymentId ||
+            (row.duplicatePayments || []).some((dup) => dup.paymentId === paymentId),
+        )) ||
+      (bookingId && rows.find((row) => row.id === bookingId)) ||
+      null
+    );
+  }
+
+  function findForMoyasar(input: Pick<MoyasarSettlement, 'paymentId' | 'invoiceId' | 'bookingId'>): PlatformBooking | null {
+    return matchMoyasar(list(), input);
+  }
+
+  function markPaidFromMoyasar(input: MoyasarSettlement): PlatformBooking | null {
     const paymentId = String(input.paymentId || '').trim();
     const invoiceId = String(input.invoiceId || '').trim();
 
     const rows = list();
-    const item =
-      (invoiceId && rows.find((row) => row.moyasarInvoiceId === invoiceId)) ||
-      (paymentId && rows.find((row) => row.moyasarInvoiceId === paymentId || row.moyasarPaymentId === paymentId)) ||
-      (bookingId && rows.find((row) => row.id === bookingId)) ||
-      null;
+    const item = matchMoyasar(rows, input);
     if (!item) return null;
 
     const amount = Number(input.amountHalalas);
     const currency = String(input.currency || 'SAR').toUpperCase();
+
+    // Already paid: the same payment again (webhook + callback) changes nothing.
+    // A different payment means the customer paid twice — keep the first,
+    // record the second as owed back so an admin sees it.
+    if (item.paymentStatus === 'paid') {
+      if (input.status !== 'paid' || !paymentId || paymentId === item.moyasarPaymentId) return item;
+      if (!item.moyasarPaymentId && invoiceId && invoiceId === item.moyasarInvoiceId) {
+        // Settled earlier from the invoice alone; this is that same payment.
+        item.moyasarPaymentId = paymentId;
+        save(rows);
+        return item;
+      }
+      const seen = (item.duplicatePayments || []).some((row) => row.paymentId === paymentId);
+      if (!seen && Number.isFinite(amount) && amount > 0) {
+        console.warn('[moyasar] second payment for an already-paid booking — refund owed', item.id, paymentId, amount);
+        item.duplicatePayments = [
+          ...(item.duplicatePayments || []),
+          {
+            paymentId,
+            ...(invoiceId ? { invoiceId } : {}),
+            amount: Math.round(amount) / 100,
+            at: new Date().toISOString(),
+            refundStatus: 'pending',
+          },
+        ];
+        save(rows);
+      }
+      return item;
+    }
+
     const covers =
       Number.isFinite(amount) && amount > 0 && currency === 'SAR' && amount >= bookingTotalHalalas(item);
     if (input.status !== 'paid' || !covers) {
@@ -399,6 +498,8 @@ export function createBookingStore(dataDir: string) {
     if (invoiceId && !item.moyasarInvoiceId) item.moyasarInvoiceId = invoiceId;
     item.paymentStatus = 'paid';
     item.settlement = PAID_SETTLEMENT_LABEL;
+    // An instant order is confirmed by its payment — checkout promises exactly that.
+    if (item.status === BOOKING_NEW_STATUS) item.status = BOOKING_CONFIRMED_STATUS;
     // Paid after the order was already cancelled or rejected unpaid: the whole
     // payment is owed back, whatever tier the date falls in.
     if (CANCELLING_BOOKING_STATUSES.includes(item.status) && item.cancellation?.refundStatus === 'not_applicable') {
@@ -414,7 +515,63 @@ export function createBookingStore(dataDir: string) {
     return item;
   }
 
+  /**
+   * Moyasar reported a payment refunded. A refunded duplicate payment closes
+   * that entry; otherwise a pending cancellation refund is marked done.
+   * Returns the booking, or null when the payment matches none.
+   */
+  function markRefundedFromMoyasar(
+    input: Pick<MoyasarSettlement, 'paymentId' | 'invoiceId' | 'bookingId'>,
+    at: Date = new Date(),
+  ): PlatformBooking | null {
+    const paymentId = String(input.paymentId || '').trim();
+    const rows = list();
+    const item = matchMoyasar(rows, input);
+    if (!item) return null;
+    const when = at.toISOString();
+
+    const duplicate = paymentId ? (item.duplicatePayments || []).find((row) => row.paymentId === paymentId) : undefined;
+    if (duplicate) {
+      if (duplicate.refundStatus !== 'refunded') {
+        duplicate.refundStatus = 'refunded';
+        duplicate.refundedAt = when;
+        save(rows);
+      }
+      return item;
+    }
+    if (item.cancellation?.refundStatus === 'pending') {
+      item.cancellation = { ...item.cancellation, refundStatus: 'refunded', refundedAt: when };
+      save(rows);
+      return item;
+    }
+    console.warn('[moyasar] refund reported for a booking with no pending refund', item.id, paymentId);
+    return item;
+  }
+
+  /** An admin refunded from the Moyasar dashboard. `null` when nothing was pending. */
+  function markRefundDone(id: string, at: Date = new Date()): PlatformBooking | null {
+    const rows = list();
+    const item = rows.find((row) => row.id === id);
+    if (!item || !bookingRefundPending(item)) return null;
+    // Refunds are sent by hand from Moyasar's dashboard; this records every refund owed on
+    // the order — the cancellation's and any duplicate payment's — as sent.
+    const refundedAt = at.toISOString();
+    if (item.cancellation?.refundStatus === 'pending') {
+      item.cancellation = { ...item.cancellation, refundStatus: 'refunded', refundedAt };
+    }
+    if (item.duplicatePayments?.some((dup) => dup.refundStatus === 'pending')) {
+      item.duplicatePayments = item.duplicatePayments.map((dup) =>
+        dup.refundStatus === 'pending' ? { ...dup, refundStatus: 'refunded', refundedAt } : dup,
+      );
+    }
+    save(rows);
+    return item;
+  }
+
   return {
+    findForMoyasar,
+    markRefundedFromMoyasar,
+    markRefundDone,
     list,
     findById,
     listForClient,

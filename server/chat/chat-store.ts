@@ -257,7 +257,16 @@ export function createChatStore(dataDir: string) {
     save(rows);
   }
 
-  return { list, unreadCount, get, hasPair, open, send, markRead };
+  /** Threads of a deleted account — on either side — go with it. */
+  function removeForUser(userId: string): number {
+    if (!userId) return 0;
+    const rows = load();
+    const kept = rows.filter((row) => row.vendorId !== userId && row.clientId !== userId);
+    if (kept.length !== rows.length) save(kept);
+    return rows.length - kept.length;
+  }
+
+  return { list, unreadCount, get, hasPair, open, send, markRead, removeForUser };
 }
 
 export type ChatStore = ReturnType<typeof createChatStore>;

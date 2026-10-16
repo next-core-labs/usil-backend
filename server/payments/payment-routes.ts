@@ -3,6 +3,8 @@ import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards.t
 import { publicSiteUrl } from '../auth/email-verification.ts';
 import type { BookingService } from '../bookings/booking-routes.ts';
 import { CLOSED_BOOKING_STATUSES, clientOwnsBooking } from '../bookings/booking-store.ts';
+import { BOOKING_PENDING_APPROVAL_STATUS } from '../vendors/vendor-listings.ts';
+import { isIsoDate, riyadhToday } from '../bookings/booking-pricing.ts';
 import {
   MOYASAR_NOT_CONFIGURED,
   createInvoice,
@@ -24,6 +26,7 @@ type Deps = {
   bookings: BookingService;
   /** Port to fall back on when no public site URL is configured. */
   port: string | number;
+  now?: () => Date;
 };
 
 /**
@@ -33,6 +36,14 @@ type Deps = {
 const INVOICE_LIMIT = 10;
 const INVOICE_WINDOW_MS = 60_000;
 const INVOICE_RATE_LIMIT = 'تجاوزت حد طلبات الدفع. انتظر دقيقة ثم أعد المحاولة.';
+
+/**
+ * Payment lookups and browser callbacks are public and each one calls
+ * Moyasar, so they are throttled per IP too.
+ */
+const LOOKUP_LIMIT = 30;
+const LOOKUP_WINDOW_MS = 60_000;
+const LOOKUP_RATE_LIMIT = 'تجاوزت حد طلبات التحقق من الدفع. انتظر دقيقة ثم أعد المحاولة.';
 
 /** Moyasar caps metadata values; keep them short and stringy. */
 const METADATA_MAX_LEN = 120;
@@ -44,6 +55,8 @@ const INVOICE_NEEDS_LOGIN = 'سجّل الدخول بالحساب الذي أن�
 const INVOICE_BOOKING_NOT_FOUND = 'الحجز غير موجود';
 const INVOICE_ALREADY_PAID = 'هذا الطلب مدفوع مسبقاً.';
 const INVOICE_BOOKING_CLOSED = 'الطلب ملغي أو منتهٍ، ولا يمكن دفعه.';
+const INVOICE_EVENT_PASSED = 'موعد المناسبة مضى، ولا يمكن دفع الطلب. اطلب من جديد بتاريخ قادم.';
+const INVOICE_AWAITING_APPROVAL = 'الطلب بانتظار موافقة المورّد. الدفع يتاح بعد موافقته، ونبلغك على بريدك.';
 const INVOICE_NEEDS_BOOKING = 'الدفع يكون لطلب محفوظ. أكمل الطلب من السلة ثم ادفع.';
 const PAYMENT_NOT_FOUND = 'عملية الدفع غير موجودة.';
 const PAYMENT_UPSTREAM = 'تعذر التواصل مع ميسر الآن. حاول بعد قليل.';
@@ -64,6 +77,8 @@ function isSupervisor(role?: string): boolean {
 export function registerPaymentRoutes(app: Express, deps: Deps) {
   const { bookings } = deps;
   const invoiceLimiter = createSlidingWindowLimiter(INVOICE_LIMIT, INVOICE_WINDOW_MS);
+  const lookupLimiter = createSlidingWindowLimiter(LOOKUP_LIMIT, LOOKUP_WINDOW_MS);
+  const now = deps.now || (() => new Date());
 
   const appBaseUrl = () => publicSiteUrl() || process.env.APP_URL || `http://localhost:${deps.port}`;
 
@@ -115,6 +130,16 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
       if (booking.paymentStatus === 'paid') return res.status(409).json({ error: INVOICE_ALREADY_PAID });
       if (CLOSED_BOOKING_STATUSES.includes(booking.status)) {
         return res.status(409).json({ error: INVOICE_BOOKING_CLOSED });
+      }
+      if (booking.status === BOOKING_PENDING_APPROVAL_STATUS) {
+        return res.status(409).json({ error: INVOICE_AWAITING_APPROVAL });
+      }
+      if (isIsoDate(booking.eventDate) && booking.eventDate < riyadhToday(now())) {
+        return res.status(409).json({ error: INVOICE_EVENT_PASSED });
+      }
+      // One payable invoice per order: a second would let the customer pay twice.
+      if (booking.paymentUrl) {
+        return res.json({ id: booking.moyasarInvoiceId || null, url: booking.paymentUrl, reused: true });
       }
       amount = Number(booking.totalAmount);
       description = `طلب يوصل ${booking.id} — ${booking.serviceName}`.slice(0, 220);
@@ -168,6 +193,21 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
 
     try {
       const payment = await fetchPayment(paymentId);
+      const refundEvent = req.body?.type === 'payment_refunded';
+      // Moyasar's own record decides; the event type only says to look.
+      if (payment.status === 'refunded' || (refundEvent && Number(payment.refunded) > 0)) {
+        const refunded = bookings.markRefundedFromMoyasar({
+          paymentId: payment.id,
+          invoiceId: payment.invoice_id || payment.invoiceId,
+          bookingId: payment.bookingId || payment.metadata?.order_id || payment.metadata?.bookingId,
+        });
+        if (!refunded) {
+          console.warn('[moyasar] webhook: refunded payment matches no booking', payment.id);
+          return res.json({ received: true, ignored: true });
+        }
+        console.log('[moyasar] payment refunded', payment.id, refunded.id);
+        return res.json({ received: true });
+      }
       if (payment.status === 'paid') {
         const settled = bookings.markPaidFromMoyasar({
           paymentId: payment.id,
@@ -183,7 +223,11 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
           console.warn('[moyasar] webhook: paid payment matches no booking', payment.id);
           return res.json({ received: true, ignored: true });
         }
-        console.log('[moyasar] payment paid', payment.id, payment.metadata?.order_id || payment.bookingId || '');
+        if (settled.paymentStatus === 'paid') {
+          console.log('[moyasar] payment paid', payment.id, settled.id);
+        } else {
+          console.warn('[moyasar] webhook: payment did not settle booking', payment.id, settled.id);
+        }
       }
       res.json({ received: true });
     } catch (error) {
@@ -201,6 +245,9 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
   });
 
   app.get('/api/payments/:id', async (req: Request, res: Response) => {
+    if (!lookupLimiter.allow(`lookup:${clientIp(req)}`)) {
+      return res.status(429).json({ error: LOOKUP_RATE_LIMIT });
+    }
     const id = String(req.params.id || '').trim();
     if (!isSafeMoyasarId(id)) {
       return res.status(400).json({ error: 'رقم عملية ميسر غير صالح.' });
@@ -214,15 +261,25 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     }
     // Public (no login): only what the payment result page shows. The
     // description and metadata carry order and customer details.
+    // The order it paid for, when that is one of ours — so the page can link to it.
+    const booking = bookings.findForMoyasar({
+      paymentId: out.payment.id,
+      invoiceId: out.payment.invoiceId,
+      bookingId: out.payment.bookingId,
+    });
     res.json({
       status: out.payment.status,
       // Moyasar works in halalas; this API surface is in riyals.
       amount: out.payment.amount / 100,
+      bookingId: booking?.id || null,
     });
   });
 
   /** Browser returning from the hosted invoice — verified server-side. */
   app.post('/api/payments/moyasar/callback', async (req: Request, res: Response) => {
+    if (!lookupLimiter.allow(`callback:${clientIp(req)}`)) {
+      return res.status(429).json({ success: false, error: LOOKUP_RATE_LIMIT });
+    }
     const moyasarId = String(req.body?.id || req.query?.id || '');
     if (!moyasarId) return res.status(400).json({ success: false, error: 'عملية ميسر ناقصة.' });
 

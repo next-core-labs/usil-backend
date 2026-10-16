@@ -156,6 +156,11 @@ describe('booking store', () => {
     assert.equal(store.findRecentDuplicate({ ...query, listingIds: ['lst-a', 'lst-b'] }), null);
     assert.equal(store.findRecentDuplicate({ ...query, userId: 'u-2' }), null);
     assert.equal(store.findRecentDuplicate({ ...query, now: now + 20 * 60_000 }), null);
+    // A different time or quantity is a new order, not a double tap.
+    assert.equal(store.findRecentDuplicate({ ...query, eventTime: '' })?.id, 'BK-dup');
+    assert.equal(store.findRecentDuplicate({ ...query, eventTime: '18:30' }), null);
+    assert.equal(store.findRecentDuplicate({ ...query, quantities: [{ id: 'lst-a', quantity: 1 }] })?.id, 'BK-dup');
+    assert.equal(store.findRecentDuplicate({ ...query, quantities: [{ id: 'lst-a', quantity: 3 }] }), null);
   });
 
   it('does not let a stranger who knows the phone block its owner', () => {
@@ -233,6 +238,19 @@ describe('booking store', () => {
       assert.match(String(settled?.settlement), /ميسر/);
       // persisted, not just mutated in memory
       assert.equal(store.list()[0].paymentStatus, 'paid');
+    });
+
+    it('confirms an instant order once paid, and leaves other statuses alone', () => {
+      const store = createBookingStore(tmpDir());
+      store.add(booking({ id: 'BK-instant', status: 'جديد' }));
+      store.add(booking({ id: 'BK-cancelled', status: 'ملغي' }));
+      const paid = { status: 'paid', amountHalalas: 150_000, currency: 'SAR' };
+      assert.equal(store.markPaidFromMoyasar({ ...paid, bookingId: 'BK-instant' })?.status, 'مؤكد');
+      assert.equal(store.findById('BK-instant')?.status, 'مؤكد');
+      assert.equal(store.markPaidFromMoyasar({ ...paid, bookingId: 'BK-cancelled' })?.status, 'ملغي');
+      // An underpayment changes nothing.
+      store.add(booking({ id: 'BK-short', status: 'جديد' }));
+      assert.equal(store.markPaidFromMoyasar({ ...paid, amountHalalas: 100, bookingId: 'BK-short' })?.status, 'جديد');
     });
 
     it('settles by invoice id when only the invoice is known', () => {

@@ -10,7 +10,10 @@ import {
 } from './integrations-store';
 
 type AuthLike = {
-  requireRole: (roles: Array<'client' | 'vendor' | 'admin'>) => (
+  requireRole: (
+    roles: Array<'client' | 'vendor' | 'admin'>,
+    options?: { exact?: boolean },
+  ) => (
     req: Request,
     res: Response,
     next: () => void,
@@ -30,7 +33,8 @@ export function registerIntegrationsRoutes(
 ): IntegrationsRoutesResult {
   const store = createIntegrationsStore(dataDir);
   const ai = createAiRouter(store, options);
-  const requireAdmin = auth.requireRole(['admin']);
+  // Provider API keys are platform secrets: «مدير كل الحسابات» only, not accounts_manager.
+  const requireAdmin = auth.requireRole(['admin'], { exact: true });
   const testLimiter = createSlidingWindowLimiter(12, 60_000);
 
   app.get('/api/admin/integrations', requireAdmin, (_req: Request, res: Response) => {

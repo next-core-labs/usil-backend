@@ -67,6 +67,8 @@ export interface ServiceItem {
   };
   /** Saudi marketplace fields */
   audience?: 'women' | 'men' | 'family' | 'corporate';
+  /** Audiences a vendor listing serves («الجمهور»); empty or missing means everyone. */
+  audiences?: Array<'women' | 'men' | 'family' | 'corporate'>;
   occasions?: string[];
   tags?: string[];
   aliases?: string[];

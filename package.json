@@ -8,9 +8,12 @@
     "build": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=build/server.cjs",
     "start": "node --enable-source-maps build/server.cjs",
     "clean": "rm -rf dist build",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json",
     "test": "node --import tsx --test $(find server core -name '*.test.ts' | sort)",
     "sync:web": "node scripts/sync-web-build.mjs",
+    "cf:assets": "node scripts/cf-assets.mjs",
+    "cf:dev": "npm run cf:assets && wrangler dev",
+    "deploy": "npm --prefix ../usil run build && npm run sync:web && npm run cf:assets && wrangler deploy",
     "db:clear-catalog": "tsx scripts/db-clear-catalog.ts",
     "wipe:vendors": "tsx scripts/wipe-vendors.ts",
     "check:core-sync": "node scripts/check-core-sync.mjs"
@@ -21,11 +24,14 @@
     "express": "^4.21.2"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261013.1",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "esbuild": "^0.25.0",
+    "iconv-lite-cf": "npm:iconv-lite@^0.6.3",
     "tsx": "^4.21.0",
-    "typescript": "~5.8.2"
+    "typescript": "~5.8.2",
+    "wrangler": "^4.150.0"
   },
   "optionalDependencies": {
     "nodemailer": "^6.9.0",

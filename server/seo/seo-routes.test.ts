@@ -342,9 +342,37 @@ describe('seo-routes', () => {
       assert.match(ok, /<title>قهوة المورد المعتمد \| يوصل<\/title>/);
       assert.match(ok, /og:image" content="https:\/\/usil\.app\/uploads\/listing-lst-approved\.jpg"/);
 
-      const rejected = await (await fetch(`${url}/service/lst-rejected`)).text();
+      const rejectedRes = await fetch(`${url}/service/lst-rejected`);
+      assert.equal(rejectedRes.status, 404);
+      const rejected = await rejectedRes.text();
       assert.doesNotMatch(rejected, /المورد المرفوض/);
       assert.match(rejected, /<title>يوصل \| سوق توريد المناسبات في السعودية<\/title>/);
+      assert.equal((await fetch(`${url}/service/lst-approved`)).status, 200);
+    } finally {
+      await close();
+    }
+  });
+
+  it('titles a public vendor page after the vendor and 404s one that is not public', async () => {
+    const dir = tmpDir();
+    const indexHtmlPath = path.join(dir, 'index.html');
+    fs.writeFileSync(indexHtmlPath, '<html><head><title>قديم</title></head><body><div id="root"></div></body></html>');
+    const app = express();
+    const { sendSpa } = registerSeoRoutes(app, fakeAuth(null) as any, dir, {
+      indexHtmlPath,
+      getVendorEntries: () => [],
+      getVendorSeo: (id) =>
+        id === 'usr-coffee' ? { title: 'قهوة النخبة', description: 'ضيافة قهوة — قهوة النخبة على يوصل', image: '/uploads/logo.png' } : null,
+    });
+    app.get('*', sendSpa);
+    const { url, close } = await listen(app);
+    try {
+      const page = await fetch(`${url}/vendor/usr-coffee`);
+      assert.equal(page.status, 200);
+      const html = await page.text();
+      assert.match(html, /<title>قهوة النخبة \| يوصل<\/title>/);
+      assert.match(html, /og:image" content="https:\/\/usil\.app\/uploads\/logo\.png"/);
+      assert.equal((await fetch(`${url}/vendor/usr-missing`)).status, 404);
     } finally {
       await close();
     }

@@ -68,9 +68,12 @@ soon as it exists — nothing to register.
 
 ## Deploy
 
-`docker-compose.yml` builds the image and mounts `/var/www/midyaf/data` at `/app/data`.
-Run `npm run sync:web` before building so the SPA is in `dist/`. Secrets come from
-`.env.production.local`; `deploy/` holds the Caddy config for `hooks.usil.app`.
+Production runs on Cloudflare Workers: `npm run deploy` builds `../usil`, copies it
+in, and deploys `wrangler.jsonc`. On Cloudflare `data/` lives in a Durable Object's
+SQLite database instead of on disk. See [deploy/cloudflare.md](deploy/cloudflare.md).
+
+`docker-compose.yml` still builds a plain Node image (mounting `/var/www/midyaf/data`
+at `/app/data`) for self-hosting; Cloudflare does not use it.
 
 ## Frontend
 

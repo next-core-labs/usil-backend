@@ -21,6 +21,8 @@ export type MoyasarPayment = {
   description: string;
   invoiceId?: string;
   invoice_id?: string | null;
+  /** Halalas refunded so far (Moyasar's `refunded`). */
+  refunded?: number;
   bookingId?: string;
   transactionUrl?: string;
   metadata?: Record<string, string> | null;
@@ -100,7 +102,7 @@ function isUsilHttpsUrl(url: URL): boolean {
   return host === 'usil.app' || host.endsWith('.usil.app');
 }
 
-/** Invoice callback + account webhook. Prefer grey-cloud hooks.usil.app so Cloudflare Bot Fight cannot 403 Moyasar. */
+/** Invoice callback + account webhook. hooks.usil.app in production; Bot Fight Mode must stay off or it 403s Moyasar. */
 export function moyasarWebhookUrl(): string {
   const fallback = `${publicSiteUrl()}/api/payments/webhook`;
   const raw = String(process.env.MOYASAR_WEBHOOK_URL || '').trim();
@@ -288,6 +290,7 @@ export async function fetchMoyasarPayment(
     currency?: string;
     description?: string;
     invoice_id?: string;
+    refunded?: number;
     metadata?: unknown;
     source?: { type?: string; company?: string; message?: string | null; transaction_url?: string };
     message?: string;
@@ -316,6 +319,7 @@ export async function fetchMoyasarPayment(
       description: String(data.description || ''),
       invoiceId: data.invoice_id ? String(data.invoice_id) : undefined,
       invoice_id: data.invoice_id ? String(data.invoice_id) : null,
+      refunded: Number(data.refunded) || 0,
       bookingId: bookingIdFromMetadata(data.metadata) || undefined,
       transactionUrl: transactionUrl || undefined,
       metadata,
@@ -385,6 +389,41 @@ export async function fetchMoyasarInvoice(
       url: url || `https://checkout.moyasar.com/invoices/${id}`,
     },
   };
+}
+
+/**
+ * PUT /v1/invoices/:id/cancel — closes an unpaid invoice so its link can no
+ * longer take money (an order cancelled before payment). Best-effort: callers
+ * never fail their own request on this.
+ */
+export async function cancelMoyasarInvoice(
+  invoiceId: string,
+  fetchImpl?: typeof fetch,
+): Promise<{ ok: true } | MoyasarFailure> {
+  if (!moyasarConfigured()) {
+    return { ok: false, error: MOYASAR_NOT_CONFIGURED, code: 'not_configured' };
+  }
+  const id = String(invoiceId || '').trim();
+  if (!isSafeMoyasarId(id)) {
+    return { ok: false, error: 'رقم فاتورة ميسر غير صالح.', code: 'invalid' };
+  }
+  const impl = fetchImpl || fetch;
+  let res: Response;
+  try {
+    res = await impl(`${MOYASAR_API}/invoices/${encodeURIComponent(id)}/cancel`, {
+      method: 'PUT',
+      headers: { Authorization: moyasarAuthHeader(), Accept: 'application/json' },
+    });
+  } catch {
+    return { ok: false, error: 'تعذر إلغاء فاتورة ميسر.', code: 'upstream' };
+  }
+  if (res.status === 404) return { ok: false, error: 'فاتورة ميسر غير موجودة.', code: 'not_found' };
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { message?: string };
+    console.warn('[moyasar] invoice cancel refused', id, res.status, data.message || '');
+    return { ok: false, error: 'تعذر إلغاء فاتورة ميسر.', code: 'upstream' };
+  }
+  return { ok: true };
 }
 
 export async function verifyMoyasarCheckout(

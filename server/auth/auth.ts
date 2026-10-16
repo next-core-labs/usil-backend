@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import fs from 'fs';
+import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
 import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from './avatar';
@@ -66,7 +66,19 @@ type StoredUser = Omit<PublicUser, 'emailVerified'> & {
   passwordResetAttempts?: number;
 };
 
-const COOKIE = 'midyaf_sid';
+/**
+ * Host-only session cookie: usil.app, owner.usil.app and vendor.usil.app each
+ * keep their own sign-in. The old `midyaf_sid` was scoped to `.usil.app`, so one
+ * browser shared a single session across all three — signing in as the owner on
+ * the console showed the owner inside the store, and the reverse. It is never
+ * read again, only expired (`expireLegacySessionCookie`).
+ */
+const COOKIE = 'usil_sid';
+/** A code younger than this is reused at sign-in instead of mailing another. */
+const LOGIN_CODE_REUSE_MS = 5 * 60 * 1000;
+const EMAIL_CODE_ALREADY_SENT = 'أرسلنا رمز التأكيد إلى بريدك قبل قليل. إذا ما وصلك، تحقق من مجلد الرسائل غير المرغوب فيها أو اطلب رمزاً جديداً.';
+const LEGACY_COOKIE = 'midyaf_sid';
+const LEGACY_COOKIE_DOMAIN = '.usil.app';
 
 function usersFile(dataDir: string) {
   return path.join(dataDir, 'users.json');
@@ -132,18 +144,15 @@ function isPrivilegedRole(role: string | undefined): boolean {
   return role === 'admin' || role === 'accounts_manager';
 }
 
+/**
+ * No Domain attribute unless COOKIE_DOMAIN explicitly asks for one: a cookie
+ * shared across subdomains would share one sign-in between the store and the
+ * consoles again.
+ */
 function cookieDomain(): string | undefined {
   const explicit = String(process.env.COOKIE_DOMAIN || '').trim();
-  if (explicit === '0' || explicit.toLowerCase() === 'none') return undefined;
-  if (explicit) return explicit;
-  const site = String(process.env.PUBLIC_SITE_URL || process.env.APP_URL || '');
-  try {
-    const host = site ? new URL(site).hostname : '';
-    if (host === 'usil.app' || host.endsWith('.usil.app')) return '.usil.app';
-  } catch {
-    /* ignore */
-  }
-  return undefined;
+  if (!explicit || explicit === '0' || explicit.toLowerCase() === 'none') return undefined;
+  return explicit;
 }
 
 const COOKIE_DAY_SEC = 60 * 60 * 24;
@@ -168,7 +177,7 @@ function setSessionCookie(res: Response, token: string, remember?: boolean) {
   const domain = cookieDomain();
   if (domain) parts.push(`Domain=${domain}`);
   if (cookieSecure()) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  res.append('Set-Cookie', parts.join('; '));
 }
 
 function clearSessionCookie(res: Response) {
@@ -176,7 +185,26 @@ function clearSessionCookie(res: Response) {
   const domain = cookieDomain();
   if (domain) parts.push(`Domain=${domain}`);
   if (cookieSecure()) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+/** Delete the old shared `midyaf_sid`, both its `.usil.app` and any host-only copy. */
+function legacyCookieExpiries(): string[] {
+  const base = [`${LEGACY_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (cookieSecure()) base.push('Secure');
+  return [[...base, `Domain=${LEGACY_COOKIE_DOMAIN}`].join('; '), base.join('; ')];
+}
+
+/**
+ * Middleware: any request still carrying the old shared cookie gets it expired.
+ * It is never trusted as a session, so that browser signs in once more — on
+ * each site separately from now on.
+ */
+export function expireLegacySessionCookie(req: Request, res: Response, next: NextFunction) {
+  if (parseCookies(req)[LEGACY_COOKIE] !== undefined) {
+    for (const header of legacyCookieExpiries()) res.append('Set-Cookie', header);
+  }
+  next();
 }
 
 const FORGOT_LIMIT = 5;
@@ -197,7 +225,7 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_ACCOUNT_LIMIT = 30;
 const LOGIN_RATE_LIMIT = 'حدّ محاولات الدخول. انتظر 15 دقيقة ثم أعد المحاولة.';
 /** One answer for unknown email, wrong phone and wrong password — no account probing. */
-const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والجوال والرقم السري.';
+const LOGIN_INVALID = 'بيانات الدخول غير صحيحة. تحقق من البريد والرقم السري.';
 /** Checked only when a password is set, so older shorter passwords still log in. */
 const PASSWORD_MIN_LENGTH = 8;
 const WEAK_PASSWORD = `الرقم السري ضعيف. استخدم ${PASSWORD_MIN_LENGTH} خانات على الأقل.`;
@@ -240,7 +268,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   if (isProduction() && !hasMailConfig() && !warnedNoMail) {
     warnedNoMail = true;
     console.warn(
-      'SMTP is not configured: verification and password-reset codes cannot be delivered, and production never returns them in API responses.',
+      'Mail is not configured (RESEND_API_KEY or SMTP): verification and password-reset codes cannot be delivered, and production never returns them in API responses.',
     );
   }
   const forgotLimiter = createSlidingWindowLimiter(FORGOT_LIMIT, FORGOT_WINDOW_MS);
@@ -249,6 +277,11 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   const loginAccountLimiter = createSlidingWindowLimiter(LOGIN_ACCOUNT_LIMIT, LOGIN_WINDOW_MS);
   const resendLimiter = createSlidingWindowLimiter(EMAIL_RESEND_LIMIT, EMAIL_RESEND_WINDOW_MS);
   const verifyAttemptLimiter = createSlidingWindowLimiter(EMAIL_VERIFY_ATTEMPT_LIMIT, EMAIL_VERIFY_ATTEMPT_WINDOW_MS);
+  /** Other modules clean up what a deleted account owned (workspace, photos, chats). */
+  const userDeletedListeners: Array<(user: PublicUser) => void> = [];
+  function onUserDeleted(listener: (user: PublicUser) => void) {
+    userDeletedListeners.push(listener);
+  }
 
   function publicUser(user: StoredUser): PublicUser {
     const avatarUrl = resolveUserAvatar(dataDir, user);
@@ -323,7 +356,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   ensureOwnerAccount();
 
   /**
-   * The first admin, for a host with no shell to edit users.json on (Render Free).
+   * The first admin, for a host with no shell to edit users.json on (Cloudflare).
    * With OWNER_EMAIL and OWNER_PASSWORD set, boot creates that admin — but only while
    * no admin exists, so a restart never resets a changed password, and the variables
    * go inert once a real user store with its own admins is in place.
@@ -441,11 +474,11 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     return user ? publicUser(user) : null;
   }
 
-  function requireRole(roles: AccountRole[]) {
+  function requireRole(roles: AccountRole[], options: RoleGuardOptions = {}) {
     return (req: Request, res: Response, next: NextFunction) => {
       const user = userFromRequest(req);
       if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-      if (!roleAllowed(user.role, roles)) {
+      if (!roleGuardAllows(user.role, roles, options)) {
         return res.status(403).json({ success: false, error: 'ليست لديك صلاحية هذا الإجراء.' });
       }
       (req as Request & { user: PublicUser }).user = user;
@@ -453,7 +486,25 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     };
   }
 
-  function loginHandler(req: Request, res: Response) {
+  /**
+   * Signing in to an unconfirmed account opens «تأكيد البريد». The sign-up code
+   * lives 30 minutes, so by the next sign-in it has usually expired and nothing
+   * new was on its way — the customer waited for an email that never came.
+   * Send a fresh code, unless one went out in the last few minutes (sign-up
+   * followed straight by sign-in), within the same budget as «إعادة الإرسال».
+   */
+  async function loginVerification(req: Request, user: StoredUser, users: StoredUser[]) {
+    const sentRecently = (user.emailVerifyExpiresAt || 0) - Date.now() > EMAIL_VERIFY_TTL_MS - LOGIN_CODE_REUSE_MS;
+    if (sentRecently || !resendLimiter.allow(`${clientIp(req)}:${user.email}`)) {
+      return { emailSent: true as const, message: EMAIL_CODE_ALREADY_SENT };
+    }
+    const issued = issueEmailVerification(user);
+    saveUsers(users);
+    const emailSent = await sendVerificationEmail(user.email, issued.code, issued.token);
+    return verificationPayload(emailSent, issued.code, EMAIL_RESEND_SENT, EMAIL_RESEND_FALLBACK);
+  }
+
+  async function loginHandler(req: Request, res: Response) {
     try {
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
       const phone = normalizePhone(req.body?.phone || '');
@@ -465,13 +516,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         return res.status(429).json({ success: false, error: LOGIN_RATE_LIMIT });
       }
       if (!email || !password) {
-        return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
+        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
       }
-      if (!phone && !String(req.body?.identifier || '').includes('@')) {
-        return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
+      if (!phone && !email.includes('@')) {
+        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
       }
 
-      const user = loadUsers().find((item) => item.email === email);
+      const users = loadUsers();
+      const user = users.find((item) => item.email === email);
       if (!user) {
         const application = readJson<{ status?: string; email?: string; passwordHash?: string }[]>(
           path.join(dataDir, 'vendor-applications.json'),
@@ -499,12 +551,17 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         return res.status(401).json({ success: false, error: LOGIN_INVALID });
       }
 
+      // Only failures count: a person signing in often must never lock themselves out.
+      loginLimiter.reset(`${clientIp(req)}:${email}`);
+      loginAccountLimiter.reset(email);
       startSession(res, user.id, parseRemember(req.body?.remember));
       const published = publicUser(user);
+      const verification = needsEmailVerification(published) ? await loginVerification(req, user, users) : {};
       res.json({
         success: true,
         user: published,
         needsEmailVerification: needsEmailVerification(published),
+        ...verification,
       });
     } catch {
       res.status(500).json({ success: false, error: 'تعذر تسجيل الدخول. حاول مرة أخرى.' });
@@ -514,14 +571,16 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   async function registerHandler(req: Request, res: Response) {
     try {
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
-      const phone = normalizePhone(req.body?.phone || req.body?.identifier);
+      // The mobile is optional for a customer account; an email-shaped identifier is never a phone.
+      const identifier = String(req.body?.identifier || '');
+      const phone = normalizePhone(req.body?.phone || (identifier.includes('@') ? '' : identifier));
       const password = String(req.body?.password || '');
       const name = String(req.body?.name || '').trim();
-      if (!email || !phone || !password || !name) {
-        return res.status(400).json({ success: false, error: 'الاسم والبريد والجوال والرقم السري مطلوبة.' });
+      if (!email || !password || !name) {
+        return res.status(400).json({ success: false, error: 'الاسم والبريد والرقم السري مطلوبة.' });
       }
-      if (!email.includes('@')) {
-        return res.status(400).json({ success: false, error: 'أدخل بريداً إلكترونياً صحيحاً.' });
+      if (!isPlausibleContact(email, phone || '000000000')) {
+        return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
       }
       if (password.length < PASSWORD_MIN_LENGTH) {
         return res.status(400).json({ success: false, error: WEAK_PASSWORD });
@@ -537,7 +596,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (users.some((item) => item.email === email)) {
         return res.status(409).json({ success: false, error: 'هذا البريد مسجّل مسبقاً.' });
       }
-      if (users.some((item) => normalizePhone(item.phone) === phone)) {
+      // Accounts without a mobile all share "", which is not a clash.
+      if (phone && users.some((item) => normalizePhone(item.phone) === phone)) {
         return res.status(409).json({ success: false, error: 'رقم الجوال مسجّل مسبقاً.' });
       }
 
@@ -817,11 +877,15 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       role: 'client',
       passwordHash: input.passwordHash,
       avatarUrl: input.avatarUrl || '',
-      emailVerified: true,
     };
     user.avatarUrl = input.avatarUrl || resolveUserAvatar(dataDir, user);
+    // Typing an email on an application proves nothing about owning it, and a
+    // verified email unlocks guest orders placed with it — so the applicant
+    // confirms it with a code like any sign-up.
+    const issued = issueEmailVerification(user);
     users.push(user);
     saveUsers(users);
+    void sendVerificationEmail(user.email, issued.code, issued.token).catch(() => undefined);
     return publicUser(user);
   }
 
@@ -858,12 +922,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       passwordHash: input.passwordHash,
       avatarUrl: input.avatarUrl || '',
       socials: input.socials || emptyVendorSocials(),
-      emailVerified: true,
     };
     if (input.avatarDataUrl) attachAvatarFromBody(user, input);
     else user.avatarUrl = resolveUserAvatar(dataDir, user);
+    // Approval vouches for the business, not the mailbox (see ensureApplicantUser).
+    const issued = issueEmailVerification(user);
     users.push(user);
     saveUsers(users);
+    void sendVerificationEmail(user.email, issued.code, issued.token).catch(() => undefined);
     return publicUser(user);
   }
 
@@ -907,12 +973,20 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     if (user.role === 'admin' && users.filter((item) => item.role === 'admin').length <= 1) {
       return res.status(400).json({ success: false, error: 'لا يمكن حذف آخر مدير لكل الحسابات.' });
     }
+    const removed = publicUser(user);
     saveUsers(users.filter((item) => item.id !== id));
     const sessions = loadSessions();
     for (const [token, userId] of Object.entries(sessions)) {
       if (userId === id) delete sessions[token];
     }
     saveSessions(sessions);
+    for (const listener of userDeletedListeners) {
+      try {
+        listener(removed);
+      } catch (error) {
+        console.warn('[auth] cleanup after deleting', id, 'failed:', (error as Error)?.message || error);
+      }
+    }
     res.json({ success: true });
   }
 
@@ -1106,8 +1180,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     try {
       const email = normalizeEmail(req.body?.email);
       const phone = normalizePhone(req.body?.phone);
-      if (!email || !phone) {
-        return res.status(400).json({ success: false, error: 'البريد الإلكتروني ورقم الجوال مطلوبان.' });
+      if (!email) {
+        return res.status(400).json({ success: false, error: 'البريد الإلكتروني مطلوب.' });
       }
       const ip = clientIp(req);
       if (!resendLimiter.allow(`${ip}:${email}`)) {
@@ -1115,8 +1189,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       }
 
       const users = loadUsers();
+      // With a mobile it must match the account's. Without one, the account must have
+      // no mobile either, or be the signed-in requester. The code only ever goes to the
+      // account's own mailbox.
+      const signedIn = userFromRequest(req);
       const user = users.find(
-        (item) => item.email === email && normalizePhone(item.phone) === phone,
+        (item) =>
+          item.email === email &&
+          (phone ? normalizePhone(item.phone) === phone : !normalizePhone(item.phone) || signedIn?.id === item.id),
       );
       if (!user) {
         return res.status(400).json({ success: false, error: EMAIL_VERIFY_NOT_FOUND });
@@ -1186,6 +1266,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     createUserHandler,
     updateUserHandler,
     deleteUserHandler,
+    onUserDeleted,
     addVendorUser,
     checkApplicantAccount,
     ensureApplicantUser,
@@ -1201,6 +1282,24 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     resendVerificationHandler,
     verifyEmailTokenHandler,
   };
+}
+
+export type RoleGuardOptions = {
+  /**
+   * Only the listed roles pass — `accounts_manager` no longer counts as
+   * `admin`. For money and platform-key settings that stay with the owner.
+   */
+  exact?: boolean;
+};
+
+/** `requireRole`'s check. Without `exact` it is `roleAllowed` (accounts_manager passes for admin). */
+export function roleGuardAllows(
+  userRole: string | null | undefined,
+  roles: readonly string[],
+  options: RoleGuardOptions = {},
+): boolean {
+  if (options.exact) return Boolean(userRole) && roles.includes(String(userRole));
+  return roleAllowed(userRole, roles);
 }
 
 export function parseCookies(req: { headers: { cookie?: string } }): Record<string, string> {
