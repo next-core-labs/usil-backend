@@ -103,6 +103,19 @@ export function serviceMatchesFulfillment(item: ServiceItem, lane: string): bool
   return (item.fulfillment || []).includes(lane as FulfillmentLane);
 }
 
+/**
+ * «الجمهور»: a vendor listing names the audiences it serves; one that names none
+ * suits everyone (hiding it would empty the filter). A family listing also fits
+ * the women's and men's sections.
+ */
+export function serviceMatchesAudience(item: Pick<ServiceItem, 'audience' | 'audiences'>, audience: string): boolean {
+  if (!audience || audience === 'all') return true;
+  const list: string[] = item.audiences?.length ? item.audiences : item.audience ? [item.audience] : [];
+  if (!list.length) return true;
+  if (list.includes(audience)) return true;
+  return list.includes('family') && (audience === 'women' || audience === 'men');
+}
+
 export type AudienceFilter = 'all' | 'women' | 'men' | 'family' | 'corporate';
 
 export const AUDIENCE_OPTIONS: { id: AudienceFilter; label: string }[] = [
@@ -146,10 +159,11 @@ export const PRICE_RANGES = [
 
 export type PriceRangeId = (typeof PRICE_RANGES)[number]['id'];
 
+/** Bands don't overlap: a boundary price (3,000, 8,000) belongs to the lower band only. */
 export function serviceMatchesPriceRange(price: number, range: string): boolean {
   if (range === 'lt1000') return price < 1000;
   if (range === '1k3k') return price >= 1000 && price <= 3000;
-  if (range === '3k8k') return price >= 3000 && price <= 8000;
+  if (range === '3k8k') return price > 3000 && price <= 8000;
   if (range === 'gt8000') return price > 8000;
   return true;
 }

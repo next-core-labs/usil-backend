@@ -311,7 +311,7 @@ describe('vendor-application-routes — account takeover and orphan uploads', ()
     const json = await res.json();
     assert.match(json.user.id, /^usr-\d+-[0-9a-f]{8}$/);
     assert.equal(readUsers(dir).length, 1);
-    assert.match(res.headers.get('set-cookie') || '', /midyaf_sid=/);
+    assert.match(res.headers.get('set-cookie') || '', /usil_sid=/);
     await close();
   });
 

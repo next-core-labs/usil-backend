@@ -66,7 +66,19 @@ type StoredUser = Omit<PublicUser, 'emailVerified'> & {
   passwordResetAttempts?: number;
 };
 
-const COOKIE = 'midyaf_sid';
+/**
+ * Host-only session cookie: usil.app, owner.usil.app and vendor.usil.app each
+ * keep their own sign-in. The old `midyaf_sid` was scoped to `.usil.app`, so one
+ * browser shared a single session across all three — signing in as the owner on
+ * the console showed the owner inside the store, and the reverse. It is never
+ * read again, only expired (`expireLegacySessionCookie`).
+ */
+const COOKIE = 'usil_sid';
+/** A code younger than this is reused at sign-in instead of mailing another. */
+const LOGIN_CODE_REUSE_MS = 5 * 60 * 1000;
+const EMAIL_CODE_ALREADY_SENT = 'أرسلنا رمز التأكيد إلى بريدك قبل قليل. إذا ما وصلك، تحقق من مجلد الرسائل غير المرغوب فيها أو اطلب رمزاً جديداً.';
+const LEGACY_COOKIE = 'midyaf_sid';
+const LEGACY_COOKIE_DOMAIN = '.usil.app';
 
 function usersFile(dataDir: string) {
   return path.join(dataDir, 'users.json');
@@ -132,18 +144,15 @@ function isPrivilegedRole(role: string | undefined): boolean {
   return role === 'admin' || role === 'accounts_manager';
 }
 
+/**
+ * No Domain attribute unless COOKIE_DOMAIN explicitly asks for one: a cookie
+ * shared across subdomains would share one sign-in between the store and the
+ * consoles again.
+ */
 function cookieDomain(): string | undefined {
   const explicit = String(process.env.COOKIE_DOMAIN || '').trim();
-  if (explicit === '0' || explicit.toLowerCase() === 'none') return undefined;
-  if (explicit) return explicit;
-  const site = String(process.env.PUBLIC_SITE_URL || process.env.APP_URL || '');
-  try {
-    const host = site ? new URL(site).hostname : '';
-    if (host === 'usil.app' || host.endsWith('.usil.app')) return '.usil.app';
-  } catch {
-    /* ignore */
-  }
-  return undefined;
+  if (!explicit || explicit === '0' || explicit.toLowerCase() === 'none') return undefined;
+  return explicit;
 }
 
 const COOKIE_DAY_SEC = 60 * 60 * 24;
@@ -168,7 +177,7 @@ function setSessionCookie(res: Response, token: string, remember?: boolean) {
   const domain = cookieDomain();
   if (domain) parts.push(`Domain=${domain}`);
   if (cookieSecure()) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  res.append('Set-Cookie', parts.join('; '));
 }
 
 function clearSessionCookie(res: Response) {
@@ -176,7 +185,26 @@ function clearSessionCookie(res: Response) {
   const domain = cookieDomain();
   if (domain) parts.push(`Domain=${domain}`);
   if (cookieSecure()) parts.push('Secure');
-  res.setHeader('Set-Cookie', parts.join('; '));
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+/** Delete the old shared `midyaf_sid`, both its `.usil.app` and any host-only copy. */
+function legacyCookieExpiries(): string[] {
+  const base = [`${LEGACY_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (cookieSecure()) base.push('Secure');
+  return [[...base, `Domain=${LEGACY_COOKIE_DOMAIN}`].join('; '), base.join('; ')];
+}
+
+/**
+ * Middleware: any request still carrying the old shared cookie gets it expired.
+ * It is never trusted as a session, so that browser signs in once more — on
+ * each site separately from now on.
+ */
+export function expireLegacySessionCookie(req: Request, res: Response, next: NextFunction) {
+  if (parseCookies(req)[LEGACY_COOKIE] !== undefined) {
+    for (const header of legacyCookieExpiries()) res.append('Set-Cookie', header);
+  }
+  next();
 }
 
 const FORGOT_LIMIT = 5;
@@ -458,7 +486,25 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     };
   }
 
-  function loginHandler(req: Request, res: Response) {
+  /**
+   * Signing in to an unconfirmed account opens «تأكيد البريد». The sign-up code
+   * lives 30 minutes, so by the next sign-in it has usually expired and nothing
+   * new was on its way — the customer waited for an email that never came.
+   * Send a fresh code, unless one went out in the last few minutes (sign-up
+   * followed straight by sign-in), within the same budget as «إعادة الإرسال».
+   */
+  async function loginVerification(req: Request, user: StoredUser, users: StoredUser[]) {
+    const sentRecently = (user.emailVerifyExpiresAt || 0) - Date.now() > EMAIL_VERIFY_TTL_MS - LOGIN_CODE_REUSE_MS;
+    if (sentRecently || !resendLimiter.allow(`${clientIp(req)}:${user.email}`)) {
+      return { emailSent: true as const, message: EMAIL_CODE_ALREADY_SENT };
+    }
+    const issued = issueEmailVerification(user);
+    saveUsers(users);
+    const emailSent = await sendVerificationEmail(user.email, issued.code, issued.token);
+    return verificationPayload(emailSent, issued.code, EMAIL_RESEND_SENT, EMAIL_RESEND_FALLBACK);
+  }
+
+  async function loginHandler(req: Request, res: Response) {
     try {
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
       const phone = normalizePhone(req.body?.phone || '');
@@ -470,13 +516,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
         return res.status(429).json({ success: false, error: LOGIN_RATE_LIMIT });
       }
       if (!email || !password) {
-        return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
+        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
       }
       if (!phone && !email.includes('@')) {
-        return res.status(400).json({ success: false, error: 'البريد والجوال والرقم السري مطلوبة.' });
+        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
       }
 
-      const user = loadUsers().find((item) => item.email === email);
+      const users = loadUsers();
+      const user = users.find((item) => item.email === email);
       if (!user) {
         const application = readJson<{ status?: string; email?: string; passwordHash?: string }[]>(
           path.join(dataDir, 'vendor-applications.json'),
@@ -509,10 +556,12 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       loginAccountLimiter.reset(email);
       startSession(res, user.id, parseRemember(req.body?.remember));
       const published = publicUser(user);
+      const verification = needsEmailVerification(published) ? await loginVerification(req, user, users) : {};
       res.json({
         success: true,
         user: published,
         needsEmailVerification: needsEmailVerification(published),
+        ...verification,
       });
     } catch {
       res.status(500).json({ success: false, error: 'تعذر تسجيل الدخول. حاول مرة أخرى.' });
@@ -522,13 +571,15 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   async function registerHandler(req: Request, res: Response) {
     try {
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
-      const phone = normalizePhone(req.body?.phone || req.body?.identifier);
+      // The mobile is optional for a customer account; an email-shaped identifier is never a phone.
+      const identifier = String(req.body?.identifier || '');
+      const phone = normalizePhone(req.body?.phone || (identifier.includes('@') ? '' : identifier));
       const password = String(req.body?.password || '');
       const name = String(req.body?.name || '').trim();
-      if (!email || !phone || !password || !name) {
-        return res.status(400).json({ success: false, error: 'الاسم والبريد والجوال والرقم السري مطلوبة.' });
+      if (!email || !password || !name) {
+        return res.status(400).json({ success: false, error: 'الاسم والبريد والرقم السري مطلوبة.' });
       }
-      if (!isPlausibleContact(email, phone)) {
+      if (!isPlausibleContact(email, phone || '000000000')) {
         return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
       }
       if (password.length < PASSWORD_MIN_LENGTH) {
@@ -545,7 +596,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       if (users.some((item) => item.email === email)) {
         return res.status(409).json({ success: false, error: 'هذا البريد مسجّل مسبقاً.' });
       }
-      if (users.some((item) => normalizePhone(item.phone) === phone)) {
+      // Accounts without a mobile all share "", which is not a clash.
+      if (phone && users.some((item) => normalizePhone(item.phone) === phone)) {
         return res.status(409).json({ success: false, error: 'رقم الجوال مسجّل مسبقاً.' });
       }
 
@@ -1128,8 +1180,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     try {
       const email = normalizeEmail(req.body?.email);
       const phone = normalizePhone(req.body?.phone);
-      if (!email || !phone) {
-        return res.status(400).json({ success: false, error: 'البريد الإلكتروني ورقم الجوال مطلوبان.' });
+      if (!email) {
+        return res.status(400).json({ success: false, error: 'البريد الإلكتروني مطلوب.' });
       }
       const ip = clientIp(req);
       if (!resendLimiter.allow(`${ip}:${email}`)) {
@@ -1137,8 +1189,14 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       }
 
       const users = loadUsers();
+      // With a mobile it must match the account's. Without one, the account must have
+      // no mobile either, or be the signed-in requester. The code only ever goes to the
+      // account's own mailbox.
+      const signedIn = userFromRequest(req);
       const user = users.find(
-        (item) => item.email === email && normalizePhone(item.phone) === phone,
+        (item) =>
+          item.email === email &&
+          (phone ? normalizePhone(item.phone) === phone : !normalizePhone(item.phone) || signedIn?.id === item.id),
       );
       if (!user) {
         return res.status(400).json({ success: false, error: EMAIL_VERIFY_NOT_FOUND });

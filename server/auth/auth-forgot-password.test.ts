@@ -159,7 +159,7 @@ describe('forgot password — two-step code flow', () => {
       password: 'old-secret',
     });
     const cookie = login.res.headers.get('set-cookie') || '';
-    assert.match(cookie, /midyaf_sid=/);
+    assert.match(cookie, /usil_sid=/);
 
     const code = await requestCode(url, CLIENT.email);
     const reset = await post(`${url}/api/auth/reset-password`, {

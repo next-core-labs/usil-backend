@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 
-import { createAuth } from './auth/auth.ts';
+import { createAuth, expireLegacySessionCookie } from './auth/auth.ts';
 import { registerAuthRoutes } from './auth/auth-routes.ts';
 import { brandedAvatarSvg, setUploadsHeaders, uploadsDir } from './auth/avatar.ts';
 import { registerGeminiRoutes } from './ai/gemini-routes.ts';
@@ -55,6 +55,9 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
     if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
     next();
   });
+
+  // The old `.usil.app`-wide session cookie shared one sign-in between the store and consoles.
+  app.use(expireLegacySessionCookie);
 
   // Product images travel as base64 data URLs, so the cap must clear 5MB × ~1.37 overhead.
   app.use(express.json({ limit: '16mb' }));

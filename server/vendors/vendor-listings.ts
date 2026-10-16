@@ -4,6 +4,17 @@ import { PLACE_NAMES, isSaudiPlaceName } from '../../core/data/saudiPlaces';
 export const LISTING_FULFILLMENT_IDS = ['hour', 'same_day', 'tomorrow', 'instant'] as const;
 export type ListingFulfillmentLane = (typeof LISTING_FULFILLMENT_IDS)[number];
 
+/** Who the listing serves — the storefront's «الجمهور» filter. None picked means it suits everyone. */
+export const LISTING_AUDIENCE_IDS = ['women', 'men', 'family', 'corporate'] as const;
+export type ListingAudience = (typeof LISTING_AUDIENCE_IDS)[number];
+
+export function parseListingAudiences(raw: unknown): ListingAudience[] {
+  const list = Array.isArray(raw) ? raw : [];
+  return Array.from(
+    new Set(list.filter((item): item is ListingAudience => (LISTING_AUDIENCE_IDS as readonly string[]).includes(String(item)))),
+  );
+}
+
 export const FULFILLMENT_AR_LABEL: Record<ListingFulfillmentLane, string> = {
   hour: 'يوصل ساعة',
   same_day: 'يوصل اليوم',
@@ -84,6 +95,8 @@ export type VendorListing = {
   /** Legacy single-image field, mirrored from images[0] so old cards keep working. */
   image?: string;
   fulfillment: ListingFulfillmentLane[];
+  /** Empty or missing: suits every audience. */
+  audiences?: ListingAudience[];
   bookingMode: ListingBookingMode;
   createdAt: string;
   updatedAt: string;
@@ -99,6 +112,7 @@ export type VendorListingInput = {
   images?: unknown;
   image?: unknown;
   fulfillment?: unknown;
+  audiences?: unknown;
   bookingMode?: unknown;
   vendorName?: unknown;
 };
@@ -224,6 +238,7 @@ export function validateVendorListing(
     images,
     image: images[0] || undefined,
     fulfillment,
+    audiences: parseListingAudiences(input.audiences),
     bookingMode,
   };
 }
@@ -267,6 +282,7 @@ export function listingToServiceItem(listing: VendorListing): ServiceItem {
       responseRate: '—',
     },
     fulfillment: listing.fulfillment as FulfillmentLane[],
+    audiences: parseListingAudiences(listing.audiences),
     tags: [],
   };
 }

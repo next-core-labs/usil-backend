@@ -65,7 +65,29 @@ export type VendorRouteOptions = VendorStoreOptions & {
 export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: string, options: VendorRouteOptions = {}) {
   const store = createVendorStore(dataDir, options);
   const applications = createVendorApplicationStore(dataDir);
-  const guard = auth.requireRole(['vendor', 'admin']);
+  const vendorOrAdmin = auth.requireRole(['vendor', 'admin']);
+
+  /** A client account whose vendor application awaits the owner — see `POST /api/vendor-signup`. */
+  function pendingApplicant(req: Request) {
+    const user = auth.userFromRequest(req);
+    if (!user || user.role !== 'client' || !user.email) return null;
+    const row = applications.findByEmail(user.email);
+    return row?.status === 'pending' ? { user, row } : null;
+  }
+
+  /**
+   * Vendors and supervisors, plus pending applicants: they set up products and
+   * socials in their own workspace while waiting. None of it is public until
+   * approval gives the account the vendor role (`isPublicVendorAccount`).
+   */
+  function guard(req: Request, res: Response, next: () => void) {
+    const pending = pendingApplicant(req);
+    if (pending) {
+      (req as Request & { user?: unknown }).user = pending.user;
+      return next();
+    }
+    return vendorOrAdmin(req, res, next);
+  }
 
   /** Vendor accounts that pass the shared public rule (see `isPublicVendorAccount`). */
   function publicVendorUsers(): PublicUser[] {
@@ -241,6 +263,9 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
     try {
       const saved = persistSocials(vendorId, req.body || {});
+      // Approval copies the application's socials onto the account, so keep them in step.
+      const pending = pendingApplicant(req);
+      if (pending) applications.saveSocials(pending.row.id, saved);
       res.json({ success: true, data: saved });
     } catch (error) {
       res.status(400).json({
@@ -471,7 +496,15 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
 
   app.get('/api/admin/listings', adminOnly, (_req: Request, res: Response) => {
     const leftovers = rejectedLeftoverIds();
-    res.json({ success: true, data: store.listAllListings().filter((listing) => !leftovers.has(listing.vendorId)) });
+    const live = new Set(publicVendorUsers().map((user) => user.id));
+    res.json({
+      success: true,
+      data: store
+        .listAllListings()
+        .filter((listing) => !leftovers.has(listing.vendorId))
+        // A pending vendor's products are saved but not public until approval.
+        .map((listing) => ({ ...listing, vendorPending: !live.has(listing.vendorId) })),
+    });
   });
 
   app.patch('/api/admin/listings/:id', adminOnly, (req: Request, res: Response) => {

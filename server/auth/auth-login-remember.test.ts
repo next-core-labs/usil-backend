@@ -56,7 +56,7 @@ function cookieHeader(res: Response): string {
 }
 
 describe('login remember cookie', () => {
-  it('sets midyaf_sid Max-Age to 30 days when remember is true', async () => {
+  it('sets usil_sid Max-Age to 30 days when remember is true', async () => {
     const dir = tmpDir();
     seedUser(dir);
     const { url, close } = await listen(appWithAuth(dir));
@@ -72,7 +72,7 @@ describe('login remember cookie', () => {
     });
     const cookie = cookieHeader(res);
     assert.equal(res.status, 200);
-    assert.match(cookie, /midyaf_sid=/);
+    assert.match(cookie, /usil_sid=/);
     assert.match(cookie, /Max-Age=2592000/);
     assert.match(cookie, /HttpOnly/i);
     assert.match(cookie, /SameSite=Lax/i);

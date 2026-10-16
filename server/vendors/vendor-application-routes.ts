@@ -3,9 +3,12 @@ import path from 'path';
 import type { Express, Request, Response } from 'express';
 import {
   createVendorApplicationStore,
+  missingForApproval,
   parseVendorFulfillment,
   publicApplication,
+  validateQuickSignup,
   validateVendorApplication,
+  type VendorApplication,
 } from './vendor-applications';
 import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
 import { notifyVendorApplicationDecision, notifyVendorApplicationReceived } from '../shared/optional-mail';
@@ -88,6 +91,111 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   const workspaces = createVendorStore(dataDir);
   const adminOnly = auth.requireRole(['admin']);
   const applyLimiter = createSlidingWindowLimiter(APPLY_LIMIT, APPLY_WINDOW_MS);
+
+  /** The workspace an application's products and socials live in: the applicant's account, or the application id. */
+  function workspaceIdFor(row: VendorApplication): string {
+    return auth.findUserByEmail?.(row.email)?.id || row.id;
+  }
+
+  /** Products and linked socials count toward approval wherever the vendor added them. */
+  function progressFor(row: VendorApplication) {
+    const id = workspaceIdFor(row);
+    const ws = workspaces.hasWorkspace(id) ? workspaces.getWorkspace(id) : null;
+    const handles = new Set(
+      [...(ws?.socials?.links || []), ...(row.socials?.links || [])]
+        .filter((link) => String(link.handle || '').trim())
+        .map((link) => link.network),
+    );
+    const listingCount = ws?.listings.length || 0;
+    return { listingCount, missing: missingForApproval(row, { listingCount, socialCount: handles.size }) };
+  }
+
+  /**
+   * The vendor console's short sign-up. The applicant is signed in straight
+   * away as a client account and works in the vendor dashboard while pending —
+   * nothing they add is public until the owner approves (see
+   * `isPublicVendorAccount`).
+   */
+  app.post('/api/vendor-signup', (req: Request, res: Response) => {
+    if (!applyLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
+      return res.status(429).json({ success: false, error: APPLY_RATE_LIMITED });
+    }
+    try {
+      const body = req.body || {};
+      validateQuickSignup(body);
+      const existing = store.findByEmail(String(body.email || ''));
+      if (existing?.status === 'pending') {
+        throw new Error('هذا البريد عليه طلب مورّد بانتظار موافقة إدارة يوصل. سجّل الدخول لإكماله');
+      }
+      if (existing?.status === 'approved') throw new Error('هذا البريد مسجّل كمورّد معتمد. استخدم تسجيل الدخول');
+      const actor = auth.userFromRequest(req);
+      const ownership = auth.checkApplicantAccount(
+        { email: String(body.email || ''), phone: String(body.phone || '') },
+        actor?.id,
+      );
+      if (ownership === 'conflict') {
+        return res.status(409).json({ success: false, error: APPLICANT_LOGIN_REQUIRED });
+      }
+      const passwordHash = hashPassword(String(body.password || ''));
+      const created = store.submitQuick(body, passwordHash);
+      const user = auth.ensureApplicantUser?.(
+        { name: personNameFromParts(created) || created.projectName, email: created.email, phone: created.phone, passwordHash },
+        actor?.id,
+      );
+      if (user && auth.startSession && ownership === 'new') auth.startSession(res, user.id);
+      workspaces.seedWorkspaceFromApplication(user?.id || created.id, created);
+      notifyVendorApplicationReceived(created.email, created.projectName);
+      res.status(201).json({
+        success: true,
+        application: publicApplication(created),
+        user: user || null,
+        missing: progressFor(created).missing,
+        message: 'أهلاً بك في يوصل! أضف منتجاتك وأكمل ملفك، وتظهر في السوق بعد موافقة الإدارة.',
+      });
+    } catch (error) {
+      res.status((error as { status?: number })?.status === 409 ? 409 : 400).json({
+        success: false,
+        error: error instanceof Error ? error.message : 'تعذر التسجيل',
+      });
+    }
+  });
+
+  /** A pending vendor completes their file: names, ID, bank, lanes, logo. */
+  app.put('/api/vendor/application', (req: Request, res: Response) => {
+    const user = auth.userFromRequest(req);
+    if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    const own = store.findByEmail(user.email);
+    if (!own || own.status !== 'pending') {
+      return res.status(404).json({ success: false, error: 'لا يوجد طلب انضمام قيد المراجعة لهذا الحساب' });
+    }
+    const written: string[] = [];
+    try {
+      const body = { ...(req.body || {}) };
+      delete body.logoUrl;
+      if (body.logoDataUrl) {
+        const logoUrl = saveUpload(dataDir, 'vendor-logo', String(body.logoDataUrl));
+        if (!logoUrl) throw new Error('ارفع شعاراً jpg أو png أو webp حتى 2 ميغابايت.');
+        body.logoUrl = logoUrl;
+        written.push(logoUrl);
+      }
+      const row = store.updateDetails(own.id, body);
+      if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+      written.length = 0;
+      const vendorId = workspaceIdFor(row);
+      workspaces.seedWorkspaceFromApplication(vendorId, row);
+      res.json({
+        success: true,
+        application: publicApplication(row),
+        missing: progressFor(row).missing,
+      });
+    } catch (error) {
+      removeUploads(dataDir, written);
+      res.status(400).json({
+        success: false,
+        error: error instanceof Error ? error.message : 'تعذر حفظ البيانات',
+      });
+    }
+  });
 
   app.post('/api/vendor-applications', (req: Request, res: Response) => {
     if (!applyLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
@@ -215,6 +323,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
     res.json({
       success: true,
       application: application ? publicApplication(application) : null,
+      missing: application?.status === 'pending' ? progressFor(application).missing : [],
       profile,
       file: application?.status === 'approved' || user.role === 'vendor' ? publicVendorFile({ ...profile, status: 'approved' }) : publicVendorFile(profile),
       workspace: ws
@@ -230,13 +339,25 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   app.get('/api/admin/vendor-applications', adminOnly, (_req: Request, res: Response) => {
     res.json({
       success: true,
-      data: store.list().map(publicApplication),
+      data: store.list().map((row) => ({ ...publicApplication(row), ...progressFor(row) })),
     });
   });
 
   app.post('/api/admin/vendor-applications/:id/approve', adminOnly, (req: Request, res: Response) => {
     try {
       const actor = auth.userFromRequest(req);
+      const pending = store.findById(req.params.id);
+      if (!pending) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+      if (pending.status === 'pending') {
+        const { missing } = progressFor(pending);
+        if (missing.length) {
+          return res.status(400).json({
+            success: false,
+            error: `ملف المورّد ناقص: ${missing.map((item) => item.label).join('، ')}`,
+            missing,
+          });
+        }
+      }
       const row = store.decide(req.params.id, 'approved', actor?.name || 'إدارة يوصل');
       if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
       const previous = auth.findUserByEmail?.(row.email);

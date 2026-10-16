@@ -54,7 +54,7 @@ function appWithAuth(dir: string) {
 
 function sid(res: Response): string {
   const cookie = res.headers.get('set-cookie') || '';
-  const match = cookie.match(/midyaf_sid=([^;]+)/);
+  const match = cookie.match(/usil_sid=([^;]+)/);
   return match ? match[1] : '';
 }
 
@@ -76,7 +76,7 @@ describe('session stays after login', () => {
     const token = sid(login);
     assert.equal(login.status, 200);
     assert.ok(token);
-    const cookie = `midyaf_sid=${token}`;
+    const cookie = `usil_sid=${token}`;
     const rounds = await Promise.all(
       Array.from({ length: 8 }, () =>
         fetch(`${url}/api/admin/users`, { headers: { Cookie: cookie } }).then((r) => r.json()),
@@ -92,7 +92,8 @@ describe('session stays after login', () => {
     await close();
   });
 
-  it('sets Domain=.usil.app when PUBLIC_SITE_URL is the live host', async () => {
+  // Host-only on the live host too: a `.usil.app` cookie shared one sign-in between store and consoles.
+  it('sets no Domain when PUBLIC_SITE_URL is the live host', async () => {
     const prev = process.env.PUBLIC_SITE_URL;
     process.env.PUBLIC_SITE_URL = 'https://usil.app';
     const dir = tmpDir();
@@ -110,7 +111,8 @@ describe('session stays after login', () => {
         }),
       });
       const cookie = login.headers.get('set-cookie') || '';
-      assert.match(cookie, /Domain=\.usil\.app/);
+      assert.match(cookie, /usil_sid=/);
+      assert.doesNotMatch(cookie, /Domain=/i);
     } finally {
       if (prev === undefined) delete process.env.PUBLIC_SITE_URL;
       else process.env.PUBLIC_SITE_URL = prev;
@@ -133,7 +135,7 @@ describe('session stays after login', () => {
     );
     const { url, close } = await listen(appWithAuth(dir));
     const me = await fetch(`${url}/api/auth/me`, {
-      headers: { Cookie: 'midyaf_sid=diag0123456789abcdef012345' },
+      headers: { Cookie: 'usil_sid=diag0123456789abcdef012345' },
     });
     const body = await me.json();
     assert.equal(body.user, null);

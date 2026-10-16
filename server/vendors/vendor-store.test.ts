@@ -199,6 +199,17 @@ describe('vendor-store', () => {
     assert.deepEqual(updated?.fulfillment, ['tomorrow']);
   });
 
+  it('keeps the audiences a listing serves («الجمهور»), dropping unknown values', () => {
+    const store = createVendorStore(tmpDir());
+    const listing = store.addListing('usr-vendor', goodListing({ audiences: ['women', 'corporate', 'kids', 'women'] }));
+    assert.deepEqual(listing.audiences, ['women', 'corporate']);
+    const untouched = store.updateListing('usr-vendor', listing.id, { price: 90 });
+    assert.deepEqual(untouched?.audiences, ['women', 'corporate']);
+    const cleared = store.updateListing('usr-vendor', listing.id, { audiences: [] });
+    assert.deepEqual(cleared?.audiences, []);
+    assert.deepEqual(store.addListing('usr-vendor', goodListing()).audiences, []);
+  });
+
   it('saves vendor socials and keeps them when other workspace fields change', () => {
     const store = createVendorStore(tmpDir());
     const socials = store.saveSocials('usr-vendor', {

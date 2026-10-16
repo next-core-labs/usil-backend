@@ -303,6 +303,7 @@ function normalizeListings(raw: unknown, vendorId: string): VendorListing[] {
 /** Fields a vendor may edit on a listing — used to tell an untouched row from an edit. */
 const LISTING_EDIT_FIELDS = [
   'title',
+  'audiences',
   'category',
   'shortDesc',
   'price',
@@ -945,6 +946,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
       images: imagesGiven ? body.images : current.images ?? (current.image ? [current.image] : []),
       image: imagesGiven ? body.image : undefined,
       fulfillment: body.fulfillment ?? current.fulfillment,
+      audiences: body.audiences ?? current.audiences,
       bookingMode: body.bookingMode ?? current.bookingMode,
       vendorName: body.vendorName || vendorName || current.vendorName,
     };
