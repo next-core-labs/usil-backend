@@ -143,4 +143,41 @@ describe('session stays after login', () => {
     assert.equal(Object.keys(sessions).length, 0);
     await close();
   });
+
+  it('ends a session on the server when its time is up, even with a copied cookie', async () => {
+    const dir = tmpDir();
+    seedAdmin(dir);
+    const token = 'expired0123456789abcdef0123';
+    const legacy = 'legacy0123456789abcdef01234';
+    fs.writeFileSync(
+      path.join(dir, 'sessions.json'),
+      JSON.stringify({
+        [token]: { userId: 'usr-nawaf-admin', expiresAt: Date.now() - 1000 },
+        [legacy]: 'usr-nawaf-admin',
+      }),
+      'utf-8',
+    );
+    const { url, close } = await listen(appWithAuth(dir));
+    try {
+      const me = await fetch(`${url}/api/auth/me`, { headers: { Cookie: `usil_sid=${token}` } });
+      assert.equal((await me.json()).user, null);
+      // A pre-expiry session keeps working, now with an expiry of its own.
+      const old = await fetch(`${url}/api/auth/me`, { headers: { Cookie: `usil_sid=${legacy}` } });
+      assert.equal((await old.json()).user.id, 'usr-nawaf-admin');
+      const sessions = JSON.parse(fs.readFileSync(path.join(dir, 'sessions.json'), 'utf-8'));
+      assert.equal(sessions[token], undefined);
+      assert.ok(sessions[legacy].expiresAt > Date.now());
+
+      const login = await fetch(`${url}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'nawafalmuhayya@gmail.com', password: 'secret12', remember: false }),
+      });
+      const fresh = JSON.parse(fs.readFileSync(path.join(dir, 'sessions.json'), 'utf-8'))[sid(login)];
+      const dayMs = 24 * 60 * 60 * 1000;
+      assert.ok(fresh.expiresAt > Date.now() + dayMs - 60_000 && fresh.expiresAt <= Date.now() + dayMs);
+    } finally {
+      await close();
+    }
+  });
 });

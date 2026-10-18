@@ -1,5 +1,7 @@
 import type { Express, Request, Response } from 'express';
 import { createVendorStore, VendorStoreError, type VendorStoreOptions } from './vendor-store';
+import { takenDatesForListing } from '../bookings/slot-holds';
+import { BOOKING_PENDING_APPROVAL_STATUS } from './vendor-listings';
 import { enrichVendorServices } from '../../core/data/saudiMarket';
 import { isPublicMarketplaceListing } from '../../core/utils/catalogMedia';
 import { createVendorApplicationStore } from './vendor-applications';
@@ -288,14 +290,27 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     }
     const { vendorId } = publicVendor(String(req.params.id || ''));
     if (!vendorId) return res.json({ success: true, data: { dates: [] } });
-    const from = riyadhToday(options.now?.() || new Date());
+    const nowDate = options.now?.() || new Date();
+    const from = riyadhToday(nowDate);
     const until = addDays(from, PUBLIC_BLOCKED_DATES_DAYS);
+    const workspace = store.getWorkspace(vendorId);
+    const closed = workspace.blockedDates.map((row) => String(row?.date || '').slice(0, 10));
+    // `?listingId=` adds the days that listing is already booked (one event per day).
+    const listingId = String(req.query.listingId || '').trim();
+    const ownListing = listingId && workspace.listings.some((row) => row.id === listingId);
+    const taken = ownListing
+      ? takenDatesForListing({
+          listingId,
+          // A request still waiting on the vendor doesn't take the day (see POST /api/bookings).
+          orders: store.readPlatformBookings().filter((row) => row.status !== BOOKING_PENDING_APPROVAL_STATUS),
+          vendorBookings: workspace.bookings,
+          fromDate: from,
+          nowMs: nowDate.getTime(),
+        })
+      : [];
     const dates = Array.from(
       new Set(
-        store
-          .getWorkspace(vendorId)
-          .blockedDates.map((row) => String(row?.date || '').slice(0, 10))
-          .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && date >= from && date <= until),
+        [...closed, ...taken].filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date) && date >= from && date <= until),
       ),
     ).sort();
     res.json({ success: true, data: { dates } });

@@ -3,7 +3,7 @@ import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
 import { AVATAR_MAX_BYTES, dataUrlProblem, resolveUserAvatar, saveUpload } from './avatar';
-import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
+import { clientIp, createSlidingWindowLimiter, normalizeSaudiMobile } from '../shared/booking-guards';
 import { FOUNDER_ADMIN_EMAIL, isDummyEmail, purgeLiveDummyData, wipeAllVendorsAndDummyMedia } from './dummy-accounts';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
 import {
@@ -14,6 +14,7 @@ import {
 } from '../shared/optional-mail';
 import { emptyVendorSocials, type VendorSocials } from '../vendors/vendor-socials';
 import { isAccountRole, isVendorSupervisor, roleAllowed, type AccountRole } from './roles';
+import { LEGACY_SESSION_TTL_MS, sessionExpired, sessionUserId, type SessionRow } from './session-rows';
 export type { AccountRole } from './roles';
 import {
   EMAIL_RESEND_FALLBACK,
@@ -88,8 +89,14 @@ function sessionsFile(dataDir: string) {
   return path.join(dataDir, 'sessions.json');
 }
 
+/** Arabic-Indic (٠-٩) and Persian (۰-۹) digits as ASCII, so «٠٥٥…» is the same number as «055…». */
+function asciiDigits(raw: string): string {
+  return String(raw || '').replace(/[\u0660-\u0669\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) & 0xf));
+}
+
 export function normalizePhone(raw: string): string {
-  const digits = String(raw || '').replace(/[^\d]/g, '');
+  let digits = asciiDigits(raw).replace(/[^\d]/g, '');
+  if (digits.startsWith('00966')) digits = digits.slice(2);
   if (digits.startsWith('966') && digits.length >= 12) return `0${digits.slice(3)}`;
   if (digits.startsWith('5') && digits.length === 9) return `0${digits}`;
   return digits;
@@ -164,9 +171,12 @@ function parseRemember(value: unknown): boolean {
   return value === true || value === 'true' || value === 1 || value === '1';
 }
 
+function sessionMaxAge(remember?: boolean): number {
+  return remember === true ? COOKIE_REMEMBER_MAX_AGE : remember === false ? COOKIE_SHORT_MAX_AGE : COOKIE_DEFAULT_MAX_AGE;
+}
+
 function setSessionCookie(res: Response, token: string, remember?: boolean) {
-  const maxAge =
-    remember === true ? COOKIE_REMEMBER_MAX_AGE : remember === false ? COOKIE_SHORT_MAX_AGE : COOKIE_DEFAULT_MAX_AGE;
+  const maxAge = sessionMaxAge(remember);
   const parts = [
     `${COOKIE}=${token}`,
     'Path=/',
@@ -240,6 +250,10 @@ const RESET_REQUEST_FALLBACK = 'البريد غير مفعّل على الخاد
 const RESET_FIELDS_REQUIRED = 'البريد الإلكتروني ورمز الاستعادة والرقم السري الجديد مطلوبة.';
 const RESET_CODE_INVALID = 'رمز الاستعادة غير صحيح أو انتهت صلاحيته. اطلب رمزاً جديداً.';
 const RESERVED_EMAIL = 'هذا البريد محجوز لإدارة يوصل.';
+const BAD_MOBILE = 'اكتب رقم جوال سعودي بصيغة 05xxxxxxxx، أو اتركه فاضي.';
+const LOGIN_FIELDS_REQUIRED = 'اكتب بريدك أو رقم جوالك، والرقم السري.';
+const NAME_MAX = 80;
+const NAME_TOO_LONG = `الاسم طويل — اكتبه في ${NAME_MAX} حرفاً أو أقل.`;
 const ADMIN_CONTACT_INVALID = 'اكتب بريداً إلكترونياً صحيحاً ورقم جوال صحيحاً (9 أرقام على الأقل).';
 
 /** Shape check for contacts an admin types in; register already requires the same. */
@@ -356,6 +370,16 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   ensureOwnerAccount();
 
   /**
+   * The founder is the reserved address and, on a host bootstrapped from
+   * OWNER_EMAIL, that owner account too: both get the founder's locks (no edits
+   * by others, no email change, no delete).
+   */
+  const ownerEmail = normalizeEmail(env.OWNER_EMAIL || '');
+  function isFounderAccount(email: string | undefined): boolean {
+    return isFounderEmail(email) || (ownerEmail.includes('@') && normalizeEmail(email || '') === ownerEmail);
+  }
+
+  /**
    * The first admin, for a host with no shell to edit users.json on (Cloudflare).
    * With OWNER_EMAIL and OWNER_PASSWORD set, boot creates that admin — but only while
    * no admin exists, so a restart never resets a changed password, and the variables
@@ -402,12 +426,43 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     writeJson(usersFile(dataDir), users);
   }
 
-  function loadSessions(): Record<string, string> {
-    return readJson<Record<string, string>>(sessionsFile(dataDir), {});
+  function readSessionRows(): Record<string, SessionRow> {
+    return readJson<Record<string, SessionRow>>(sessionsFile(dataDir), {});
   }
 
-  function saveSessions(sessions: Record<string, string>) {
-    writeJson(sessionsFile(dataDir), sessions);
+  /** Live sessions only, as token → user id. */
+  function loadSessions(): Record<string, string> {
+    const nowMs = Date.now();
+    const out: Record<string, string> = {};
+    for (const [token, row] of Object.entries(readSessionRows())) {
+      const userId = sessionUserId(row);
+      if (userId && !sessionExpired(row, nowMs)) out[token] = userId;
+    }
+    return out;
+  }
+
+  /**
+   * Writes `sessions` (token → user id), keeping each surviving row's expiry.
+   * Tokens left out — and expired rows, which `loadSessions` never returned — are dropped.
+   */
+  function saveSessions(sessions: Record<string, string>, expiries: Record<string, number> = {}) {
+    const previous = readSessionRows();
+    const out: Record<string, SessionRow> = {};
+    for (const [token, userId] of Object.entries(sessions)) {
+      const before = previous[token];
+      const kept = before && typeof before === 'object' && before.userId === userId ? before.expiresAt : undefined;
+      const expiresAt = expiries[token] ?? kept;
+      out[token] = expiresAt ? { userId, expiresAt } : userId;
+    }
+    writeJson(sessionsFile(dataDir), out);
+  }
+
+  function addSession(userId: string, remember?: boolean): string {
+    const token = crypto.randomBytes(24).toString('hex');
+    const sessions = loadSessions();
+    sessions[token] = userId;
+    saveSessions(sessions, { [token]: Date.now() + sessionMaxAge(remember) * 1000 });
+    return token;
   }
 
   function pruneDeadAuthArtifacts() {
@@ -435,20 +490,31 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     }
     if (usersChanged) writeJson(usersFile(dataDir), users);
 
-    const sessions = loadSessions();
-    let removed = 0;
-    for (const [token, userId] of Object.entries(sessions)) {
+    // Expired rows go too, and a pre-expiry row gets one now.
+    const rows = readSessionRows();
+    const nowMs = Date.now();
+    const sessions: Record<string, string> = {};
+    const expiries: Record<string, number> = {};
+    let changed = false;
+    for (const [token, row] of Object.entries(rows)) {
+      const userId = sessionUserId(row);
       const dead =
         !token ||
         token.startsWith('diag') ||
         token.length < 16 ||
-        !ids.has(userId);
+        !ids.has(userId) ||
+        sessionExpired(row, nowMs);
       if (dead) {
-        delete sessions[token];
-        removed += 1;
+        changed = true;
+        continue;
+      }
+      sessions[token] = userId;
+      if (typeof row === 'string') {
+        expiries[token] = nowMs + LEGACY_SESSION_TTL_MS;
+        changed = true;
       }
     }
-    if (removed) saveSessions(sessions);
+    if (changed) saveSessions(sessions, expiries);
   }
 
   pruneDeadAuthArtifacts();
@@ -506,24 +572,27 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
 
   async function loginHandler(req: Request, res: Response) {
     try {
-      const email = normalizeEmail(req.body?.email || req.body?.identifier);
+      // The identifier is an email, or a Saudi mobile in any common form (05…, +966…, 00966…).
+      const identifier = String(req.body?.email || req.body?.identifier || '').trim();
+      const byPhone = identifier.includes('@') ? null : normalizeSaudiMobile(normalizePhone(identifier));
+      const email = byPhone ? '' : normalizeEmail(identifier);
+      const key = byPhone || email;
       const phone = normalizePhone(req.body?.phone || '');
       const password = String(req.body?.password || '');
       if (
-        !loginLimiter.allow(`${clientIp(req)}:${email}`) ||
-        (email && !loginAccountLimiter.allow(email))
+        !loginLimiter.allow(`${clientIp(req)}:${key}`) ||
+        (key && !loginAccountLimiter.allow(key))
       ) {
         return res.status(429).json({ success: false, error: LOGIN_RATE_LIMIT });
       }
-      if (!email || !password) {
-        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
-      }
-      if (!phone && !email.includes('@')) {
-        return res.status(400).json({ success: false, error: 'البريد والرقم السري مطلوبان.' });
+      if (!key || !password || (!byPhone && !email.includes('@'))) {
+        return res.status(400).json({ success: false, error: LOGIN_FIELDS_REQUIRED });
       }
 
       const users = loadUsers();
-      const user = users.find((item) => item.email === email);
+      const user = byPhone
+        ? users.find((item) => item.phone && normalizePhone(item.phone) === byPhone)
+        : users.find((item) => item.email === email);
       if (!user) {
         const application = readJson<{ status?: string; email?: string; passwordHash?: string }[]>(
           path.join(dataDir, 'vendor-applications.json'),
@@ -552,8 +621,8 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       }
 
       // Only failures count: a person signing in often must never lock themselves out.
-      loginLimiter.reset(`${clientIp(req)}:${email}`);
-      loginAccountLimiter.reset(email);
+      loginLimiter.reset(`${clientIp(req)}:${key}`);
+      loginAccountLimiter.reset(key);
       startSession(res, user.id, parseRemember(req.body?.remember));
       const published = publicUser(user);
       const verification = needsEmailVerification(published) ? await loginVerification(req, user, users) : {};
@@ -573,11 +642,19 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       const email = normalizeEmail(req.body?.email || req.body?.identifier);
       // The mobile is optional for a customer account; an email-shaped identifier is never a phone.
       const identifier = String(req.body?.identifier || '');
-      const phone = normalizePhone(req.body?.phone || (identifier.includes('@') ? '' : identifier));
+      const rawPhone = normalizePhone(req.body?.phone || (identifier.includes('@') ? '' : identifier));
       const password = String(req.body?.password || '');
-      const name = String(req.body?.name || '').trim();
+      const name = String(req.body?.name || '').replace(/\s+/g, ' ').trim();
       if (!email || !password || !name) {
         return res.status(400).json({ success: false, error: 'الاسم والبريد والرقم السري مطلوبة.' });
+      }
+      if (name.length > NAME_MAX) {
+        return res.status(400).json({ success: false, error: NAME_TOO_LONG });
+      }
+      // Optional, but when given it is a Saudi mobile: the vendor has to be able to call it.
+      const phone = rawPhone ? normalizeSaudiMobile(rawPhone) : '';
+      if (phone === null) {
+        return res.status(400).json({ success: false, error: BAD_MOBILE });
       }
       if (!isPlausibleContact(email, phone || '000000000')) {
         return res.status(400).json({ success: false, error: ADMIN_CONTACT_INVALID });
@@ -616,10 +693,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       users.push(user);
       saveUsers(users);
 
-      const token = crypto.randomBytes(24).toString('hex');
-      const sessions = loadSessions();
-      sessions[token] = user.id;
-      saveSessions(sessions);
+      const token = addSession(user.id);
       setSessionCookie(res, token);
       const emailSent = await sendVerificationEmail(user.email, issued.code, issued.token);
       res.status(201).json({
@@ -748,7 +822,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
       return res.status(403).json({ success: false, error: PRIVILEGED_ONLY });
     }
     const isSelf = user.id === actor.id;
-    const founder = isFounderEmail(user.email);
+    const founder = isFounderAccount(user.email);
     // Nobody else edits the founder at all: a field-by-field lock kept leaving
     // gaps (name, avatar, the verified flag) for another admin to deface.
     if (founder && !isSelf) {
@@ -765,7 +839,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     if (founder && emailChanges) {
       return res.status(403).json({ success: false, error: FOUNDER_LOCKED });
     }
-    if (!founder && emailChanges && isFounderEmail(nextEmail)) {
+    if (!founder && emailChanges && isFounderAccount(nextEmail)) {
       return res.status(409).json({ success: false, error: RESERVED_EMAIL });
     }
 
@@ -820,10 +894,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
   }
 
   function startSession(res: Response, userId: string, remember?: boolean) {
-    const token = crypto.randomBytes(24).toString('hex');
-    const sessions = loadSessions();
-    sessions[token] = userId;
-    saveSessions(sessions);
+    const token = addSession(userId, remember);
     setSessionCookie(res, token, remember);
     return token;
   }
@@ -964,7 +1035,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     const users = loadUsers();
     const user = users.find((item) => item.id === id);
     if (!user) return res.status(404).json({ success: false, error: 'الحساب غير موجود.' });
-    if (isFounderEmail(user.email)) {
+    if (isFounderAccount(user.email)) {
       return res.status(400).json({ success: false, error: 'لا يمكن حذف حساب الإدارة الرئيسي.' });
     }
     if (!actorMayTouchRole(actor, user.role)) {
@@ -1122,6 +1193,57 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     res.json({ success: true, user: publicUser(user) });
   }
 
+  /**
+   * PATCH /api/auth/me — the signed-in person edits their own name, mobile and
+   * password. Email and role are not editable here: the email is the verified
+   * identity, and roles belong to admins.
+   */
+  function updateProfileHandler(req: Request, res: Response) {
+    const actor = userFromRequest(req);
+    if (!actor) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    const users = loadUsers();
+    const user = users.find((item) => item.id === actor.id);
+    if (!user) return res.status(404).json({ success: false, error: 'الحساب غير موجود.' });
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+
+    if (body.name !== undefined) {
+      const name = String(body.name || '').replace(/\s+/g, ' ').trim();
+      if (!name) return res.status(400).json({ success: false, error: 'اكتب اسمك.' });
+      if (name.length > NAME_MAX) return res.status(400).json({ success: false, error: NAME_TOO_LONG });
+      user.name = name;
+    }
+    if (body.phone !== undefined) {
+      const raw = normalizePhone(String(body.phone || ''));
+      const phone = raw ? normalizeSaudiMobile(raw) : '';
+      if (phone === null) return res.status(400).json({ success: false, error: BAD_MOBILE });
+      if (phone && users.some((item) => item.id !== user.id && normalizePhone(item.phone) === phone)) {
+        return res.status(409).json({ success: false, error: 'رقم الجوال مسجّل مسبقاً.' });
+      }
+      user.phone = phone;
+    }
+    let passwordChanged = false;
+    if (body.newPassword !== undefined) {
+      const next = String(body.newPassword || '');
+      if (!verifyPassword(String(body.currentPassword || ''), user.passwordHash)) {
+        return res.status(403).json({ success: false, error: 'الرقم السري الحالي غير صحيح.' });
+      }
+      if (next.length < PASSWORD_MIN_LENGTH) return res.status(400).json({ success: false, error: WEAK_PASSWORD });
+      user.passwordHash = hashPassword(next);
+      passwordChanged = true;
+    }
+    saveUsers(users);
+    // A new password signs out every other device; this one stays signed in.
+    if (passwordChanged) {
+      const current = parseCookies(req)[COOKIE];
+      const sessions = loadSessions();
+      for (const [token, id] of Object.entries(sessions)) {
+        if (id === user.id && token !== current) delete sessions[token];
+      }
+      saveSessions(sessions);
+    }
+    res.json({ success: true, user: publicUser(user) });
+  }
+
   /** `{ user }` only when the request's own session is that account. */
   function ownUserOnly(req: Request, user: StoredUser): { user?: PublicUser } {
     return userFromRequest(req)?.id === user.id ? { user: publicUser(user) } : {};
@@ -1276,6 +1398,7 @@ export function createAuth(dataDir: string, env: NodeJS.ProcessEnv = process.env
     listVendorUsers,
     listUsersByRole,
     avatarHandler,
+    updateProfileHandler,
     forgotPasswordHandler,
     resetPasswordHandler,
     verifyEmailHandler,

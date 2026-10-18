@@ -39,6 +39,8 @@ export type BookingCancellation = {
   /** When the refund was confirmed (`refundStatus: 'refunded'`). */
   refundedAt?: string;
   note: string;
+  /** Why the vendor or admin ended it, in their words — shown to the client. */
+  reason?: string;
 };
 
 /**

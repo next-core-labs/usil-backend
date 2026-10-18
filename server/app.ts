@@ -10,6 +10,7 @@ import { registerBookingRoutes } from './bookings/booking-routes.ts';
 import { registerChatRoutes } from './chat/chat-routes.ts';
 import { registerExternalBookingRoutes, type CourierOption } from './bookings/external-booking-routes.ts';
 import { registerCityRequestRoutes } from './cities/city-request-routes.ts';
+import { registerVendorLeadRoutes } from './leads/vendor-lead-routes.ts';
 import { registerCourierApplicationRoutes } from './couriers/courier-application-routes.ts';
 import { registerLegacyRoutes } from './legacy-routes.ts';
 import { registerMoyasarAdminRoutes } from './payments/moyasar-admin-routes.ts';
@@ -20,6 +21,8 @@ import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerTrendingRoutes } from './catalog/trending-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
 import { registerVendorRoutes } from './vendors/vendor-routes.ts';
+import { registerWhatsAppRoutes } from './whatsapp/whatsapp-routes.ts';
+import { captureWhatsAppRawBody } from './whatsapp/whatsapp-webhook.ts';
 import { SERVICES as CATALOG_SERVICES } from '../core/data/services.ts';
 import { listApprovedCatalogServices, publicVendorAccounts, serviceSeoFrom } from './shared/approved-catalog.ts';
 import { isKnownSpaPath } from '../core/utils/siteRoutes.ts';
@@ -60,7 +63,8 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
   app.use(expireLegacySessionCookie);
 
   // Product images travel as base64 data URLs, so the cap must clear 5MB × ~1.37 overhead.
-  app.use(express.json({ limit: '16mb' }));
+  // The WhatsApp webhook also keeps its raw bytes: Meta signs those, not the parsed JSON.
+  app.use(express.json({ limit: '16mb', verify: captureWhatsAppRawBody }));
 
   // ─── Startup ───
   applyMoyasarRuntime(DATA_DIR);
@@ -76,10 +80,12 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
 
   const { ai: aiRouter } = registerIntegrationsRoutes(app, auth, DATA_DIR);
   registerMoyasarAdminRoutes(app, auth, DATA_DIR);
+  registerWhatsAppRoutes(app, auth, DATA_DIR);
   registerGeminiRoutes(app, { ai: aiRouter, dataDir: DATA_DIR, listVendorUsers: () => auth.listVendorUsers() });
 
   registerSupportRoutes(app, auth, DATA_DIR);
   registerCityRequestRoutes(app, auth, DATA_DIR);
+  registerVendorLeadRoutes(app, auth, DATA_DIR);
 
   const vendorStore = registerVendorRoutes(app, auth, DATA_DIR);
   vendorStore.stripCatalogClonedListings(

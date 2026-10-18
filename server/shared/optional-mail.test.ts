@@ -5,6 +5,7 @@ import {
   notifyBookingRejected,
   notifyVendorApplicationDecision,
   notifyVendorNewOrder,
+  vendorConsoleOrdersUrl,
   sendPasswordResetEmail,
   sendVerificationEmail,
   setMailFetchForTests,
@@ -116,6 +117,27 @@ describe('optional mail over Resend', () => {
     assert.match(sent[1].body.subject, /موافقتك/);
     assert.match(sent[2].body.subject, /مدفوع/);
     assert.match(sent[2].body.text, /BK-654321/);
+    // A vendor goes to the console's orders page, never the store.
+    assert.match(sent[1].body.text, /\/#\/orders/);
+    assert.match(sent[2].body.text, /\/#\/orders/);
+  });
+
+  it('links vendors to the console orders page: configured, local or live', () => {
+    const saved = { console: process.env.VENDOR_CONSOLE_URL, site: process.env.PUBLIC_SITE_URL };
+    try {
+      process.env.VENDOR_CONSOLE_URL = 'https://vendor.usil.app/';
+      assert.equal(vendorConsoleOrdersUrl(), 'https://vendor.usil.app/#/orders');
+      delete process.env.VENDOR_CONSOLE_URL;
+      process.env.PUBLIC_SITE_URL = 'http://localhost:3000';
+      assert.equal(vendorConsoleOrdersUrl(), 'http://127.0.0.1:5190/#/orders');
+      process.env.PUBLIC_SITE_URL = 'https://usil.app';
+      assert.equal(vendorConsoleOrdersUrl(), 'https://vendor.usil.app/#/orders');
+    } finally {
+      if (saved.console === undefined) delete process.env.VENDOR_CONSOLE_URL;
+      else process.env.VENDOR_CONSOLE_URL = saved.console;
+      if (saved.site === undefined) delete process.env.PUBLIC_SITE_URL;
+      else process.env.PUBLIC_SITE_URL = saved.site;
+    }
   });
 
   it('booking notices are a no-op without mail config', async () => {

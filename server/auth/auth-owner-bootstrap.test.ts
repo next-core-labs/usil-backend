@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import express from 'express';
 import { createAuth, hashPassword } from './auth.ts';
+import { registerAuthRoutes } from './auth-routes.ts';
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'usil-owner-'));
@@ -51,6 +52,50 @@ describe('owner bootstrap from OWNER_EMAIL / OWNER_PASSWORD', () => {
       });
       assert.equal(res.status, 200);
       assert.equal((await res.json()).user.role, 'admin');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('gives the OWNER_EMAIL account the founder locks against other admins', async () => {
+    const dir = tmpDir();
+    createAuth(dir, OWNER);
+    const users = readUsers(dir) as Array<Record<string, unknown>>;
+    const ownerId = String(users[0].id);
+    users.push({
+      id: 'usr-admin2',
+      name: 'مدير ثاني',
+      email: 'admin2@usil.com',
+      phone: '0512340000',
+      role: 'admin',
+      passwordHash: hashPassword('admin2-secret'),
+      avatarUrl: '',
+      emailVerified: true,
+    });
+    fs.writeFileSync(path.join(dir, 'users.json'), JSON.stringify(users));
+    const auth = createAuth(dir, OWNER);
+    const app = express();
+    app.use(express.json());
+    registerAuthRoutes(app, auth, dir);
+    const server = await listen(app);
+    try {
+      const login = await fetch(`${server.url}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ identifier: 'admin2@usil.com', password: 'admin2-secret' }),
+      });
+      assert.equal(login.status, 200);
+      const cookie = String(login.headers.get('set-cookie') || '').split(';')[0];
+      const send = (method: string, body?: unknown) =>
+        fetch(`${server.url}/api/admin/users/${ownerId}`, {
+          method,
+          headers: { 'content-type': 'application/json', cookie },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+      assert.equal((await send('PATCH', { email: 'moved@usil.com' })).status, 403);
+      assert.equal((await send('PATCH', { role: 'client' })).status, 403);
+      assert.equal((await send('DELETE')).status, 400);
+      assert.equal(readUsers(dir).find((row) => row.email === 'owner@usil.com')?.role, 'admin');
     } finally {
       await server.close();
     }

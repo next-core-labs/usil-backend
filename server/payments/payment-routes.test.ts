@@ -174,17 +174,26 @@ describe('POST /api/payments/invoice with a booking id', () => {
   it('refuses a paid or cancelled booking, and lets an admin invoice an open one', async () => {
     const dir = tmpDir();
     const store = createBookingStore(dir);
-    store.add(row({ id: 'BK-paid', paymentStatus: 'paid' }));
+    // The paid order is on another day: one listing serves one event per day.
+    store.add(row({ id: 'BK-paid', paymentStatus: 'paid', eventDate: '2026-12-02' }));
     store.add(row({ id: 'BK-cancelled', status: 'ملغي' }));
     store.add(row({ id: 'BK-open', totalAmount: 99.5 }));
+    // An old unpaid checkout whose day another customer has since paid for.
+    store.add(row({ id: 'BK-lost-day', eventDate: '2026-12-02' }));
     const { url, close } = await listen(buildApp(dir));
-    const req = (id: string, actor: string) =>
-      call(url, 'POST', '/api/payments/invoice', actor, { amount: 5, description: 'x', metadata: { bookingId: id } });
-    assert.equal((await req('BK-paid', 'owner')).status, 409);
-    assert.equal((await req('BK-cancelled', 'owner')).status, 409);
-    assert.equal((await req('BK-open', 'admin')).status, 200);
-    assert.equal(invoicesRaised[invoicesRaised.length - 1].amount, 9_950);
-    await close();
+    try {
+      const req = (id: string, actor: string) =>
+        call(url, 'POST', '/api/payments/invoice', actor, { amount: 5, description: 'x', metadata: { bookingId: id } });
+      assert.equal((await req('BK-paid', 'owner')).status, 409);
+      assert.equal((await req('BK-cancelled', 'owner')).status, 409);
+      assert.equal((await req('BK-open', 'admin')).status, 200);
+      assert.equal(invoicesRaised[invoicesRaised.length - 1].amount, 9_950);
+      const lost = await req('BK-lost-day', 'admin');
+      assert.equal(lost.status, 409);
+      assert.equal(lost.json.slotTaken, true);
+    } finally {
+      await close();
+    }
   });
 
   it('raises a free-amount invoice only for an admin', async () => {
