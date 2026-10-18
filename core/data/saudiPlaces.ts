@@ -211,17 +211,58 @@ export function isSaudiPlaceName(name: string): boolean {
   return byName.has(value);
 }
 
+/** Same folding as catalog search: «جده» finds «جدة», «ابحر» finds «أبحر». */
+function foldArabic(value: string): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\u064B-\u0652\u0640]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .trim();
+}
+
+/** Latin spellings people type for the main cities. */
+const LATIN_PLACE_NAMES: Record<string, string> = {
+  riyadh: 'الرياض',
+  jeddah: 'جدة',
+  jedda: 'جدة',
+  makkah: 'مكة المكرمة',
+  mecca: 'مكة المكرمة',
+  madinah: 'المدينة المنورة',
+  medina: 'المدينة المنورة',
+  dammam: 'الدمام',
+  khobar: 'الخبر',
+  dhahran: 'الظهران',
+  taif: 'الطائف',
+  abha: 'أبها',
+  tabuk: 'تبوك',
+  hail: 'حائل',
+  jazan: 'جازان',
+  najran: 'نجران',
+  qassim: 'القصيم',
+  buraidah: 'بريدة',
+  yanbu: 'ينبع',
+};
+
 export function searchPlaces(query: string, limit = 40): SaudiPlace[] {
-  const q = String(query || '').trim();
-  if (!q) return SAUDI_PLACES.slice(0, limit);
+  const raw = String(query || '').trim();
+  if (!raw) return SAUDI_PLACES.slice(0, limit);
+  const latin = Object.entries(LATIN_PLACE_NAMES).find(([key]) => key.startsWith(raw.toLowerCase()) && raw.length >= 3);
+  const q = foldArabic(latin ? latin[1] : raw);
   return SAUDI_PLACES.filter((place) => {
-    if (place.name.includes(q) || place.region.includes(q)) return true;
-    return (place.aliases || []).some((alias) => alias.includes(q));
+    if (foldArabic(place.name).includes(q) || foldArabic(place.region).includes(q)) return true;
+    return (place.aliases || []).some((alias) => foldArabic(alias).includes(q));
   }).slice(0, limit);
 }
 
+/**
+ * Names that mean the same place. The region is left out on purpose: whole-region
+ * coverage is matched explicitly, and two towns sharing a region (جدة and الطائف)
+ * are not the same place.
+ */
 function relatedNames(place: SaudiPlace): Set<string> {
-  const names = new Set<string>([place.name, place.region, ...(place.aliases || [])]);
+  const names = new Set<string>([place.name, ...(place.aliases || [])]);
   if (place.governorate) names.add(place.governorate);
   return names;
 }

@@ -137,7 +137,11 @@ function row(overrides: Partial<PlatformBooking> = {}): PlatformBooking {
   };
 }
 
-function buildApp(dir: string, blocked: Record<string, string[]> = {}) {
+function buildApp(
+  dir: string,
+  blocked: Record<string, string[]> = {},
+  vendorCalendar: Record<string, Array<{ id?: string; serviceId?: string; date?: string; status?: string }>> = {},
+) {
   const app = express();
   app.use(express.json());
   const userFromRequest = (req: express.Request) => ACTORS[String(req.headers['x-test-actor'] || '')] || null;
@@ -161,6 +165,7 @@ function buildApp(dir: string, blocked: Record<string, string[]> = {}) {
   registerBookingRoutes(app, auth, dir, {
     listListings: () => LISTINGS,
     blockedDatesFor: (vendorId) => (blocked[vendorId] || []).map((date) => ({ date })),
+    vendorBookingsFor: (vendorId) => vendorCalendar[vendorId] || [],
     now: () => NOW,
   });
   return app;
@@ -502,7 +507,8 @@ describe('POST /api/bookings — server-side pricing and checks', () => {
       assert.equal(own.status, 201);
       assert.equal(own.json.booking.email, 'client@usil.sa');
 
-      const fresh = await call(url, 'POST', '/api/bookings', '', { ...checkout, email: 'new.guest@usil.sa' });
+      // Another day: the client's order already holds 2026-10-10 for this listing.
+      const fresh = await call(url, 'POST', '/api/bookings', '', { ...checkout, eventDate: '2026-10-12', email: 'new.guest@usil.sa' });
       assert.equal(fresh.status, 201);
     } finally {
       await close();
@@ -530,8 +536,11 @@ describe('POST /api/bookings — server-side pricing and checks', () => {
     const blocked = await call(url, 'POST', '/api/bookings', '', checkout);
     assert.equal(blocked.status, 409);
     assert.match(blocked.json.error, /مغلق/);
-    // Today is still bookable.
-    assert.equal((await call(url, 'POST', '/api/bookings', '', { ...checkout, eventDate: '2026-09-24' })).status, 201);
+    // A «قبل يوم للتجهيز» listing can't be booked for today; tomorrow is fine.
+    const today = await call(url, 'POST', '/api/bookings', '', { ...checkout, eventDate: '2026-09-24' });
+    assert.equal(today.status, 409);
+    assert.match(today.json.error, /يوماً للتجهيز/);
+    assert.equal((await call(url, 'POST', '/api/bookings', '', { ...checkout, eventDate: '2026-09-25' })).status, 201);
     await close();
   });
 
@@ -562,10 +571,13 @@ describe('POST /api/bookings — server-side pricing and checks', () => {
     assert.equal(again.json.duplicate, true);
     assert.equal(again.json.booking.id, first.json.booking.id);
 
-    const guest = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0561111111' });
+    // A guest on a free day (the client holds 2026-10-10); their double tap is caught too.
+    const guestOrder = { ...checkout, phone: '0561111111', eventDate: '2026-10-12' };
+    const guest = await call(url, 'POST', '/api/bookings', '', guestOrder);
     assert.equal(guest.status, 201);
-    const guestAgain = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0561111111' });
+    const guestAgain = await call(url, 'POST', '/api/bookings', '', guestOrder);
     assert.equal(guestAgain.status, 409);
+    assert.equal(guestAgain.json.duplicate, true);
 
     // A different date is a different order.
     const other = await call(url, 'POST', '/api/bookings', 'client', { ...checkout, eventDate: '2026-10-11' });
@@ -641,14 +653,31 @@ describe('POST /api/bookings — field shapes', () => {
         ...checkout,
         name: `  ${'ن'.repeat(300)}  `,
         notes: 'م'.repeat(5000),
-        city: `  ${'ر'.repeat(200)}`,
+        city: '  الرياض  ',
       });
       assert.equal(res.status, 201, JSON.stringify(res.json));
       const stored = createBookingStore(dir).findById(res.json.booking.id)!;
       assert.equal(stored.name.length, 100);
       assert.equal(stored.notes.length, 1000);
-      assert.equal(stored.city.length, 80);
+      assert.equal(stored.city, 'الرياض');
       assert.equal(typeof stored.email, 'string');
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('POST /api/bookings — where the event is', () => {
+  it('refuses a made-up city and a city the listing does not serve', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const fake = await call(url, 'POST', '/api/bookings', '', { ...checkout, city: 'مدينة وهمية' });
+      assert.equal(fake.status, 400);
+      const outside = await call(url, 'POST', '/api/bookings', '', { ...checkout, city: 'جدة' });
+      assert.equal(outside.status, 409);
+      assert.match(outside.json.error, /ما يخدم جدة/);
+      assert.equal(createBookingStore(dir).count(), 0);
     } finally {
       await close();
     }
@@ -663,9 +692,17 @@ describe('POST /api/bookings — duplicate check needs the same buyer', () => {
       // A guest types the client's phone and an email of their own.
       const squat = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0512345678', email: 'x@evil.sa' });
       assert.equal(squat.status, 201);
+      // Same listing and day: the date is the guest's now. The client is told it's taken,
+      // never handed the stranger's order as if it were their own.
       const mine = await call(url, 'POST', '/api/bookings', 'client', { ...checkout, phone: '0512345678' });
-      assert.equal(mine.status, 201, JSON.stringify(mine.json));
-      assert.notEqual(mine.json.booking.id, squat.json.booking.id);
+      assert.equal(mine.status, 409, JSON.stringify(mine.json));
+      assert.equal(mine.json.slotTaken, true);
+      assert.equal(mine.json.duplicate, undefined);
+      assert.equal(mine.json.booking, undefined);
+      // Another day is free for the client.
+      const otherDay = await call(url, 'POST', '/api/bookings', 'client', { ...checkout, phone: '0512345678', eventDate: '2026-10-12' });
+      assert.equal(otherDay.status, 201, JSON.stringify(otherDay.json));
+      assert.notEqual(otherDay.json.booking.id, squat.json.booking.id);
       // The guest's own repeat is still caught.
       const again = await call(url, 'POST', '/api/bookings', '', { ...checkout, phone: '0512345678', email: 'x@evil.sa' });
       assert.equal(again.status, 409);
@@ -789,10 +826,15 @@ describe('PATCH /api/bookings/:id — ending a paid order', () => {
     seed(dir, [row({ id: 'BK-unpaid', status: 'بانتظار موافقة المورّد' })]);
     const { url, close } = await listen(buildApp(dir));
     try {
-      const res = await call(url, 'PATCH', '/api/bookings/BK-unpaid', 'vendor1', { status: 'مرفوض من المورّد' });
+      const res = await call(url, 'PATCH', '/api/bookings/BK-unpaid', 'vendor1', {
+        status: 'مرفوض من المورّد',
+        reason: '  فريق التصوير محجوز   يوم 19 نوفمبر ',
+      });
       assert.equal(res.status, 200);
       assert.equal(res.json.booking.cancellation.cancelledBy, 'vendor');
       assert.equal(res.json.booking.cancellation.refundStatus, 'not_applicable');
+      assert.equal(res.json.booking.cancellation.reason, 'فريق التصوير محجوز يوم 19 نوفمبر');
+      assert.match(res.json.booking.cancellation.note, /رفضه المورّد/);
     } finally {
       await close();
     }
@@ -906,7 +948,7 @@ describe('POST /api/bookings — event time, minimum quantity, duplicates', () =
       });
 
       // Guest with an email: the stored-row match, same 409 shape.
-      const emailGuest = { ...checkout, phone: '0563333333', email: 'walkin@usil.sa' };
+      const emailGuest = { ...checkout, phone: '0563333333', email: 'walkin@usil.sa', eventDate: '2026-10-13' };
       const firstEmail = await call(url, 'POST', '/api/bookings', '', emailGuest);
       const emailAgain = await call(url, 'POST', '/api/bookings', '', emailGuest);
       assert.equal(emailAgain.status, 409);
@@ -1125,6 +1167,190 @@ describe('DELETE /api/bookings/:id — owner admin, no money on the order', () =
       assert.equal((await call(url, 'DELETE', '/api/bookings/BK-dup', 'admin')).status, 409);
       assert.equal((await call(url, 'DELETE', '/api/bookings/BK-free', 'admin')).status, 200);
       assert.deepEqual(createBookingStore(dir).list().map((b) => b.id).sort(), ['BK-dup', 'BK-paid']);
+    } finally {
+      await close();
+    }
+  });
+});
+
+describe('one event per listing per day — date reservation', () => {
+  const D = '2026-10-16';
+  const order = { ...checkout, eventDate: D, items: [{ id: 'lst-coffee', quantity: 1 }] };
+
+  it("refuses a second order for a listing's taken date, from anyone", async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const first = await call(url, 'POST', '/api/bookings', 'client', order);
+      assert.equal(first.status, 201);
+      // A stranger, same listing and day.
+      const stranger = await call(url, 'POST', '/api/bookings', '', { ...order, phone: '0569999999', email: 'other@usil.sa' });
+      assert.equal(stranger.status, 409);
+      assert.equal(stranger.json.slotTaken, true);
+      assert.equal(stranger.json.booking, undefined);
+      // The same customer again with another quantity or time: their own order is pointed out.
+      const mineAgain = await call(url, 'POST', '/api/bookings', 'client', { ...order, items: [{ id: 'lst-coffee', quantity: 3 }], eventTime: '20:00' });
+      assert.equal(mineAgain.status, 409);
+      assert.equal(mineAgain.json.slotTaken, true);
+      assert.equal(mineAgain.json.booking.id, first.json.booking.id);
+      assert.match(mineAgain.json.error, /طلباتي/);
+      assert.equal(createBookingStore(dir).count(), 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it('leaves other listings and other days free', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      assert.equal((await call(url, 'POST', '/api/bookings', 'client', order)).status, 201);
+      // Same vendor, another listing, same day.
+      const sweets = await call(url, 'POST', '/api/bookings', 'client', { ...order, items: [{ id: 'lst-sweets', quantity: 1 }] });
+      assert.equal(sweets.status, 201);
+      // Another vendor, same day.
+      assert.equal((await call(url, 'POST', '/api/bookings', '', { ...order, phone: '0567777777', items: [{ id: 'lst-tent', quantity: 1 }] })).status, 201);
+      // Same listing, next day.
+      assert.equal((await call(url, 'POST', '/api/bookings', '', { ...order, phone: '0568888888', eventDate: '2026-10-17' })).status, 201);
+    } finally {
+      await close();
+    }
+  });
+
+  it('a cart is refused whole when any of its listings is taken that day', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      assert.equal((await call(url, 'POST', '/api/bookings', '', { ...order, items: [{ id: 'lst-tent', quantity: 1 }] })).status, 201);
+      const cart = await call(url, 'POST', '/api/bookings', 'client', {
+        ...order,
+        items: [
+          { id: 'lst-coffee', quantity: 1 },
+          { id: 'lst-tent', quantity: 1 },
+        ],
+      });
+      assert.equal(cart.status, 409);
+      assert.equal(cart.json.listingId, 'lst-tent');
+      assert.equal(createBookingStore(dir).count(), 1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("holds the date for orders approved, paid or in progress — not cancelled, rejected or someone else's waiting request", async () => {
+    const holding = [
+      { status: 'مؤكد', bookingMode: 'approval' as const },
+      { status: 'مؤكد', paymentStatus: 'paid' as const },
+      { status: 'قيد التنفيذ', paymentStatus: 'paid' as const },
+    ];
+    for (const extra of holding) {
+      const dir = tmpDir();
+      seed(dir, [row({ id: 'BK-held', eventDate: D, createdAt: '2026-09-01 10:00', ...extra })]);
+      const { url, close } = await listen(buildApp(dir));
+      try {
+        const res = await call(url, 'POST', '/api/bookings', 'client', order);
+        assert.equal(res.status, 409, JSON.stringify(extra));
+      } finally {
+        await close();
+      }
+    }
+    const free = [
+      { status: 'ملغي', paymentStatus: 'paid' as const },
+      { status: 'مرفوض من المورّد', paymentStatus: 'paid' as const },
+      { status: 'بانتظار موافقة المورّد', bookingMode: 'approval' as const },
+    ];
+    for (const { status, ...extra } of free) {
+      const dir = tmpDir();
+      seed(dir, [row({ id: 'BK-ended', eventDate: D, status, ...extra })]);
+      const { url, close } = await listen(buildApp(dir));
+      try {
+        assert.equal((await call(url, 'POST', '/api/bookings', 'client', order)).status, 201, status);
+      } finally {
+        await close();
+      }
+    }
+  });
+
+  it('an abandoned checkout stops holding the date, and lapses when someone else books it', async () => {
+    const dir = tmpDir();
+    // Unpaid instant order placed days ago (NOW is 2026-09-24): past its payment window.
+    seed(dir, [row({ id: 'BK-stale', eventDate: D, createdAt: '2026-09-20 10:00', moyasarInvoiceId: 'inv_stale01', paymentUrl: 'https://checkout.moyasar.com/invoices/inv_stale01', email: 'gone@usil.sa', phone: '0560000000', userId: undefined })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const res = await call(url, 'POST', '/api/bookings', 'client', order);
+      assert.equal(res.status, 201);
+      const stale = createBookingStore(dir).findById('BK-stale');
+      assert.equal(stale?.status, 'ملغي');
+      assert.equal(stale?.cancellation?.refundStatus, 'not_applicable');
+      await waitFor(() => cancelledInvoices.includes('inv_stale01'));
+    } finally {
+      await close();
+    }
+  });
+
+  it("honours bookings the vendor recorded in their own calendar", async () => {
+    const dir = tmpDir();
+    const calendar = { 'v-1': [{ id: 'vb-1', serviceId: 'lst-coffee', date: D, status: 'confirmed' }, { id: 'vb-2', serviceId: 'lst-coffee', date: '2026-10-18', status: 'cancelled' }] };
+    const { url, close } = await listen(buildApp(dir, {}, calendar));
+    try {
+      const taken = await call(url, 'POST', '/api/bookings', 'client', order);
+      assert.equal(taken.status, 409);
+      assert.equal(taken.json.slotTaken, true);
+      assert.equal((await call(url, 'POST', '/api/bookings', 'client', { ...order, eventDate: '2026-10-18' })).status, 201);
+    } finally {
+      await close();
+    }
+  });
+
+  it("lets others request a date while someone else's request is still waiting on the vendor", async () => {
+    const dir = tmpDir();
+    const waiting = { bookingMode: 'approval' as const, status: 'بانتظار موافقة المورّد', serviceId: 'lst-coffee', items: [{ id: 'lst-coffee', title: 'ركن قهوة', quantity: 1, price: 500, vendorId: 'v-1' }], eventDate: D };
+    seed(dir, [row({ id: 'BK-waiting', ...waiting, userId: 'u-someone', email: 'someone@usil.sa', phone: '0561231234' })]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const mine = await call(url, 'POST', '/api/bookings', 'client', order);
+      assert.equal(mine.status, 201, JSON.stringify(mine.json));
+    } finally {
+      await close();
+    }
+  });
+
+  it('approving needs the date free; of two orders waiting on it, the vendor approves one', async () => {
+    const dir = tmpDir();
+    const waiting = { bookingMode: 'approval' as const, status: 'بانتظار موافقة المورّد', serviceId: 'lst-sweets', items: [{ id: 'lst-sweets', title: 'حلويات', quantity: 1, price: 120.5, vendorId: 'v-1' }], eventDate: D };
+    seed(dir, [
+      row({ id: 'BK-w1', ...waiting }),
+      row({ id: 'BK-w2', ...waiting, email: 'b@usil.sa', phone: '0561231234' }),
+      row({ id: 'BK-w3', ...waiting, eventDate: '2026-10-19' }),
+      row({ id: 'BK-paid', serviceId: 'lst-sweets', items: waiting.items, eventDate: '2026-10-19', status: 'مؤكد', paymentStatus: 'paid' }),
+    ]);
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      assert.equal((await call(url, 'PATCH', '/api/bookings/BK-w1', 'vendor1', { status: 'مؤكد' })).status, 200);
+      // The date is now promised to BK-w1's customer.
+      const second = await call(url, 'PATCH', '/api/bookings/BK-w2', 'vendor1', { status: 'مؤكد' });
+      assert.equal(second.status, 409);
+      assert.equal(second.json.slotTaken, true);
+      // Rejecting it is still allowed.
+      assert.equal((await call(url, 'PATCH', '/api/bookings/BK-w2', 'vendor1', { status: 'مرفوض من المورّد' })).status, 200);
+      // A paid order already has 2026-10-19.
+      assert.equal((await call(url, 'PATCH', '/api/bookings/BK-w3', 'vendor1', { status: 'مؤكد' })).status, 409);
+    } finally {
+      await close();
+    }
+  });
+
+  it('two buyers racing for the same date: only one order is stored', async () => {
+    const dir = tmpDir();
+    const { url, close } = await listen(buildApp(dir));
+    try {
+      const results = await Promise.all(
+        ['0561000001', '0561000002', '0561000003', '0561000004'].map((phone) =>
+          call(url, 'POST', '/api/bookings', '', { ...order, phone, email: `${phone}@usil.sa` }),
+        ),
+      );
+      assert.equal(results.filter((r) => r.status === 201).length, 1, JSON.stringify(results.map((r) => r.status)));
+      assert.equal(createBookingStore(dir).count(), 1);
     } finally {
       await close();
     }

@@ -6,6 +6,7 @@ import {
   BOOKING_IN_PROGRESS_STATUS,
   CANCELLING_BOOKING_STATUSES,
   CLOSED_BOOKING_STATUSES,
+  bookedListingIds,
   bookingRefundPending,
   bookingTotalHalalas,
   checkStatusTransition,
@@ -29,10 +30,18 @@ import {
 import {
   BOOKING_NEW_STATUS,
   BOOKING_PENDING_APPROVAL_STATUS,
+  BOOKING_REJECTED_STATUS,
 } from '../vendors/vendor-listings.ts';
 import { createVendorStore } from '../vendors/vendor-store.ts';
 import { MOYASAR_NOT_CONFIGURED, cancelMoyasarInvoice, createMoyasarInvoice } from '../payments/moyasar.ts';
+import {
+  findSlotConflict,
+  staleCheckoutsOn,
+  type SlotConflict,
+  type VendorCalendarBooking,
+} from './slot-holds.ts';
 import { isIsoDate, quoteBooking, riyadhToday, type PricedListing } from './booking-pricing.ts';
+import { cityFilterMatches, isSaudiPlaceName } from '../../core/data/saudiPlaces.ts';
 import { notifyBookingApproved, notifyBookingRejected, notifyVendorNewOrder } from '../shared/optional-mail.ts';
 
 export type BookingActor = { id: string; role: string; email?: string; phone?: string; emailVerified?: boolean };
@@ -63,6 +72,8 @@ type Deps = {
   approvedVendorIds?: () => Iterable<string>;
   /** Defaults to reading the vendor workspace (read-only). */
   blockedDatesFor?: (vendorId: string) => Array<{ date: string }>;
+  /** Bookings the vendor recorded in their calendar; they hold a listing's date too. */
+  vendorBookingsFor?: (vendorId: string) => VendorCalendarBooking[];
   now?: () => Date;
 };
 
@@ -70,6 +81,8 @@ type Deps = {
 export type BookingService = BookingStore & {
   actorFromRequest: (req: Request) => BookingActor | null;
   canRead: (actor: BookingActor | null, booking: PlatformBooking) => boolean;
+  /** Another live booking holding this order's listings on its date (`null` = the date is its own). */
+  slotConflictFor: (booking: PlatformBooking) => SlotConflict | null;
 };
 
 const BOOKING_LIMIT = 10;
@@ -87,6 +100,17 @@ const COURIER_NO_ORDERS = 'المندوب يرى حجوزاته الخارجية
 const BAD_EVENT_DATE = 'اختر تاريخ المناسبة بصيغة صحيحة (YYYY-MM-DD).';
 const PAST_EVENT_DATE = 'تاريخ المناسبة مضى. اختر تاريخاً من اليوم فصاعداً.';
 const BLOCKED_EVENT_DATE = 'المورّد مغلق في هذا التاريخ. اختر تاريخاً آخر.';
+/** Longest rejection or cancellation reason kept on an order. */
+const REASON_MAX = 300;
+const BAD_EVENT_CITY = 'اختر مدينة المناسبة من القائمة.';
+const outOfCoverage = (title: string, city: string) =>
+  `«${title}» ما يخدم ${city}. اختر مدينة يغطيها المورّد أو منتجاً آخر.`;
+const tooSoon = (title: string) => `«${title}» يحتاج يوماً للتجهيز. اختر تاريخاً من بكرة فصاعداً.`;
+export const SLOT_TAKEN = 'هذا المنتج محجوز في التاريخ المختار. اختر تاريخاً آخر.';
+const SLOT_TAKEN_OWN = 'عندك طلب على هذا المنتج في نفس التاريخ. تابعه أو ألغه من «طلباتي» قبل طلب جديد.';
+const SLOT_BUSY = 'يتم حجز هذا التاريخ الآن لطلب آخر. حاول بعد لحظات.';
+export const SLOT_TAKEN_CONFIRM = 'هذا المنتج محجوز لطلب آخر في نفس التاريخ. ارفض هذا الطلب أو غيّر التاريخ مع العميل.';
+const STALE_CHECKOUT_NOTE = 'انتهت مهلة الدفع وحُجز التاريخ لطلب آخر.';
 const PRICE_CHANGED =
   'تغيّر سعر السلة عن المعروض. حدّث الصفحة وراجع الإجمالي قبل الدفع.';
 const DUPLICATE_ORDER =
@@ -281,6 +305,66 @@ export function registerBookingRoutes(
     );
   const blockedDatesFor = (vendorId: string) =>
     deps.blockedDatesFor ? deps.blockedDatesFor(vendorId) : vendorStore.getWorkspace(vendorId).blockedDates;
+  const vendorBookingsFor = (vendorId: string): VendorCalendarBooking[] =>
+    deps.vendorBookingsFor ? deps.vendorBookingsFor(vendorId) : vendorStore.getWorkspace(vendorId).bookings;
+
+  /** Live bookings already holding any of these listings on `date` (see slot-holds.ts). */
+  function slotConflict(
+    listingIds: string[],
+    vendorIds: string[],
+    date: string,
+    excludeId?: string,
+    ignoreOrder?: (row: PlatformBooking) => boolean,
+  ): SlotConflict | null {
+    return findSlotConflict({
+      listingIds,
+      date,
+      orders: store.list(),
+      vendorBookings: vendorIds.flatMap((vendorId) => vendorBookingsFor(vendorId)),
+      excludeId,
+      ignoreOrder,
+      nowMs: now().getTime(),
+    });
+  }
+  /** An order the vendor already accepted outranks others still waiting on the vendor. */
+  const slotConflictFor = (booking: PlatformBooking) =>
+    slotConflict(
+      bookedListingIds(booking),
+      (booking.vendorIds || []).map(String),
+      booking.eventDate,
+      booking.id,
+      booking.status === BOOKING_NEW_STATUS || booking.status === BOOKING_PENDING_APPROVAL_STATUS
+        ? undefined
+        : (row) => row.status === BOOKING_PENDING_APPROVAL_STATUS,
+    );
+  /** listing#date pairs a checkout is taking right now, so two buyers can't both pass the check. */
+  const slotsInFlight = new Set<string>();
+
+  /**
+   * A new order took a date that an abandoned checkout (unpaid past its window)
+   * still sat on: end that checkout and close its invoice, so the old pay link
+   * can't later sell the same date a second time.
+   */
+  function lapseStaleCheckouts(booking: PlatformBooking) {
+    const stale = staleCheckoutsOn({
+      listingIds: bookedListingIds(booking),
+      date: booking.eventDate,
+      orders: store.list(),
+      nowMs: now().getTime(),
+    });
+    for (const row of stale) {
+      if (row.id === booking.id) continue;
+      const ended = store.cancel(row.id, {
+        cancelledAt: now().toISOString(),
+        cancelledBy: 'admin',
+        refundPercent: 0,
+        refundHalalas: 0,
+        refundStatus: 'not_applicable',
+        note: STALE_CHECKOUT_NOTE,
+      });
+      if (ended) cancelUnpaidInvoice(ended);
+    }
+  }
   const ownListingIds = (vendorId: string): Set<string> =>
     new Set(
       deps
@@ -397,14 +481,34 @@ export function registerBookingRoutes(
       return res.status(400).json({ success: false, error: PAST_EVENT_DATE });
     }
 
+    if (!isSaudiPlaceName(city)) {
+      return res.status(400).json({ success: false, error: BAD_EVENT_CITY });
+    }
+
+    const listings = deps.listListings();
     const quote = quoteBooking({
       serviceId,
       items,
-      listings: deps.listListings(),
+      listings,
       approvedVendorIds: approvedVendorIds(),
     });
     if (quote.ok === false) {
       return res.status(400).json({ success: false, error: quote.error });
+    }
+    // Every listing on the order has to serve the event's city, and a listing
+    // without an hour or same-day lane needs the day to prepare («قبل يوم للتجهيز»).
+    const listingById = new Map(listings.map((listing) => [String(listing.id), listing]));
+    for (const line of quote.lines) {
+      const listing = listingById.get(line.id);
+      const cities = Array.isArray(listing?.cities) ? listing.cities : [];
+      if (cities.length && !cityFilterMatches(cities, city)) {
+        return res.status(409).json({ success: false, error: outOfCoverage(line.title, city), listingId: line.id });
+      }
+      const lanes = Array.isArray(listing?.fulfillment) ? listing.fulfillment.map(String) : [];
+      const sameDay = lanes.includes('hour') || lanes.includes('same_day');
+      if (!sameDay && lanes.includes('tomorrow') && date === riyadhToday(now())) {
+        return res.status(409).json({ success: false, error: tooSoon(line.title), listingId: line.id });
+      }
     }
     // The client total is advisory: a mismatch means the cart shows stale
     // prices, so the customer re-checks rather than paying a surprise amount.
@@ -480,9 +584,44 @@ export function registerBookingRoutes(
           .json({ success: false, error: DUPLICATE_ORDER, duplicate: true, booking: duplicateSummary(earlierRow) });
       }
     }
+    // "Your own order" only for the account that placed it, or a guest matching its
+    // email *and* phone (as the duplicate check) — never someone who knows one of them.
+    const ownOrder = (row: PlatformBooking) =>
+      (sessionUser && row.userId === sessionUser.id) ||
+      (!sessionUser &&
+        Boolean(orderEmail) &&
+        row.email.toLowerCase() === orderEmail.toLowerCase() &&
+        row.phone === saudiPhone);
+    // One event per listing per day: a date someone already holds can't be sold again.
+    // Someone else's request still waiting on the vendor doesn't hold it: an unpaid,
+    // unanswered request must not shut everyone else out. The vendor approves one of
+    // the requests, and approving needs the date free (SLOT_TAKEN_CONFIRM).
+    const conflict = slotConflict(
+      listingIds,
+      quote.vendorIds,
+      date,
+      undefined,
+      (row) => row.status === BOOKING_PENDING_APPROVAL_STATUS && !ownOrder(row),
+    );
+    if (conflict) {
+      const own = conflict.kind === 'order' && Boolean(ownOrder(conflict.booking));
+      return res.status(409).json({
+        success: false,
+        error: own ? SLOT_TAKEN_OWN : SLOT_TAKEN,
+        slotTaken: true,
+        listingId: conflict.listingId,
+        ...(own && conflict.kind === 'order' ? { booking: duplicateSummary(conflict.booking) } : {}),
+      });
+    }
+    const slotKeys = listingIds.map((id) => `${id}#${date}`);
+    if (slotKeys.some((key) => slotsInFlight.has(key))) {
+      return res.status(409).json({ success: false, error: SLOT_BUSY, slotTaken: true });
+    }
+
     const bookingId = newBookingId();
     reservedIds.add(bookingId);
     inFlight.add(flightKey);
+    for (const key of slotKeys) slotsInFlight.add(key);
 
     try {
       const booking: PlatformBooking = {
@@ -512,6 +651,7 @@ export function registerBookingRoutes(
       // approval (see the PATCH route) and the client pays from «طلباتي».
       if (quote.needsVendorApproval) {
         store.add(booking);
+        lapseStaleCheckouts(booking);
         notifyVendorsOfOrder(booking, true);
         return res.status(201).json({ success: true, booking, awaitingApproval: true });
       }
@@ -533,11 +673,13 @@ export function registerBookingRoutes(
       booking.paymentUrl = invoice.invoice.url;
 
       store.add(booking);
+      lapseStaleCheckouts(booking);
       if (anonymous) recentGuestCheckouts.set(flightKey, { bookingId: booking.id, at: nowMs });
       res.status(201).json({ success: true, booking });
     } finally {
       inFlight.delete(flightKey);
       reservedIds.delete(bookingId);
+      for (const key of slotKeys) slotsInFlight.delete(key);
     }
   });
 
@@ -655,6 +797,20 @@ export function registerBookingRoutes(
       }
     }
 
+    // Confirming takes the listing's date: another customer must not already hold it.
+    // A second order also still waiting on the vendor doesn't count — approving one
+    // is how the vendor picks between them.
+    if (confirming) {
+      const taken = slotConflict(
+        bookedListingIds(current),
+        (current.vendorIds || []).map(String),
+        String(current.eventDate || '').slice(0, 10),
+        current.id,
+        (row) => row.status === BOOKING_PENDING_APPROVAL_STATUS,
+      );
+      if (taken) return res.status(409).json({ success: false, error: SLOT_TAKEN_CONFIRM, slotTaken: true });
+    }
+
     // Ending an order records who ended it and what is owed, in the same shape
     // a client cancellation uses, so a refund is never lost. A paid order owes
     // the full amount (the customer did not cancel), which only an admin may
@@ -667,6 +823,9 @@ export function registerBookingRoutes(
         return res.status(409).json({ success: false, error: PAID_NEEDS_ADMIN });
       }
       const refundHalalas = paid ? bookingTotalHalalas(current) : 0;
+      const rejected = status === BOOKING_REJECTED_STATUS;
+      const reason =
+        typeof req.body?.reason === 'string' ? req.body.reason.replace(/\s+/g, ' ').trim().slice(0, REASON_MAX) : '';
       cancellation = {
         cancelledAt: now().toISOString(),
         cancelledBy: by,
@@ -674,8 +833,11 @@ export function registerBookingRoutes(
         refundHalalas,
         refundStatus: !paid ? 'not_applicable' : refundHalalas > 0 ? 'pending' : 'none',
         note: !paid
-          ? 'أُلغي قبل الدفع — لا يوجد مبلغ للاسترجاع.'
+          ? rejected
+            ? 'رفضه المورّد قبل الدفع — لا يوجد مبلغ للاسترجاع.'
+            : 'أُلغي قبل الدفع — لا يوجد مبلغ للاسترجاع.'
           : 'ألغته إدارة يوصل بعد الدفع — يُعاد كامل المبلغ عبر ميسر بنفس وسيلة الدفع.',
+        ...(reason ? { reason } : {}),
       };
     }
 
@@ -758,5 +920,5 @@ export function registerBookingRoutes(
     return after;
   }
 
-  return Object.assign(store, { actorFromRequest: auth.userFromRequest, canRead, markPaidFromMoyasar });
+  return Object.assign(store, { actorFromRequest: auth.userFromRequest, canRead, markPaidFromMoyasar, slotConflictFor });
 }

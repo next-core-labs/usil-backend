@@ -133,6 +133,20 @@ export function notifyBookingRejected(email: string, bookingId: string, serviceN
  * A vendor has a new order: one waiting for their approval, or an instant
  * order that has just been paid and is now confirmed.
  */
+/**
+ * The vendor console's orders page — where a vendor accepts or rejects. The
+ * store is the customer's side: sending a vendor there to "review the order"
+ * dropped them on the shop as if they were buying.
+ */
+export function vendorConsoleOrdersUrl(): string {
+  const explicit = String(process.env.VENDOR_CONSOLE_URL || '').trim().replace(/\/$/, '');
+  if (explicit) return `${explicit}/#/orders`;
+  const site = publicSiteUrl();
+  // Local runs: the console's dev server, next to the store's.
+  const local = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(site);
+  return `${local ? 'http://127.0.0.1:5190' : 'https://vendor.usil.app'}/#/orders`;
+}
+
 export function notifyVendorNewOrder(
   email: string,
   bookingId: string,
@@ -146,13 +160,13 @@ export function notifyVendorNewOrder(
     needsApproval
       ? [
           `وصلك طلب جديد ${bookingId}${label} ينتظر موافقتك.`,
-          'العميل يدفع بعد موافقتك. راجع الطلب من لوحة المورّد:',
-          (process.env.VENDOR_CONSOLE_URL || publicSiteUrl()).replace(/\/$/, ''),
+          'العميل يدفع بعد موافقتك. اقبله أو ارفضه من «طلبات المتجر» في لوحة المورّد:',
+          vendorConsoleOrdersUrl(),
         ]
       : [
           `وصلك طلب جديد ${bookingId}${label}، ودفعه العميل وتأكد.`,
-          'جهّز الطلب لموعد المناسبة. التفاصيل في لوحة المورّد:',
-          (process.env.VENDOR_CONSOLE_URL || publicSiteUrl()).replace(/\/$/, ''),
+          'جهّز الطلب لموعد المناسبة. التفاصيل في «طلبات المتجر» بلوحة المورّد:',
+          vendorConsoleOrdersUrl(),
         ],
   );
 }

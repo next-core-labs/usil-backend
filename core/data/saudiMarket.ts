@@ -568,8 +568,18 @@ const CATEGORY_SEARCH_MARKERS: Partial<Record<ServiceCategory, string[]>> = {
   entertainment: ['ألعاب', 'ترفيه', 'مسابقات', 'أطفال'],
 };
 
-function normalizeSearch(value: string): string {
-  return value.toLowerCase().trim();
+/**
+ * Lower-case plus the Arabic spellings people mix up: أ/إ/آ → ا, ة → ه, ى → ي,
+ * and no tashkeel or tatweel — so «اضاءه» finds «إضاءة».
+ */
+export function normalizeSearch(value: string): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\u064B-\u0652\u0640]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .trim();
 }
 
 export function expandSearchTerms(query: string): string[] {
@@ -612,8 +622,8 @@ export function serviceMatchesSearch(item: ServiceItem, query: string): boolean 
     ...(item.includes || []),
     ...(item.fulfillment || []).map((lane) => FULFILLMENT_LANE_BY_ID[lane]?.chip || lane),
   ]
-    .join(' · ')
-    .toLowerCase();
+    .join(' · ');
+  const folded = normalizeSearch(haystack);
 
   for (const [category, markers] of Object.entries(CATEGORY_SEARCH_MARKERS)) {
     const hit = terms.some((term) =>
@@ -622,7 +632,7 @@ export function serviceMatchesSearch(item: ServiceItem, query: string): boolean 
     if (hit && item.category === category) return true;
   }
 
-  return terms.some((term) => term.length >= 2 && haystack.includes(term));
+  return terms.some((term) => term.length >= 2 && folded.includes(term));
 }
 
 function withMarketplaceMetadata(service: ServiceItem): ServiceItem {

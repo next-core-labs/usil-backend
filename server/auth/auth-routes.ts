@@ -21,6 +21,7 @@ type AuthApi = {
   meHandler: RouteHandler;
   logoutHandler: RouteHandler;
   avatarHandler: RouteHandler;
+  updateProfileHandler: RouteHandler;
   listUsersHandler: RouteHandler;
   createUserHandler: RouteHandler;
   updateUserHandler: RouteHandler;
@@ -47,6 +48,7 @@ export function registerAuthRoutes(app: Express, auth: AuthApi, dataDir: string)
   app.get('/api/auth/me', (req, res) => auth.meHandler(req, res));
   app.post('/api/auth/logout', (req, res) => auth.logoutHandler(req, res));
   app.post('/api/auth/avatar', (req, res) => auth.avatarHandler(req, res));
+  app.patch('/api/auth/me', (req, res) => auth.updateProfileHandler(req, res));
 
   app.get('/api/admin/users', (req, res) => auth.listUsersHandler(req, res));
   app.post('/api/admin/users', (req, res) => auth.createUserHandler(req, res));

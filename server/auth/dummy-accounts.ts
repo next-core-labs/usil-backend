@@ -3,6 +3,7 @@ import path from 'path';
 import { isAllowedListingImage, isStockMediaUrl } from '../../core/utils/catalogMedia';
 import { readJsonFile, writeJsonFile } from '../shared/json-file';
 import { createVendorOfficeStore } from '../vendors/vendor-office.ts';
+import { sessionUserId } from './session-rows.ts';
 
 export const FOUNDER_ADMIN_EMAIL = 'nawafalmuhayya@gmail.com';
 
@@ -288,9 +289,9 @@ export function wipeAllVendorsAndDummyMedia(
 
   if (removedVendors.length) {
     writeJson(usersFile, keptUsers);
-    const sessions = readJson<Record<string, string>>(sessionsFile, {});
-    for (const [token, userId] of Object.entries(sessions)) {
-      if (removedIds.has(userId)) delete sessions[token];
+    const sessions = readJson<Record<string, unknown>>(sessionsFile, {});
+    for (const [token, row] of Object.entries(sessions)) {
+      if (removedIds.has(sessionUserId(row))) delete sessions[token];
     }
     writeJson(sessionsFile, sessions);
   }
@@ -364,9 +365,9 @@ export function purgeLiveDummyData(dataDir: string): {
 
   if (removedUsers.length) {
     writeJson(usersFile, keptUsers);
-    const sessions = readJson<Record<string, string>>(sessionsFile, {});
-    for (const [token, userId] of Object.entries(sessions)) {
-      if (removedIds.has(userId)) delete sessions[token];
+    const sessions = readJson<Record<string, unknown>>(sessionsFile, {});
+    for (const [token, row] of Object.entries(sessions)) {
+      if (removedIds.has(sessionUserId(row))) delete sessions[token];
     }
     writeJson(sessionsFile, sessions);
 

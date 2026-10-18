@@ -383,6 +383,32 @@ describe('vendor-store', () => {
     assert.equal(custom.serviceId, 'srv-custom');
   });
 
+  it('refuses a calendar booking on a day a platform order or another entry already holds the listing', () => {
+    let orders: any[] = [];
+    const store = createVendorStore(tmpDir(), { listPlatformBookings: () => orders });
+    const corner = store.addListing('v1', goodListing());
+    const base = { customerName: 'نواف', customerPhone: '0504444444', serviceId: corner.id };
+    orders = [
+      {
+        id: 'BK-526586',
+        serviceId: corner.id,
+        items: [{ id: corner.id }],
+        vendorIds: ['v1'],
+        eventDate: '2099-03-01',
+        status: 'مؤكد',
+        paymentStatus: 'unpaid',
+        createdAt: '2099-01-01 10:00',
+      },
+    ];
+    assert.throws(() => store.addBooking('v1', { ...base, date: '2099-03-01' }), /BK-526586/);
+    const phone = store.addBooking('v1', { ...base, date: '2099-03-02' });
+    assert.throws(() => store.addBooking('v1', { ...base, date: '2099-03-02' }), /محجوز/);
+    assert.throws(() => store.updateBooking('v1', phone.id, { date: '2099-03-01' }), /محجوز/);
+    // Unlinked entries and other days stay free.
+    store.addBooking('v1', { customerName: 'نواف', customerPhone: '0504444444', date: '2099-03-01' });
+    store.addBooking('v1', { ...base, date: '2099-03-03' });
+  });
+
   it('rejects past, blocked and malformed booking dates and unknown statuses', () => {
     const store = createVendorStore(tmpDir());
     const base = { customerName: 'نواف', customerPhone: '0504444444' };

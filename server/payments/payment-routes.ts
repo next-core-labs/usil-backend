@@ -55,6 +55,7 @@ const INVOICE_NEEDS_LOGIN = 'سجّل الدخول بالحساب الذي أن�
 const INVOICE_BOOKING_NOT_FOUND = 'الحجز غير موجود';
 const INVOICE_ALREADY_PAID = 'هذا الطلب مدفوع مسبقاً.';
 const INVOICE_BOOKING_CLOSED = 'الطلب ملغي أو منتهٍ، ولا يمكن دفعه.';
+const INVOICE_SLOT_TAKEN = 'هذا الموعد حُجز لعميل آخر قبل إتمام الدفع. اختر تاريخاً آخر واطلب من جديد.';
 const INVOICE_EVENT_PASSED = 'موعد المناسبة مضى، ولا يمكن دفع الطلب. اطلب من جديد بتاريخ قادم.';
 const INVOICE_AWAITING_APPROVAL = 'الطلب بانتظار موافقة المورّد. الدفع يتاح بعد موافقته، ونبلغك على بريدك.';
 const INVOICE_NEEDS_BOOKING = 'الدفع يكون لطلب محفوظ. أكمل الطلب من السلة ثم ادفع.';
@@ -136,6 +137,10 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
       }
       if (isIsoDate(booking.eventDate) && booking.eventDate < riyadhToday(now())) {
         return res.status(409).json({ error: INVOICE_EVENT_PASSED });
+      }
+      // Resuming an old unpaid checkout: its date may have gone to another customer meanwhile.
+      if (bookings.slotConflictFor(booking)) {
+        return res.status(409).json({ error: INVOICE_SLOT_TAKEN, slotTaken: true });
       }
       // One payable invoice per order: a second would let the customer pay twice.
       if (booking.paymentUrl) {

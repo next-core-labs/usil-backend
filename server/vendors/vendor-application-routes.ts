@@ -22,7 +22,10 @@ import { isStockMediaUrl } from '../../core/utils/catalogMedia';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
 
 /** Each application can write ~16 MB of photos and emails the address it names. */
+/** Vendor accounts one device may open per hour. Only sign-ups that pass the checks count. */
 const APPLY_LIMIT = 10;
+/** Every attempt, mistakes included: high enough for someone fixing typos, low enough to stop a flood. */
+const APPLY_ATTEMPT_LIMIT = 60;
 const APPLY_WINDOW_MS = 60 * 60 * 1000;
 const APPLY_RATE_LIMITED = 'طلبات كثيرة من هذا الجهاز. انتظر ساعة ثم أعد المحاولة.';
 
@@ -91,6 +94,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   const workspaces = createVendorStore(dataDir);
   const adminOnly = auth.requireRole(['admin']);
   const applyLimiter = createSlidingWindowLimiter(APPLY_LIMIT, APPLY_WINDOW_MS);
+  const attemptLimiter = createSlidingWindowLimiter(APPLY_ATTEMPT_LIMIT, APPLY_WINDOW_MS);
 
   /** The workspace an application's products and socials live in: the applicant's account, or the application id. */
   function workspaceIdFor(row: VendorApplication): string {
@@ -117,7 +121,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
    * `isPublicVendorAccount`).
    */
   app.post('/api/vendor-signup', (req: Request, res: Response) => {
-    if (!applyLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
+    if (!attemptLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
       return res.status(429).json({ success: false, error: APPLY_RATE_LIMITED });
     }
     try {
@@ -135,6 +139,10 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       );
       if (ownership === 'conflict') {
         return res.status(409).json({ success: false, error: APPLICANT_LOGIN_REQUIRED });
+      }
+      // Counted only now: a form sent back for a typo must not lock the device out.
+      if (!applyLimiter.allow(`vendor-apply:${clientIp(req)}`)) {
+        return res.status(429).json({ success: false, error: APPLY_RATE_LIMITED });
       }
       const passwordHash = hashPassword(String(body.password || ''));
       const created = store.submitQuick(body, passwordHash);

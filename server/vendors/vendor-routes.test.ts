@@ -830,7 +830,7 @@ describe('vendor back office — persisted with the workspace', () => {
     return { status: res.status, json: (await res.json()) as Record<string, any> };
   }
 
-  it('stores a whitelisted office, keeps it when a save omits it, and replaces it when sent', async () => {
+  it('stores a whitelisted office, keeps it when a save omits it, and replaces only the sections sent', async () => {
     const dir = tmpDir();
     const app = express();
     app.use(express.json({ limit: '16mb' }));
@@ -863,9 +863,16 @@ describe('vendor back office — persisted with the workspace', () => {
       assert.equal(reread.json.data.office.crewMembers[0].name, 'خالد');
       assert.equal(reread.json.data.inventoryItems.length, 1);
 
-      // Sent: it replaces the whole office.
-      const replaced = await send(`${url}/api/vendor/workspace`, 'PUT', { office: { payouts: [{ id: 'p-1' }] } });
-      assert.deepEqual(replaced.json.data.office, { payouts: [{ id: 'p-1' }] });
+      // Sent sections replace those sections; the rest stays as stored.
+      const merged = await send(`${url}/api/vendor/workspace`, 'PUT', {
+        office: { payouts: [{ id: 'p-1' }], crewMembers: [] },
+      });
+      assert.deepEqual(merged.json.data.office, {
+        invoices: [{ id: 'inv-1', total: 500 }],
+        crewMembers: [],
+        payouts: [{ id: 'p-1' }],
+        brandSettings: { color: '#0A1A33' },
+      });
 
       // The catalog file stays free of office data.
       const raw = fs.readFileSync(path.join(dir, 'vendor-workspaces.json'), 'utf-8');
@@ -955,6 +962,53 @@ describe('GET /api/vendors/:id/blocked-dates — public availability', () => {
       assert.deepEqual(json, { success: true, data: { dates: ['2026-10-15', '2026-12-01', '2027-04-13'] } });
       const unknown = await fetch(`${url}/api/vendors/usr-nobody/blocked-dates`);
       assert.deepEqual(await unknown.json(), { success: true, data: { dates: [] } });
+    } finally {
+      await close();
+    }
+  });
+
+  it('with ?listingId= adds the days that listing is already booked', async () => {
+    const dir = tmpDir();
+    fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
+    for (const name of ['p1.jpg', 'p2.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+    const store = createVendorStore(dir);
+    const listing = store.addListing('usr-shop', {
+      title: 'ركن قهوة',
+      category: 'hospitality',
+      price: 500,
+      fulfillment: ['tomorrow'],
+      images: ['/uploads/p1.jpg', '/uploads/p2.jpg'],
+    });
+    store.saveWorkspace('usr-shop', {
+      ...store.getWorkspace('usr-shop'),
+      blockedDates: [{ id: 'blk-1', date: '2026-10-20', reason: '', type: 'holiday' as const }],
+      // A phone booking the vendor recorded, and a cancelled one.
+      bookings: [
+        { id: 'vb-1', serviceId: listing.id, date: '2026-10-22', status: 'confirmed' } as never,
+        { id: 'vb-2', serviceId: listing.id, date: '2026-10-23', status: 'cancelled' } as never,
+      ],
+    });
+    const platform = [
+      { id: 'BK-1', serviceId: listing.id, items: [{ id: listing.id }], eventDate: '2026-10-25', status: 'مؤكد', paymentStatus: 'paid', createdAt: '2026-10-01 10:00' },
+      { id: 'BK-2', serviceId: listing.id, items: [{ id: listing.id }], eventDate: '2026-10-26', status: 'ملغي', paymentStatus: 'paid', createdAt: '2026-10-01 10:00' },
+      { id: 'BK-3', serviceId: 'lst-other', items: [{ id: 'lst-other' }], eventDate: '2026-10-27', status: 'مؤكد', paymentStatus: 'paid', createdAt: '2026-10-01 10:00' },
+    ];
+    const app = express();
+    app.use(express.json());
+    registerVendorRoutes(
+      app,
+      fakeAuth(null, 'x', { vendors: [{ id: 'usr-shop', name: 'متجر', email: 'shop@usil.sa', role: 'vendor' }] }) as any,
+      dir,
+      { now: () => new Date('2026-10-16T09:00:00Z'), listPlatformBookings: () => platform as never },
+    );
+    const { url, close } = await listen(app);
+    try {
+      const dates = async (query: string) =>
+        ((await (await fetch(`${url}/api/vendors/usr-shop/blocked-dates${query}`)).json()) as { data: { dates: string[] } }).data.dates;
+      assert.deepEqual(await dates(`?listingId=${listing.id}`), ['2026-10-20', '2026-10-22', '2026-10-25']);
+      // Without a listing, or with one that isn't this vendor's: closed days only.
+      assert.deepEqual(await dates(''), ['2026-10-20']);
+      assert.deepEqual(await dates('?listingId=lst-other'), ['2026-10-20']);
     } finally {
       await close();
     }

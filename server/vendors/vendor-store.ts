@@ -7,6 +7,7 @@ import { isAllowedListingImage, isStockMediaUrl } from '../../core/utils/catalog
 import type { BookingStatus } from '../../core/types';
 import { normalizeSaudiMobile } from '../shared/booking-guards';
 import { riyadhToday } from '../bookings/booking-pricing.ts';
+import { findSlotConflict } from '../bookings/slot-holds.ts';
 import {
   createBookingStore,
   vendorHasBooking,
@@ -682,13 +683,14 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     const current = getWorkspace(vendorId);
     const next: Partial<VendorWorkspace> = {};
     // Checked before anything is written, so a refused office saves nothing.
-    // Present = replace the whole office; absent = keep it as stored.
+    // Each section sent replaces that section; sections left out keep what is
+    // stored, so a tab saving its brand can't wipe crew another device added.
     let office: VendorOffice | undefined;
     if (patch.office !== undefined) {
       if (!patch.office || typeof patch.office !== 'object' || Array.isArray(patch.office)) {
         throw new VendorStoreError(OFFICE_INVALID);
       }
-      office = sanitizeOffice(patch.office);
+      office = { ...offices.get(vendorId), ...sanitizeOffice(patch.office) };
       if (officeBytes(office) > OFFICE_MAX_BYTES) throw new VendorStoreError(OFFICE_TOO_LARGE, 413);
     }
     if (Array.isArray(patch.inventoryItems)) next.inventoryItems = patch.inventoryItems as InventoryRecord[];
@@ -755,6 +757,24 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     }
   }
 
+  /**
+   * One listing serves one event per day: a calendar entry can't take a day a
+   * platform order or another calendar entry already holds for that listing.
+   */
+  function assertListingFree(ws: VendorWorkspace, serviceId: string, date: string, now: Date, excludeId?: string) {
+    if (serviceId === 'srv-custom') return;
+    const conflict = findSlotConflict({
+      listingIds: [serviceId],
+      date,
+      orders: readPlatformBookings(),
+      vendorBookings: ws.bookings.filter((row) => row.id !== excludeId),
+      nowMs: now.getTime(),
+    });
+    if (!conflict) return;
+    const ref = conflict.kind === 'order' ? conflict.booking.id : 'حجز في تقويمك';
+    throw new VendorStoreError(`هذا المنتج محجوز في ${date} (${ref}) — اختر تاريخاً آخر`, 409);
+  }
+
   function clockOrDefault(value: unknown, fallback: string): string {
     if (value === undefined || value === null || value === '') return fallback;
     if (!isClockTime(value)) throw new VendorStoreError('اكتب الوقت بصيغة HH:MM');
@@ -792,6 +812,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
         ? DEFAULT_VENDOR_BOOKING_STATUS
         : String(body.status);
     if (!isVendorBookingStatus(status)) throw new VendorStoreError('حالة الحجز غير معروفة');
+    assertListingFree(ws, serviceId, date, now);
 
     const totalAmount = nonNegativeNumber(body.totalAmount, 0, 'المبلغ الإجمالي غير صالح');
     const depositAmount = nonNegativeNumber(body.depositAmount, 0, 'مبلغ العربون غير صالح');
@@ -848,7 +869,10 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
         next.notes = cleanText(value, 1000) || undefined;
       } else if (key === 'date') {
         const date = String(value);
-        if (date !== item.date) assertBookableDate(ws, date, todayInRiyadh(now));
+        if (date !== item.date) {
+          assertBookableDate(ws, date, todayInRiyadh(now));
+          assertListingFree(ws, String(item.serviceId || ''), date, now, item.id);
+        }
         next.date = date;
       } else {
         if (!isClockTime(value)) throw new VendorStoreError('اكتب الوقت بصيغة HH:MM');
@@ -1215,6 +1239,8 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     updateListingAdmin,
     listingToServiceItem,
     listingToPublicService,
+    /** Platform orders (read-only) — they hold listing dates on the public availability. */
+    readPlatformBookings,
     getSocials,
     saveSocials,
     replaceSocials,

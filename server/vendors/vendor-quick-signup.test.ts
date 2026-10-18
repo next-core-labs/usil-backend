@@ -293,3 +293,18 @@ describe('vendor quick sign-up — dashboard first, approval after', () => {
     }
   });
 });
+
+describe('vendor sign-up rate limit', () => {
+  it('does not count forms sent back for a mistake', async () => {
+    const { url, close } = await mount();
+    try {
+      for (let i = 0; i < 12; i++) {
+        const bad = await call(url, 'POST', '/api/vendor-signup', '', { ...SIGNUP, phone: '123' });
+        assert.equal(bad.status, 400);
+      }
+      await signUp(url);
+    } finally {
+      await close();
+    }
+  });
+});
