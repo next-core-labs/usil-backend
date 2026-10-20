@@ -1209,12 +1209,27 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     return true;
   }
 
+  /**
+   * Merge only the office keys present in `body` (each replaced whole) into the
+   * stored office. Screens that own different keys — invoices, expenses,
+   * quotations, brand — save independently without overwriting each other.
+   */
+  function patchOffice(vendorId: string, body: unknown): VendorOffice {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new VendorStoreError(OFFICE_INVALID);
+    const incoming = sanitizeOffice(body);
+    if (!Object.keys(incoming).length) throw new VendorStoreError(OFFICE_INVALID);
+    const next: VendorOffice = { ...offices.get(vendorId), ...incoming };
+    if (officeBytes(next) > OFFICE_MAX_BYTES) throw new VendorStoreError(OFFICE_TOO_LARGE, 413);
+    return offices.save(vendorId, next);
+  }
+
   return {
     purgeVendor,
     file,
     getWorkspace,
     getWorkspaceWithOffice,
     getOffice: (vendorId: string) => offices.get(vendorId),
+    patchOffice,
     hasWorkspace,
     ensureEmptyWorkspace,
     seedWorkspaceFromApplication,

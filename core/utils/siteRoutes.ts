@@ -47,6 +47,7 @@ export type SitePage =
   | 'payment-success'
   | 'payment-cancelled'
   | 'vendor-file'
+  | 'sign'
   | 'notfound'
   | StorefrontScreen
   | null;
@@ -71,6 +72,7 @@ export function isKnownSpaPath(pathname: string): boolean {
   if ((KNOWN_SPA_PATHS as readonly string[]).includes(path)) return true;
   if (path.startsWith('/service/')) return true;
   if (path.startsWith('/vendor/')) return true;
+  if (path.startsWith('/sign/')) return true;
   if (path.startsWith('/api/')) return false;
   if (path.startsWith('/uploads/')) return true;
   return false;
@@ -106,6 +108,9 @@ export function parseLocation(pathname: string, hash = ''): LocationIntent {
   }
   if (path === '/payment/cancelled') {
     return { ...base, sitePage: 'payment-cancelled' };
+  }
+  if (path.startsWith('/sign/')) {
+    return { ...base, sitePage: signTokenFromPath(pathname) ? 'sign' : 'notfound' };
   }
   if (path.startsWith('/vendor/')) {
     const id = decodeURIComponent(pathname.replace(/\/$/, '').slice('/vendor/'.length).split('/')[0] || '').trim();
@@ -144,7 +149,7 @@ export function parseLocation(pathname: string, hash = ''): LocationIntent {
   return { ...base, sitePage: 'notfound' };
 }
 
-export function pathForSitePage(page: Exclude<SitePage, 'notfound' | 'vendor-file' | 'product' | null>): string {
+export function pathForSitePage(page: Exclude<SitePage, 'notfound' | 'vendor-file' | 'product' | 'sign' | null>): string {
   if (page === 'payment-success') return '/payment/success';
   if (page === 'payment-cancelled') return '/payment/cancelled';
   return `/${page}`;
@@ -156,4 +161,17 @@ export function pathForProduct(id: string): string {
 
 export function pathForVendor(id: string): string {
   return `/vendor/${encodeURIComponent(String(id || '').trim())}`;
+}
+
+/**
+ * The contract-signing token in `/sign/<token>` (case kept — it is base64url),
+ * or null when the path is not a signing link.
+ */
+export function signTokenFromPath(pathname: string): string | null {
+  const match = /^\/sign\/([A-Za-z0-9_-]{20,200})\/?$/i.exec(String(pathname || ''));
+  return match ? match[1] : null;
+}
+
+export function pathForSign(token: string): string {
+  return `/sign/${encodeURIComponent(String(token || '').trim())}`;
 }

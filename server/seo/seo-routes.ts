@@ -157,6 +157,11 @@ export function registerSeoRoutes(app: Express, auth: AuthLike, dataDir: string,
   return {
     store,
     sendSpa: (req: Request, res: Response) => {
+      // A contract-signing link is private to one client: never indexed, never leaked in a Referer.
+      if (/^\/sign\//i.test(req.path)) {
+        res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+      }
       const vendorId = vendorIdFromPath(req.path);
       const page = vendorId ? lookupVendorSeo(vendorId) : lookupServiceSeo(req.path);
       // A product or vendor that is not public is a 404 for crawlers too; the
