@@ -168,6 +168,23 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     }
   });
 
+  /** The back office alone; PATCH merges the keys it is given (see `patchOffice`). */
+  app.get('/api/vendor/office', guard, (req: Request, res: Response) => {
+    const vendorId = vendorIdFrom(req);
+    if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    res.json({ success: true, data: store.getOffice(vendorId) });
+  });
+
+  app.patch('/api/vendor/office', guard, (req: Request, res: Response) => {
+    const vendorId = vendorIdFrom(req);
+    if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    try {
+      res.json({ success: true, data: store.patchOffice(vendorId, req.body) });
+    } catch (error) {
+      res.status(statusOf(error)).json({ success: false, error: messageOf(error, 'تعذر حفظ بيانات المكتب') });
+    }
+  });
+
   app.get('/api/vendor/summary', guard, (req: Request, res: Response) => {
     const vendorId = vendorIdFrom(req);
     if (!vendorId) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });

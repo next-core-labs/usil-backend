@@ -29,6 +29,7 @@ export const OFFICE_ARRAY_KEYS = [
   'trackings',
   'workLogs',
   'attendance',
+  'quotations',
 ] as const;
 
 export type OfficeArrayKey = (typeof OFFICE_ARRAY_KEYS)[number];

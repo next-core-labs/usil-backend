@@ -8,6 +8,7 @@ import { registerGeminiRoutes } from './ai/gemini-routes.ts';
 import { registerIntegrationsRoutes } from './ai/integrations-routes.ts';
 import { registerBookingRoutes } from './bookings/booking-routes.ts';
 import { registerChatRoutes } from './chat/chat-routes.ts';
+import { registerContractRoutes } from './contracts/contract-routes.ts';
 import { registerExternalBookingRoutes, type CourierOption } from './bookings/external-booking-routes.ts';
 import { registerCityRequestRoutes } from './cities/city-request-routes.ts';
 import { registerVendorLeadRoutes } from './leads/vendor-lead-routes.ts';
@@ -16,6 +17,7 @@ import { registerLegacyRoutes } from './legacy-routes.ts';
 import { registerMoyasarAdminRoutes } from './payments/moyasar-admin-routes.ts';
 import { applyMoyasarRuntime } from './payments/moyasar-store.ts';
 import { registerPaymentRoutes } from './payments/payment-routes.ts';
+import { registerPayoutRoutes } from './payouts/payout-routes.ts';
 import { registerSeoRoutes } from './seo/seo-routes.ts';
 import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerTrendingRoutes } from './catalog/trending-routes.ts';
@@ -116,6 +118,24 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
 
   // Payments settle against platform bookings.
   registerPaymentRoutes(app, { bookings: bookingStore, port: PORT });
+  // Vendor earnings (computed from paid orders) and their withdrawal requests.
+  registerPayoutRoutes(app, auth, DATA_DIR, { bookings: bookingStore, vendors: vendorStore });
+
+  // Electronic contracts: the vendor issues, the client signs on a private /sign/<token> link.
+  registerContractRoutes(app, auth, DATA_DIR, {
+    legacyContracts: (vendorId) => vendorStore.getWorkspace(vendorId).contracts || [],
+    vendorBrand: (vendorId) => {
+      const brand = (vendorStore.getOffice(vendorId).brandSettings || {}) as Record<string, unknown>;
+      const profile = vendorStore.getWorkspace(vendorId).profile;
+      const pick = (value: unknown) => (typeof value === 'string' && value.trim() ? value.trim() : undefined);
+      return {
+        name: pick(brand.brandName) || pick(profile?.projectName),
+        logoUrl: pick(brand.logoUrl) || pick(profile?.logoUrl),
+        crNumber: pick(brand.crNumber) || pick(profile?.commercialRegister),
+        email: pick(brand.email) || pick(profile?.email),
+      };
+    },
+  });
 
   // «ترند هالأسبوع»: the public catalog ranked by this week's bookings and product views.
   registerTrendingRoutes(app, DATA_DIR, {

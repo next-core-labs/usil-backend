@@ -830,6 +830,29 @@ describe('vendor back office — persisted with the workspace', () => {
     return { status: res.status, json: (await res.json()) as Record<string, any> };
   }
 
+  it('PATCH /api/vendor/office merges only the keys sent, so screens never overwrite each other', async () => {
+    const dir = tmpDir();
+    const app = express();
+    app.use(express.json({ limit: '16mb' }));
+    registerVendorRoutes(app, fakeAuth('vendor') as any, dir);
+    const { url, close } = await listen(app);
+    try {
+      assert.deepEqual((await send(`${url}/api/vendor/office`, 'GET')).json.data, {});
+      await send(`${url}/api/vendor/office`, 'PATCH', { invoices: [{ id: 'inv-1' }] });
+      // Another screen saves its own key; the invoices stay.
+      const both = await send(`${url}/api/vendor/office`, 'PATCH', { expenses: [{ id: 'exp-1' }], quotations: [{ id: 'q-1' }], bogus: [1] });
+      assert.equal(both.status, 200);
+      assert.deepEqual(both.json.data, { invoices: [{ id: 'inv-1' }], expenses: [{ id: 'exp-1' }], quotations: [{ id: 'q-1' }] });
+      assert.equal((await send(`${url}/api/vendor/office`, 'PATCH', { bogus: [1] })).status, 400);
+      assert.equal((await send(`${url}/api/vendor/office`, 'PATCH', [])).status, 400);
+      const huge = 'x'.repeat(1_600_000);
+      assert.equal((await send(`${url}/api/vendor/office`, 'PATCH', { expenses: [{ note: huge }] })).status, 413);
+      assert.deepEqual((await send(`${url}/api/vendor/office`, 'GET')).json.data.expenses, [{ id: 'exp-1' }]);
+    } finally {
+      await close();
+    }
+  });
+
   it('stores a whitelisted office, keeps it when a save omits it, and replaces only the sections sent', async () => {
     const dir = tmpDir();
     const app = express();

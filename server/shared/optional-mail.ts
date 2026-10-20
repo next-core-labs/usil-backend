@@ -171,6 +171,58 @@ export function notifyVendorNewOrder(
   );
 }
 
+/** The owner console's withdrawal requests screen. */
+function ownerConsolePayoutsUrl(): string {
+  const explicit = String(process.env.OWNER_CONSOLE_URL || '').trim().replace(/\/$/, '');
+  return `${explicit || 'https://owner.usil.app'}/#/payouts`;
+}
+
+/** A vendor asked for a payout — tells the owner (PAYOUTS_EMAIL, else OWNER_EMAIL). */
+export function notifyPayoutRequested(vendorName: string, amount: number, payoutId: string): void {
+  const to = String(process.env.PAYOUTS_EMAIL || process.env.OWNER_EMAIL || '').trim();
+  notify(to, 'طلب سحب أرباح جديد — يوصل', [
+    `طلب «${vendorName || 'مورّد'}» سحب ${amount.toFixed(2)} ر.س (الطلب ${payoutId}).`,
+    'راجع الطلب واعتمده أو ارفضه، ثم حوّل المبلغ يدوياً من البنك وسجّل رقم المرجع:',
+    ownerConsolePayoutsUrl(),
+  ]);
+}
+
+/** The owner approved, rejected or paid a vendor's payout request. */
+export function notifyPayoutDecision(
+  email: string,
+  input: { id: string; amount: number; status: 'approved' | 'paid' | 'rejected'; reference?: string; adminNote?: string },
+): void {
+  const amount = `${input.amount.toFixed(2)} ر.س`;
+  const consoleUrl = vendorConsoleOrdersUrl().replace(/#\/orders$/, '#/earnings');
+  const lines =
+    input.status === 'approved'
+      ? [`اعتمدت إدارة يوصل طلب السحب ${input.id} بمبلغ ${amount}.`, 'يُحوَّل المبلغ إلى حسابك البنكي، ونرسل لك رقم مرجع التحويل فور تنفيذه.']
+      : input.status === 'paid'
+        ? [`حوّلت إدارة يوصل ${amount} إلى حسابك البنكي (طلب السحب ${input.id}).`, input.reference ? `رقم مرجع التحويل: «${input.reference}»` : '']
+        : [`لم تعتمد إدارة يوصل طلب السحب ${input.id} بمبلغ ${amount}، وعاد المبلغ إلى رصيدك المتاح.`];
+  if (input.adminNote) lines.push(`ملاحظة الإدارة: ${input.adminNote}`);
+  lines.push('التفاصيل في «الأرباح والسحب» بلوحة المورّد:', consoleUrl);
+  const subject =
+    input.status === 'approved'
+      ? 'تم اعتماد طلب السحب — يوصل'
+      : input.status === 'paid'
+        ? 'تم تحويل أرباحك — يوصل'
+        : 'تحديث على طلب السحب — يوصل';
+  notify(email, subject, lines);
+}
+
+/** A client signed a contract on its private link — tells the vendor. */
+export function notifyContractSigned(
+  email: string,
+  input: { number: string; clientName: string; signedByName: string; service?: string },
+): void {
+  notify(email, `وقّع العميل العقد ${input.number} — يوصل`, [
+    `وقّع ${input.signedByName || input.clientName} العقد ${input.number}${input.service ? ` — ${input.service}` : ''} إلكترونياً.`,
+    'نسخة العقد الموقّع مع إثبات التوقيع في «العقود» بلوحة المورّد:',
+    vendorConsoleOrdersUrl().replace(/#\/orders$/, '#/contracts'),
+  ]);
+}
+
 export async function sendPasswordResetEmail(email: string, code: string): Promise<boolean> {
   const to = String(email || '').trim().toLowerCase();
   if (!hasMailConfig() || !isMailbox(to) || !/^\d{6}$/.test(code)) return false;
