@@ -49,6 +49,7 @@ export const UPLOAD_PREFIX_BY_PURPOSE: Readonly<Record<string, string>> = {
   avatar: 'avatar',
   logo: 'vendor-logo',
   'vendor-logo': 'vendor-logo',
+  hero: 'site-hero',
 };
 
 export function uploadPrefixForPurpose(purpose: unknown): string {
