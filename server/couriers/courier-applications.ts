@@ -114,8 +114,10 @@ export function validateCourierApplication(input: Partial<CourierApplicationInpu
   if (!isValidSaudiPlateNumbers(plateNumbers)) {
     throw new Error('رقم اللوحة يجب أن يكون من رقم إلى أربعة أرقام');
   }
-  const email = String(input.email || '').trim().toLowerCase() || undefined;
-  if (email && (email.length > 254 || !EMAIL_RE.test(email))) throw new Error('البريد الإلكتروني غير صحيح');
+  // Email is how we reach the courier about the review; the mobile is optional.
+  const email = String(input.email || '').trim().toLowerCase();
+  if (!email) throw new Error('اكتب البريد الإلكتروني');
+  if (email.length > 254 || !EMAIL_RE.test(email)) throw new Error('البريد الإلكتروني غير صحيح');
   const rawPhone = String(input.phone || '').trim();
   const phone = rawPhone ? normalizeSaudiMobile(rawPhone) : undefined;
   if (phone === null) throw new Error('رقم الجوال غير صحيح — اكتبه بصيغة 05xxxxxxxx');

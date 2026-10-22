@@ -19,6 +19,7 @@ import { applyMoyasarRuntime } from './payments/moyasar-store.ts';
 import { registerPaymentRoutes } from './payments/payment-routes.ts';
 import { registerPayoutRoutes } from './payouts/payout-routes.ts';
 import { registerSeoRoutes } from './seo/seo-routes.ts';
+import { registerSiteAppearanceRoutes } from './site/site-appearance-routes.ts';
 import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerTrendingRoutes } from './catalog/trending-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
@@ -136,6 +137,9 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
       };
     },
   });
+
+  // «مظهر الواجهة»: the owner restyles the home hero cards without a deploy.
+  registerSiteAppearanceRoutes(app, auth, DATA_DIR);
 
   // «ترند هالأسبوع»: the public catalog ranked by this week's bookings and product views.
   registerTrendingRoutes(app, DATA_DIR, {
