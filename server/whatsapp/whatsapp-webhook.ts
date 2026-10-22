@@ -30,6 +30,20 @@ export function verifyWhatsAppSignature(appSecret: string, raw: Buffer, header: 
   return given.length === expected.length && crypto.timingSafeEqual(given, expected);
 }
 
+/**
+ * Kapso signs each forwarded webhook with `X-Webhook-Signature: <hex
+ * HMAC-SHA256(secret, raw body)>` (a bare hex digest, optionally `sha256=`
+ * prefixed), using the `secret_key` the webhook was registered with.
+ */
+export function verifyKapsoSignature(secret: string, raw: Buffer, header: unknown): boolean {
+  if (!secret || typeof header !== 'string') return false;
+  const hex = header.trim().replace(/^sha256=/i, '');
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return false;
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest();
+  const given = Buffer.from(hex, 'hex');
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
 type Obj = Record<string, unknown>;
 
 function obj(value: unknown): Obj {

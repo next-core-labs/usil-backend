@@ -16,7 +16,7 @@ import {
   type WhatsAppField,
 } from './whatsapp-settings';
 import { createWhatsAppStore, isWaId, normalizeWhatsAppPhone, type Person } from './whatsapp-store';
-import { parseWhatsAppWebhook, rawBodyOf, verifyWhatsAppSignature } from './whatsapp-webhook';
+import { parseWhatsAppWebhook, rawBodyOf, verifyKapsoSignature, verifyWhatsAppSignature } from './whatsapp-webhook';
 
 type Guard = (req: Request, res: Response, next: () => void) => void;
 
@@ -100,6 +100,8 @@ export function registerWhatsAppRoutes(
   /** The config that saving `saved` would produce: env values still win. */
   function effectiveConfig(saved: { accessToken: string; phoneNumberId: string }): WhatsAppConfig {
     const config = resolveWhatsAppConfig(dataDir);
+    // Kapso is configured entirely from the environment, not this saved form.
+    if (config.provider === 'kapso') return config;
     const envSet = (name: string) => Boolean(String(process.env[name] || '').trim());
     return {
       ...config,
@@ -254,12 +256,22 @@ export function registerWhatsAppRoutes(
 
   app.post(WEBHOOK_PATH, (req: Request, res: Response) => {
     const config = resolveWhatsAppConfig(dataDir);
-    if (!config.appSecret) {
-      return res.status(503).json({ success: false, error: 'WhatsApp app secret is not configured.' });
-    }
     const raw = rawBodyOf(req);
-    const signature = req.headers['x-hub-signature-256'];
-    if (!raw || !verifyWhatsAppSignature(config.appSecret, raw, signature)) {
+    let valid = false;
+    if (config.provider === 'kapso') {
+      if (!config.webhookSecret) {
+        return res.status(503).json({ success: false, error: 'Kapso webhook secret is not configured.' });
+      }
+      // Kapso has sent both header spellings across versions; accept either.
+      const signature = req.headers['x-webhook-signature'] ?? req.headers['x-kapso-signature'];
+      valid = Boolean(raw) && verifyKapsoSignature(config.webhookSecret, raw as Buffer, signature);
+    } else {
+      if (!config.appSecret) {
+        return res.status(503).json({ success: false, error: 'WhatsApp app secret is not configured.' });
+      }
+      valid = Boolean(raw) && verifyWhatsAppSignature(config.appSecret, raw as Buffer, req.headers['x-hub-signature-256']);
+    }
+    if (!valid) {
       return res.status(401).json({ success: false, error: 'Invalid signature.' });
     }
     try {

@@ -30,12 +30,22 @@ export const WHATSAPP_CLEARABLE_FIELDS: readonly WhatsAppField[] = [
 
 export type SettingSource = 'env' | 'saved' | 'none';
 
+export type WhatsAppProvider = 'meta' | 'kapso';
+
 /** What the app actually uses: env over saved. */
 export type WhatsAppConfig = {
+  /**
+   * `meta` talks to Meta's Graph API directly (Bearer access token, app-secret
+   * webhook signatures). `kapso` routes the identical Cloud API payloads through
+   * Kapso's Meta proxy (X-API-Key auth, Kapso-signed webhooks) — see README.
+   */
+  provider: WhatsAppProvider;
   accessToken: string;
   phoneNumberId: string;
   businessAccountId: string;
   appSecret: string;
+  /** Kapso only: the secret Kapso signs each forwarded webhook with. */
+  webhookSecret: string;
   verifyToken: string;
   graphBase: string;
   graphVersion: string;
@@ -72,7 +82,15 @@ const ENV_NAME: Record<WhatsAppField | 'verifyToken', string> = {
 
 export const DEFAULT_GRAPH_VERSION = 'v23.0';
 export const DEFAULT_GRAPH_BASE = 'https://graph.facebook.com';
+/** Kapso's Meta proxy: same Cloud API shape, different host + X-API-Key auth. */
+export const DEFAULT_KAPSO_GRAPH_BASE = 'https://api.kapso.ai/meta/whatsapp';
+export const DEFAULT_KAPSO_GRAPH_VERSION = 'v24.0';
 export const WEBHOOK_PATH = '/api/whatsapp/webhook';
+
+/** `WHATSAPP_PROVIDER=kapso` routes everything through Kapso; anything else is Meta direct. */
+export function resolveWhatsAppProvider(): WhatsAppProvider {
+  return envValue('WHATSAPP_PROVIDER').toLowerCase() === 'kapso' ? 'kapso' : 'meta';
+}
 
 function envValue(name: string): string {
   return String(process.env[name] || '').trim();
@@ -146,19 +164,44 @@ export function ensureVerifyToken(dataDir: string): string {
 
 export function resolveWhatsAppConfig(dataDir: string): WhatsAppConfig {
   const saved = loadWhatsAppSettings(dataDir);
+  const provider = resolveWhatsAppProvider();
+
+  if (provider === 'kapso') {
+    // Kapso authenticates with a project API key and signs each forwarded
+    // webhook with its own secret, so there is no Meta access token or app secret.
+    return {
+      provider,
+      accessToken: sanitizeSecret(envValue('KAPSO_API_KEY')) || saved.accessToken,
+      phoneNumberId: sanitizeNumericId(envValue(ENV_NAME.phoneNumberId)) || saved.phoneNumberId,
+      businessAccountId: sanitizeNumericId(envValue(ENV_NAME.businessAccountId)) || saved.businessAccountId,
+      appSecret: '',
+      webhookSecret: sanitizeSecret(envValue('KAPSO_WEBHOOK_SECRET')),
+      verifyToken: envValue(ENV_NAME.verifyToken) || saved.verifyToken,
+      graphBase: (envValue('WHATSAPP_GRAPH_BASE') || DEFAULT_KAPSO_GRAPH_BASE).replace(/\/+$/, ''),
+      graphVersion: envValue('WHATSAPP_GRAPH_VERSION') || DEFAULT_KAPSO_GRAPH_VERSION,
+    };
+  }
+
   return {
+    provider,
     accessToken: sanitizeSecret(envValue(ENV_NAME.accessToken)) || saved.accessToken,
     phoneNumberId: sanitizeNumericId(envValue(ENV_NAME.phoneNumberId)) || saved.phoneNumberId,
     businessAccountId: sanitizeNumericId(envValue(ENV_NAME.businessAccountId)) || saved.businessAccountId,
     appSecret: sanitizeSecret(envValue(ENV_NAME.appSecret)) || saved.appSecret,
+    webhookSecret: '',
     verifyToken: envValue(ENV_NAME.verifyToken) || saved.verifyToken,
     graphBase: (envValue('WHATSAPP_GRAPH_BASE') || DEFAULT_GRAPH_BASE).replace(/\/+$/, ''),
     graphVersion: envValue('WHATSAPP_GRAPH_VERSION') || DEFAULT_GRAPH_VERSION,
   };
 }
 
-/** Enough to send and receive: token + phone number ID + app secret (webhook signatures). */
+/**
+ * Enough to send and receive. Meta needs token + phone number ID + app secret
+ * (webhook signatures); Kapso carries the webhook secret separately, so it needs
+ * only the API key + phone number ID.
+ */
 export function isWhatsAppConfigured(config: WhatsAppConfig): boolean {
+  if (config.provider === 'kapso') return Boolean(config.accessToken && config.phoneNumberId);
   return Boolean(config.accessToken && config.phoneNumberId && config.appSecret);
 }
 

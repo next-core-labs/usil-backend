@@ -24,6 +24,16 @@ function graphUrl(config: WhatsAppConfig, pathAndQuery: string): string {
   return `${config.graphBase}/${config.graphVersion}/${pathAndQuery.replace(/^\/+/, '')}`;
 }
 
+/**
+ * Meta takes the access token as a Bearer; Kapso's proxy takes the project key
+ * as `X-API-Key`. The request shapes are otherwise identical.
+ */
+function authHeader(config: WhatsAppConfig): Record<string, string> {
+  return config.provider === 'kapso'
+    ? { 'X-API-Key': config.accessToken }
+    : { Authorization: `Bearer ${config.accessToken}` };
+}
+
 /** Meta's `error.message`, plus `error_data.details` when it says more. */
 export function graphErrorMessage(body: unknown, status: number): string {
   const error = (body as { error?: { message?: unknown; error_data?: { details?: unknown } } } | null)?.error;
@@ -44,7 +54,7 @@ async function graphCall<T>(
     res = await fetchImpl(graphUrl(config, pathAndQuery), {
       method: init.method || 'GET',
       headers: {
-        Authorization: `Bearer ${config.accessToken}`,
+        ...authHeader(config),
         ...(init.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
@@ -127,7 +137,7 @@ export function createGraphClient(fetchImpl: typeof fetch) {
     async download(config: WhatsAppConfig, url: string): Promise<Response | null> {
       try {
         const res = await fetchImpl(url, {
-          headers: { Authorization: `Bearer ${config.accessToken}` },
+          headers: authHeader(config),
           signal: AbortSignal.timeout(60_000),
         });
         return res.ok ? res : null;
