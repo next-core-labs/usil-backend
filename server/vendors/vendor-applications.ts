@@ -139,8 +139,18 @@ export type VendorApplicationInput = {
   whatsapp?: string;
 };
 
+/**
+ * Arabic-keyboard digits, spaces/dashes and copied direction marks are
+ * cleaned up, and 22 bare digits get their `SA` — the vendor console does the
+ * same before sending.
+ */
 export function normalizeIban(raw: string): string {
-  return String(raw || '').replace(/\s+/g, '').toUpperCase();
+  const iban = String(raw || '')
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0))
+    .replace(/[\s\-_.\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
+    .toUpperCase();
+  return /^\d{22}$/.test(iban) ? `SA${iban}` : iban;
 }
 
 export function isValidSaudiIban(raw: string): boolean {

@@ -21,6 +21,7 @@ const valid = {
   firstName: 'سعد',
   familyName: 'الدوسري',
   nationalId: '1088123456',
+  email: 'saad.courier@gmail.com',
   plateLetters: 'ب ر د',
   plateNumbers: '1234',
   carType: 'سيدان',
@@ -28,6 +29,15 @@ const valid = {
 };
 
 describe('courier-applications', () => {
+  it('requires an email and leaves the mobile optional', () => {
+    const { email: _email, ...noEmail } = valid;
+    assert.throws(() => validateCourierApplication(noEmail), /اكتب البريد الإلكتروني/);
+    assert.throws(() => validateCourierApplication({ ...valid, email: '   ' }), /اكتب البريد الإلكتروني/);
+    const clean = validateCourierApplication({ ...valid, email: ' Saad@Gmail.com ' });
+    assert.equal(clean.email, 'saad@gmail.com');
+    assert.equal(clean.phone, undefined);
+  });
+
   it('accepts Saudi ID/Iqama and official plate letters', () => {
     const clean = validateCourierApplication(valid);
     assert.equal(clean.nationalId, '1088123456');
@@ -66,7 +76,7 @@ describe('courier-applications', () => {
     const raw = JSON.parse(fs.readFileSync(path.join(dir, 'courier-applications.json'), 'utf-8'))[0];
     assert.deepEqual(
       Object.keys(raw).sort(),
-      ['carType', 'createdAt', 'familyName', 'firstName', 'fulfillment', 'id', 'nationalId', 'plateLetters', 'plateNumbers', 'products', 'status'].sort(),
+      ['carType', 'createdAt', 'email', 'familyName', 'firstName', 'fulfillment', 'id', 'nationalId', 'plateLetters', 'plateNumbers', 'products', 'status'].sort(),
     );
     assert.deepEqual(raw.fulfillment, ['hour', 'same_day']);
     assert.throws(() => store.submit(valid), /بانتظار موافقة/);
