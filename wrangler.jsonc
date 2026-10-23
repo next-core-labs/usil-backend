@@ -33,8 +33,15 @@
     "PUBLIC_SITE_URL": "https://usil.app",
     "APP_URL": "https://usil.app",
     "VENDOR_CONSOLE_URL": "https://vendor.usil.app",
-    "MOYASAR_WEBHOOK_URL": "https://hooks.usil.app/api/payments/webhook"
+    "MOYASAR_WEBHOOK_URL": "https://hooks.usil.app/api/payments/webhook",
+    "WHATSAPP_PROVIDER": "kapso",
+    "WHATSAPP_PHONE_NUMBER_ID": "1103679859495148",
+    "WHATSAPP_BUSINESS_ACCOUNT_ID": "957345127139923",
+    "WHATSAPP_GRAPH_BASE": "https://api.kapso.ai/meta/whatsapp",
+    "WHATSAPP_GRAPH_VERSION": "v24.0",
+    "WHATSAPP_WEBHOOK_URL": "https://hooks.usil.app"
   }
   // Secrets (wrangler secret put <NAME>): OWNER_EMAIL, OWNER_PASSWORD, RESEND_API_KEY, MAIL_FROM,
-  // MOYASAR_SECRET_KEY, MOYASAR_PUBLISHABLE_KEY, MOYASAR_WEBHOOK_SECRET, GEMINI_API_KEY
+  // MOYASAR_SECRET_KEY, MOYASAR_PUBLISHABLE_KEY, MOYASAR_WEBHOOK_SECRET, GEMINI_API_KEY,
+  // KAPSO_API_KEY, KAPSO_WEBHOOK_SECRET
 }
