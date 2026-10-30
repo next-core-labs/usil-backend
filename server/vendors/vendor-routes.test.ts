@@ -13,7 +13,8 @@ function tmpDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vendor-api-'));
   // Listing photos must exist under data/uploads.
   fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
-  for (const name of ['listing-a.jpg', 'listing-b.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+  // Distinct bytes per file: one photo under two names counts once.
+  for (const name of ['listing-a.jpg', 'listing-b.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), name);
   return dir;
 }
 
@@ -601,7 +602,7 @@ describe('vendor-routes QA fixes', () => {
       await vendor.close();
     }
     fs.rmSync(path.join(dir, 'uploads', 'listing-a.jpg'));
-    fs.writeFileSync(path.join(dir, 'uploads', 'listing-c.jpg'), 'x');
+    fs.writeFileSync(path.join(dir, 'uploads', 'listing-c.jpg'), 'listing-c.jpg');
 
     const admin = await serve(fakeAuth('admin', 'usr-admin'), dir);
     try {
@@ -993,7 +994,7 @@ describe('GET /api/vendors/:id/blocked-dates — public availability', () => {
   it('with ?listingId= adds the days that listing is already booked', async () => {
     const dir = tmpDir();
     fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
-    for (const name of ['p1.jpg', 'p2.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+    for (const name of ['p1.jpg', 'p2.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), name);
     const store = createVendorStore(dir);
     const listing = store.addListing('usr-shop', {
       title: 'ركن قهوة',

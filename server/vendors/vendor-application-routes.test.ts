@@ -60,6 +60,8 @@ function fakeAuth(role: 'admin' | 'vendor' | null) {
 
 const TINY_PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+/** A second, different photo: the same one twice no longer meets the two-photo minimum. */
+const TINY_PNG_2 = `data:image/png;base64,${Buffer.concat([Buffer.from(TINY_PNG.split(',')[1], 'base64'), Buffer.from([0])]).toString('base64')}`;
 
 const payload = {
   firstName: 'نواف',
@@ -82,7 +84,7 @@ const payload = {
     category: 'hospitality',
     price: 850,
     fulfillment: ['hour', 'same_day'],
-    images: [TINY_PNG, TINY_PNG],
+    images: [TINY_PNG, TINY_PNG_2],
   },
 };
 

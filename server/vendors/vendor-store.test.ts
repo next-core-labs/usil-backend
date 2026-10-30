@@ -10,7 +10,7 @@ function tmpDir() {
   // Listing photos must exist under data/uploads now.
   fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
   for (const name of ['listing-a.jpg', 'listing-b.jpg', 'listing-c.jpg', 'logo.png']) {
-    fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+    fs.writeFileSync(path.join(dir, 'uploads', name), name);
   }
   return dir;
 }
@@ -719,7 +719,7 @@ describe('vendor-store — deleted vendor', () => {
     const uploads = path.join(dir, 'uploads');
     fs.mkdirSync(uploads, { recursive: true });
     for (const name of ['listing-own.jpg', 'listing-shared.jpg', 'other-vendor.jpg']) {
-      fs.writeFileSync(path.join(uploads, name), 'x');
+      fs.writeFileSync(path.join(uploads, name), name);
     }
     fs.writeFileSync(
       store.file,

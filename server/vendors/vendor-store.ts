@@ -331,6 +331,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   const listPlatformBookings = options.listPlatformBookings || (() => createBookingStore(dataDir).list());
   const uploadsRoot = path.resolve(dataDir, 'uploads');
   const IMAGE_INVALID_AR = 'صورة المنتج غير صالحة — ارفع الصورة من جهازك';
+  const IMAGE_DUPLICATE_AR = 'أضفت نفس الصورة مرتين — اختر صوراً مختلفة للمنتج';
   const offices = createVendorOfficeStore(dataDir);
 
   function readFile(): VendorStoreFile {
@@ -392,23 +393,27 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
 
   /* ── Listing images ───────────────────────────────────────────── */
 
-  /** `/uploads/<flat file name>` that exists under data/uploads — no traversal, no sub-folders. */
-  function isExistingUpload(url: string): boolean {
-    if (!url.startsWith('/uploads/')) return false;
+  /** Disk path of `/uploads/<flat file name>` when it exists under data/uploads — no traversal, no sub-folders. */
+  function existingUploadPath(url: string): string | null {
+    if (!url.startsWith('/uploads/')) return null;
     let name: string;
     try {
       name = decodeURIComponent(url.slice('/uploads/'.length));
     } catch {
-      return false;
+      return null;
     }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes('..')) return false;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes('..')) return null;
     const full = path.resolve(uploadsRoot, name);
-    if (path.dirname(full) !== uploadsRoot) return false;
+    if (path.dirname(full) !== uploadsRoot) return null;
     try {
-      return fs.statSync(full).isFile();
+      return fs.statSync(full).isFile() ? full : null;
     } catch {
-      return false;
+      return null;
     }
+  }
+
+  function isExistingUpload(url: string): boolean {
+    return existingUploadPath(url) !== null;
   }
 
   function rawImageList(images: unknown, legacyImage?: unknown): string[] {
@@ -423,18 +428,33 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
    * Every vendor-supplied photo must be an upload that exists on disk or an
    * inline `data:image/…` photo (core's `isAllowedListingImage`), which is
    * stored only after the rest of the listing validates.
+   *
+   * The same photo under two names is refused: one placeholder picked twice
+   * met the two-photo minimum and left whole storefronts showing black tiles.
    */
   function checkListingImages(images: unknown, legacyImage?: unknown): Array<{ kind: 'upload' | 'data'; value: string }> {
     const out: Array<{ kind: 'upload' | 'data'; value: string }> = [];
+    const digests = new Set<string>();
     for (const value of rawImageList(images, legacyImage)) {
       if (isStockMediaUrl(value) || !isAllowedListingImage(value)) throw new VendorStoreError(IMAGE_INVALID_AR);
+      if (out.some((row) => row.value === value)) continue;
+      let bytes: Buffer;
+      let kind: 'upload' | 'data';
       if (value.startsWith('data:image/')) {
-        if (!parseDataUrl(value, UPLOAD_MAX_BYTES)) throw new VendorStoreError(IMAGE_INVALID_AR);
-        out.push({ kind: 'data', value });
-        continue;
+        const parsed = parseDataUrl(value, UPLOAD_MAX_BYTES);
+        if (!parsed) throw new VendorStoreError(IMAGE_INVALID_AR);
+        bytes = parsed.buffer;
+        kind = 'data';
+      } else {
+        const full = existingUploadPath(value);
+        if (!full) throw new VendorStoreError(IMAGE_INVALID_AR);
+        bytes = fs.readFileSync(full);
+        kind = 'upload';
       }
-      if (!isExistingUpload(value)) throw new VendorStoreError(IMAGE_INVALID_AR);
-      if (!out.some((row) => row.value === value)) out.push({ kind: 'upload', value });
+      const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+      if (digests.has(digest)) throw new VendorStoreError(IMAGE_DUPLICATE_AR);
+      digests.add(digest);
+      out.push({ kind, value });
     }
     return out.slice(0, LISTING_MAX_IMAGES);
   }
