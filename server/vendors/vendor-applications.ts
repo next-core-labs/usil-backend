@@ -344,11 +344,28 @@ export function parseVendorDetails(input: VendorDetailsInput): DetailsPatch {
 
 export type MissingKey = 'names' | 'nationalId' | 'bank' | 'fulfillment' | 'socials' | 'listings';
 
+/**
+ * What an approved vendor may still send to `PUT /api/vendor/application`:
+ * the fields behind `missingForApproval`. Store name and logo are the brand
+ * screen's once approved.
+ */
+export const COMPLETION_FIELDS = [
+  'firstName',
+  'fatherName',
+  'familyName',
+  'nationalId',
+  'bankName',
+  'iban',
+  'accountHolderName',
+  'fulfillment',
+] as const satisfies ReadonlyArray<keyof VendorDetailsInput>;
+
 export type MissingItem = { key: MissingKey; label: string };
 
 /**
- * What still stands between a pending vendor and approval. The owner cannot
- * approve while this is non-empty, and the vendor sees the same list.
+ * What the vendor's file still lacks. The owner approves past it only on
+ * purpose, and the vendor keeps seeing the list — before and after approval —
+ * until it is empty.
  */
 export function missingForApproval(
   row: Pick<
@@ -475,7 +492,8 @@ export function createVendorApplicationStore(dataDir: string) {
     const rows = readAll();
     const row = rows.find((item) => item.id === id);
     if (!row) return null;
-    if (row.status !== 'pending') throw new Error('هذا الطلب تمت مراجعته — ما يمكن تعديله الآن');
+    // Approved vendors may still complete their file; the route limits them to the approval fields.
+    if (row.status === 'rejected') throw new Error('هذا الطلب تمت مراجعته — ما يمكن تعديله الآن');
     Object.assign(row, patch);
     writeAll(rows);
     return row;
