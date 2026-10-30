@@ -13,7 +13,8 @@ function tmpDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'usil-vendor-api-'));
   // Listing photos must exist under data/uploads.
   fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
-  for (const name of ['listing-a.jpg', 'listing-b.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+  // Distinct bytes per file: one photo under two names counts once.
+  for (const name of ['listing-a.jpg', 'listing-b.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), name);
   return dir;
 }
 
@@ -601,7 +602,7 @@ describe('vendor-routes QA fixes', () => {
       await vendor.close();
     }
     fs.rmSync(path.join(dir, 'uploads', 'listing-a.jpg'));
-    fs.writeFileSync(path.join(dir, 'uploads', 'listing-c.jpg'), 'x');
+    fs.writeFileSync(path.join(dir, 'uploads', 'listing-c.jpg'), 'listing-c.jpg');
 
     const admin = await serve(fakeAuth('admin', 'usr-admin'), dir);
     try {
@@ -621,6 +622,34 @@ describe('vendor-routes QA fixes', () => {
       assert.equal(fixedJson.vendorId, 'usr-vendor');
     } finally {
       await admin.close();
+    }
+  });
+
+  it('lets an admin delete any vendor listing', async () => {
+    const dir = tmpDir();
+    const vendor = await serve(fakeAuth('vendor'), dir);
+    let id = '';
+    try {
+      id = (await (await vendor.send('POST', '/api/vendor/listings', listing())).json()).listing.id;
+    } finally {
+      await vendor.close();
+    }
+
+    const admin = await serve(fakeAuth('admin', 'usr-admin'), dir);
+    try {
+      assert.equal((await admin.send('DELETE', `/api/admin/listings/${id}`)).status, 200);
+      const left = (await (await admin.send('GET', '/api/admin/listings')).json()).data;
+      assert.ok(!left.some((row: { id: string }) => row.id === id));
+      assert.equal((await admin.send('DELETE', `/api/admin/listings/${id}`)).status, 404);
+    } finally {
+      await admin.close();
+    }
+
+    const stranger = await serve(fakeAuth('vendor', 'usr-other'), dir);
+    try {
+      assert.equal((await stranger.send('DELETE', '/api/admin/listings/lst-x')).status, 403);
+    } finally {
+      await stranger.close();
     }
   });
 });
@@ -993,7 +1022,7 @@ describe('GET /api/vendors/:id/blocked-dates — public availability', () => {
   it('with ?listingId= adds the days that listing is already booked', async () => {
     const dir = tmpDir();
     fs.mkdirSync(path.join(dir, 'uploads'), { recursive: true });
-    for (const name of ['p1.jpg', 'p2.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), 'x');
+    for (const name of ['p1.jpg', 'p2.jpg']) fs.writeFileSync(path.join(dir, 'uploads', name), name);
     const store = createVendorStore(dir);
     const listing = store.addListing('usr-shop', {
       title: 'ركن قهوة',

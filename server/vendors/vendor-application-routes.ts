@@ -2,6 +2,7 @@ import { fs } from '../shared/data-fs.ts';
 import path from 'path';
 import type { Express, Request, Response } from 'express';
 import {
+  COMPLETION_FIELDS,
   createVendorApplicationStore,
   missingForApproval,
   parseVendorFulfillment,
@@ -12,9 +13,9 @@ import {
 } from './vendor-applications';
 import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
 import { notifyVendorApplicationDecision, notifyVendorApplicationReceived } from '../shared/optional-mail';
-import { parseDataUrl, saveUpload, UPLOAD_MAX_BYTES, uploadsDir } from '../auth/avatar';
+import { saveUpload, uploadsDir } from '../auth/avatar';
 import { createVendorStore } from './vendor-store';
-import { persistListingImages } from './listing-media';
+import { dataUrlDigest, persistListingImages } from './listing-media';
 import { personNameFromParts, profileFromApplication, publicVendorFile } from './vendor-profile';
 import { parseVendorSocials, type VendorSocials } from './vendor-socials';
 import { LISTING_MIN_IMAGES, validateVendorListing } from './vendor-listings';
@@ -35,14 +36,17 @@ const LISTING_PHOTOS_REQUIRED = 'أضف صورتين حقيقيتين للمنت
 function countUsableListingImages(images: unknown, legacyImage?: unknown): number {
   const raw = [...(Array.isArray(images) ? images : []), legacyImage].map((item) => String(item || '').trim());
   const existing = new Set<string>();
-  let fresh = 0;
+  const fresh = new Set<string>();
   for (const value of raw) {
     if (!value || isStockMediaUrl(value)) continue;
     if (value.startsWith('/uploads/')) existing.add(value);
-    // Each data URL becomes its own file, so identical ones still count separately.
-    else if (value.startsWith('data:image/') && parseDataUrl(value, UPLOAD_MAX_BYTES)) fresh += 1;
+    // The same photo picked twice counts once — a single placeholder must not meet the two-photo minimum.
+    else if (value.startsWith('data:image/')) {
+      const digest = dataUrlDigest(value);
+      if (digest) fresh.add(digest);
+    }
   }
-  return existing.size + fresh;
+  return existing.size + fresh.size;
 }
 
 function removeUploads(dataDir: string, urls: string[]) {
@@ -168,13 +172,36 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
     }
   });
 
-  /** A pending vendor completes their file: names, ID, bank, lanes, logo. */
+  /**
+   * A pending vendor completes their file: names, ID, bank, lanes, logo. A
+   * vendor approved with a short file keeps completing it here, limited to
+   * `COMPLETION_FIELDS`.
+   */
   app.put('/api/vendor/application', (req: Request, res: Response) => {
     const user = auth.userFromRequest(req);
     if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
     const own = store.findByEmail(user.email);
-    if (!own || own.status !== 'pending') {
+    const approved = own?.status === 'approved' && user.role === 'vendor';
+    if (!own || (own.status !== 'pending' && !approved)) {
       return res.status(404).json({ success: false, error: 'لا يوجد طلب انضمام قيد المراجعة لهذا الحساب' });
+    }
+    if (approved) {
+      const raw = (req.body || {}) as Record<string, unknown>;
+      const body = Object.fromEntries(COMPLETION_FIELDS.filter((key) => key in raw).map((key) => [key, raw[key]]));
+      try {
+        const row = store.updateDetails(own.id, body);
+        if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+        // Only what changed here: the brand screen owns the store name and logo now.
+        workspaces.saveVendorWorkspace(user.id, {
+          profile: { personName: personNameFromParts(row) || undefined, fulfillment: row.fulfillment },
+        });
+        return res.json({ success: true, application: publicApplication(row), missing: progressFor(row).missing });
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          error: error instanceof Error ? error.message : 'تعذر حفظ البيانات',
+        });
+      }
     }
     const written: string[] = [];
     try {
@@ -331,7 +358,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
     res.json({
       success: true,
       application: application ? publicApplication(application) : null,
-      missing: application?.status === 'pending' ? progressFor(application).missing : [],
+      missing: application && application.status !== 'rejected' ? progressFor(application).missing : [],
       profile,
       file: application?.status === 'approved' || user.role === 'vendor' ? publicVendorFile({ ...profile, status: 'approved' }) : publicVendorFile(profile),
       workspace: ws
@@ -358,7 +385,8 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       if (!pending) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
       if (pending.status === 'pending') {
         const { missing } = progressFor(pending);
-        if (missing.length) {
+        // The owner may approve a short file on purpose; the vendor keeps the list to finish.
+        if (missing.length && req.body?.allowIncomplete !== true) {
           return res.status(400).json({
             success: false,
             error: `ملف المورّد ناقص: ${missing.map((item) => item.label).join('، ')}`,

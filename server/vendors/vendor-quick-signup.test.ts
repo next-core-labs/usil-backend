@@ -90,7 +90,8 @@ const LISTING = {
   price: 250,
   priceUnit: 'للمناسبة',
   cities: ['الرياض'],
-  images: [`data:image/png;base64,${PNG.toString('base64')}`, `data:image/png;base64,${PNG.toString('base64')}`],
+  // Two different photos: the same one twice no longer meets the two-photo minimum.
+  images: [`data:image/png;base64,${PNG.toString('base64')}`, `data:image/png;base64,${Buffer.concat([PNG, Buffer.from([0])]).toString('base64')}`],
   fulfillment: ['same_day'],
   bookingMode: 'approval',
 };
@@ -228,7 +229,7 @@ describe('vendor quick sign-up — dashboard first, approval after', () => {
     }
   });
 
-  it('blocks approval until the file is complete, then publishes the products', async () => {
+  it('refuses a short file unless the owner says so, then publishes the products', async () => {
     const { url, close } = await mount();
     try {
       const { cookie } = await signUp(url);
@@ -259,8 +260,41 @@ describe('vendor quick sign-up — dashboard first, approval after', () => {
       assert.equal((await call(url, 'GET', '/api/vendor/listings', cookie)).status, 200);
       // The password chosen at sign-up still signs in.
       assert.ok(await login(url, SIGNUP.email, SIGNUP.password));
-      // Approved files are no longer editable through the pending route.
-      assert.equal((await call(url, 'PUT', '/api/vendor/application', cookie, DETAILS)).status, 404);
+      // Approved: only the completion fields go through, never the store name.
+      const late = await call(url, 'PUT', '/api/vendor/application', cookie, { ...DETAILS, projectName: 'اسم آخر' });
+      assert.equal(late.status, 200);
+      assert.equal((await late.json()).application.projectName, SIGNUP.projectName);
+    } finally {
+      await close();
+    }
+  });
+
+  it('lets the owner approve a short file on purpose, and the vendor keeps the list until it is done', async () => {
+    const { url, close } = await mount();
+    try {
+      const { cookie } = await signUp(url);
+      const admin = await login(url, ADMIN.email, ADMIN.password);
+      const row = await applicationId(url, admin);
+      const ok = await call(url, 'POST', `/api/admin/vendor-applications/${row.id}/approve`, admin, { allowIncomplete: true });
+      const okJson = await ok.json();
+      assert.equal(ok.status, 200, okJson.error);
+      assert.equal(okJson.user.role, 'vendor');
+
+      const before = await (await call(url, 'GET', '/api/me/vendor-file', cookie)).json();
+      assert.equal(before.application.status, 'approved');
+      assert.ok(before.missing.some((item: { key: string }) => item.key === 'bank'));
+
+      // Renamed on the brand screen after approval: completing the file must not undo it.
+      const brand = await call(url, 'PUT', '/api/vendor/workspace', cookie, { profile: { projectName: 'بيت القهوة الجديد' } });
+      assert.equal(brand.status, 200, (await brand.json()).error);
+      await completeFile(url, cookie);
+
+      const after = await (await call(url, 'GET', '/api/me/vendor-file', cookie)).json();
+      assert.deepEqual(after.missing, []);
+      assert.deepEqual(after.profile.fulfillment, ['same_day']);
+      assert.equal(after.workspace.profile.projectName, 'بيت القهوة الجديد');
+      const adminRow = await applicationId(url, admin);
+      assert.deepEqual(adminRow.missing, []);
     } finally {
       await close();
     }
