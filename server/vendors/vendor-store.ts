@@ -1033,6 +1033,11 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     return updateListing(owner, id, input, undefined, { admin: true });
   }
 
+  function removeListingAdmin(id: string): boolean {
+    const owner = listingOwners().get(String(id || ''));
+    return owner ? removeListing(owner, id) : false;
+  }
+
   /* ── Socials ──────────────────────────────────────────────────── */
 
   function getSocials(vendorId: string): VendorSocials {
@@ -1272,6 +1277,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     removeListing,
     listAllListings,
     updateListingAdmin,
+    removeListingAdmin,
     listingToServiceItem,
     listingToPublicService,
     /** Platform orders (read-only) — they hold listing dates on the public availability. */

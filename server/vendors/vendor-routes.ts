@@ -552,6 +552,11 @@ export function registerVendorRoutes(app: Express, auth: AuthApi, dataDir: strin
     }
   });
 
+  app.delete('/api/admin/listings/:id', adminOnly, (req: Request, res: Response) => {
+    if (!store.removeListingAdmin(req.params.id)) return res.status(404).json({ success: false, error: 'المنتج غير موجود' });
+    res.json({ success: true });
+  });
+
   /** Title, description and logo for `/vendor/<id>` — null when the page would 404. */
   function publicVendorSeo(id: string): { title: string; description: string; image: string } | null {
     const { vendorId, source } = publicVendor(String(id || '').trim());
