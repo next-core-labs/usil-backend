@@ -13,6 +13,7 @@ import {
 } from './vendor-applications';
 import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
 import { notifyVendorApplicationDecision, notifyVendorApplicationReceived } from '../shared/optional-mail';
+import { pushStaffVendorApplication, pushVendorApplicationDecision } from '../push/push-notices.ts';
 import { saveUpload, uploadsDir } from '../auth/avatar';
 import { createVendorStore } from './vendor-store';
 import { dataUrlDigest, persistListingImages } from './listing-media';
@@ -157,6 +158,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       if (user && auth.startSession && ownership === 'new') auth.startSession(res, user.id);
       workspaces.seedWorkspaceFromApplication(user?.id || created.id, created);
       notifyVendorApplicationReceived(created.email, created.projectName);
+      pushStaffVendorApplication(created.projectName);
       res.status(201).json({
         success: true,
         application: publicApplication(created),
@@ -319,6 +321,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       const listing = workspaces.addListing(vendorId, listingDraft, created.projectName);
       const profile = profileFromApplication(created, vendorId, { listingCount: 1 });
       notifyVendorApplicationReceived(created.email, created.projectName);
+      pushStaffVendorApplication(created.projectName);
       res.status(201).json({
         success: true,
         application: publicApplication(created),
@@ -410,6 +413,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       }
       const workspace = workspaces.seedWorkspaceFromApplication(user.id, row);
       notifyVendorApplicationDecision(row.email, row.projectName, 'approved');
+      pushVendorApplicationDecision(row.email, row.projectName, 'approved');
       res.json({
         success: true,
         application: publicApplication(row),
@@ -446,6 +450,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       if (account && account.role === 'client') leftovers.push(account.id);
       for (const id of leftovers) workspaces.removeWorkspace(id);
       notifyVendorApplicationDecision(row.email, row.projectName, 'rejected', row.rejectReason);
+      pushVendorApplicationDecision(row.email, row.projectName, 'rejected');
       res.json({ success: true, application: publicApplication(row) });
     } catch (error) {
       res.status(400).json({

@@ -48,7 +48,14 @@ npx wrangler secret put MOYASAR_SECRET_KEY
 npx wrangler secret put MOYASAR_PUBLISHABLE_KEY
 npx wrangler secret put MOYASAR_WEBHOOK_SECRET   # the one already registered with Moyasar
 npx wrangler secret put GEMINI_API_KEY     # optional
+npx wrangler secret put FCM_SERVICE_ACCOUNT      # push: Firebase service-account JSON
+npx wrangler secret put FIREBASE_WEB_CONFIG      # push in the consoles: the web app's firebaseConfig JSON
+npx wrangler secret put FIREBASE_VAPID_KEY       # push in the consoles: Web Push certificate public key
 ```
+
+Push is optional: without `FCM_SERVICE_ACCOUNT` nothing is sent and the consoles hide
+their bell. The native app also needs `google-services.json` (Android) and
+`GoogleService-Info.plist` (iOS) from the same Firebase project — see `../usil/HOW_TO_RUN.txt`.
 
 The non-secret settings (`NODE_ENV`, `PUBLIC_SITE_URL`, `VENDOR_CONSOLE_URL`,
 `MOYASAR_WEBHOOK_URL`, …) are under `vars` in `wrangler.jsonc`.

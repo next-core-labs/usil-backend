@@ -2,6 +2,7 @@ import type { Express, Request, Response } from 'express';
 import type { PlatformBooking } from '../bookings/booking-store.ts';
 import { isVendorSupervisor } from '../auth/roles.ts';
 import { notifyPayoutDecision, notifyPayoutRequested } from '../shared/optional-mail.ts';
+import { pushPayoutDecision, pushStaffPayoutRequested } from '../push/push-notices.ts';
 import { computeVendorEarnings, rawBalanceHalalas, type VendorEarnings } from './earnings.ts';
 import { createPayoutStore, parsePayoutInput, PayoutError, type PayoutRequest } from './payout-store.ts';
 
@@ -133,6 +134,7 @@ export function registerPayoutRoutes(app: Express, auth: AuthApi, dataDir: strin
       }
       const row = store.add(vendorId, vendorName(vendorId, 'مورّد'), input);
       notifyPayoutRequested(row.vendorName, row.amount, row.id);
+      pushStaffPayoutRequested(row.vendorName, row.amount);
       res.status(201).json({ success: true, data: row });
     } catch (error) {
       errorOut(res, error, 'تعذر إرسال طلب السحب.');
@@ -165,6 +167,9 @@ export function registerPayoutRoutes(app: Express, auth: AuthApi, dataDir: strin
         String(actor?.name || actor?.email || actor?.id || ''),
       );
       const email = String(vendorUser(row.vendorId)?.email || '');
+      if (row.status === 'approved' || row.status === 'paid' || row.status === 'rejected') {
+        pushPayoutDecision(row.vendorId, { id: row.id, amount: row.amount, status: row.status });
+      }
       if (email && (row.status === 'approved' || row.status === 'paid' || row.status === 'rejected')) {
         notifyPayoutDecision(email, {
           id: row.id,
