@@ -77,6 +77,14 @@ export function pushContractSigned(vendorId: string, input: { number: string; si
   });
 }
 
+export function pushVendorBankChanged(vendorId: string): void {
+  pushToUser(vendorId, {
+    title: 'تم تعديل بياناتك البنكية',
+    body: 'عدّلت إدارة يوصل الآيبان أو البنك في ملفك. إذا ما طلبت هذا التعديل تواصل معنا فوراً.',
+    links: vendorConsole('storefront'),
+  });
+}
+
 export function pushPayLinkPaid(
   vendorId: string,
   input: { kind: 'invoice' | 'quotation'; docNumber: string; clientName: string; amount: number },

@@ -175,6 +175,61 @@ describe('vendor-application-routes', () => {
     await close();
   });
 
+  it('lets a supervisor read and edit an approved vendor\'s file, bank details included, by ?vendorId=', async () => {
+    const app = express();
+    app.use(express.json());
+    const auth = fakeAuth('admin');
+    registerVendorApplicationRoutes(app, auth as any, tmpDir());
+    const { url, close } = await listen(app);
+    try {
+      const created = await fetch(`${url}/api/vendor-applications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const id = (await created.json()).application.id;
+      await fetch(`${url}/api/admin/vendor-applications/${id}/approve`, { method: 'POST' });
+      const vendorId = auth.created.find((row) => row.email === 'apply@usil.app')!.id;
+      const put = (query: string, body: unknown) =>
+        fetch(`${url}/api/vendor/application${query}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+      const file = await (await fetch(`${url}/api/me/vendor-file?vendorId=${vendorId}`)).json();
+      assert.equal(file.application.iban, 'SA0380000000608010167519');
+      assert.equal(file.profile.projectName, 'إرث الضيافة');
+      // Without ?vendorId= the supervisor still gets their own (empty) file.
+      assert.equal((await (await fetch(`${url}/api/me/vendor-file`)).json()).application, null);
+
+      const saved = await put(`?vendorId=${vendorId}`, {
+        iban: 'SA4420000001234567891234',
+        bankName: 'البنك الأهلي السعودي',
+        accountHolderName: 'مؤسسة إرث الضيافة',
+        projectName: 'إرث الضيافة الملكية',
+        commercialRegister: '1010123456',
+      });
+      assert.equal(saved.status, 200);
+      const after = await (await fetch(`${url}/api/me/vendor-file?vendorId=${vendorId}`)).json();
+      assert.equal(after.application.iban, 'SA4420000001234567891234');
+      assert.equal(after.application.accountHolderName, 'مؤسسة إرث الضيافة');
+      assert.equal(after.application.commercialRegister, '1010123456');
+      assert.equal(after.profile.projectName, 'إرث الضيافة الملكية');
+
+      assert.equal((await put(`?vendorId=${vendorId}`, { iban: 'SA12' })).status, 400);
+      assert.equal((await put('?vendorId=usr-nobody', { iban: 'SA4420000001234567891234' })).status, 404);
+
+      // A vendor naming another vendor gets only their own file — ?vendorId= is for supervisors.
+      auth.userFromRequest = () => ({ id: 'usr-other', name: 'مورّد', email: 'other@usil.app', phone: '0500000001', role: 'vendor' });
+      assert.equal((await (await fetch(`${url}/api/me/vendor-file?vendorId=${vendorId}`)).json()).application, null);
+      assert.equal((await put(`?vendorId=${vendorId}`, { iban: 'SA4420000001234567891234' })).status, 404);
+      assert.equal((await (await fetch(`${url}/api/me/vendor-file?vendorId=${vendorId}`)).json()).application, null);
+    } finally {
+      await close();
+    }
+  });
+
   it('rejects guests from the admin list', async () => {
     const app = express();
     app.use(express.json());
