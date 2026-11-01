@@ -175,6 +175,24 @@ describe('seo-routes', () => {
     assert.equal(seen.size, 63);
   });
 
+  it('keeps the brand search «يوصل» on the homepage, not the provider sign-up page', () => {
+    const settings = defaultSeoSettings();
+    const html = '<html><head><title>قديم</title></head><body><div id="root"></div></body></html>';
+    const titleOf = (path: string) => /<title>([\s\S]*?)<\/title>/.exec(injectSeoIntoHtml(html, settings, path))?.[1] || '';
+
+    assert.match(titleOf('/'), /^يوصل \|/);
+    const providers = injectSeoIntoHtml(html, settings, '/providers');
+    assert.match(titleOf('/providers'), /مورّد/);
+    assert.doesNotMatch(titleOf('/providers'), /^يوصل/);
+    assert.match(providers, /<h1>انضم كمورّد معتمد في يوصل<\/h1>/);
+    assert.doesNotMatch(providers, /name="robots"/);
+
+    for (const path of ['/login', '/cart', '/checkout', '/orders', '/account', '/chat', '/payment/success', '/sign/abc']) {
+      assert.match(injectSeoIntoHtml(html, settings, path), /name="robots" content="noindex, follow"/, path);
+    }
+    assert.doesNotMatch(injectSeoIntoHtml(html, settings, '/'), /name="robots"/);
+  });
+
   it('points share images at a real PNG rather than the SVG favicon', () => {
     const settings = defaultSeoSettings();
     assert.match(settings.ogImage, /^https:\/\/usil\.app\/og\/og-default\.png$/);
@@ -202,6 +220,7 @@ describe('seo-routes', () => {
     assert.equal(homeGraph[0]['@type'], 'Organization');
     assert.equal(homeGraph[0].logo.url, 'https://usil.app/og/logo-512.png');
     assert.equal(homeGraph[1]['@type'], 'WebSite');
+    assert.equal(homeGraph[1].alternateName, 'Usil');
 
     const service = injectSeoIntoHtml(html, settings, '/service/royal-saudi-coffee');
     const serviceBlock = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/.exec(service);

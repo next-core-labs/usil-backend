@@ -32,6 +32,8 @@ export function organizationJsonLd(baseUrl: string, description: string) {
         '@id': `${baseUrl}/#website`,
         url: `${baseUrl}/`,
         name: 'يوصل',
+        // جوجل يقرأ اسم الموقع من WebSite، فالاسم اللاتيني يربط بحث «Usil» بالرئيسية أيضًا
+        alternateName: 'Usil',
         inLanguage: 'ar-SA',
         publisher: { '@id': orgId },
       },
