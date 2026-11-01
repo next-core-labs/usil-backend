@@ -877,6 +877,11 @@ describe('vendor back office — persisted with the workspace', () => {
       const huge = 'x'.repeat(1_600_000);
       assert.equal((await send(`${url}/api/vendor/office`, 'PATCH', { expenses: [{ note: huge }] })).status, 413);
       assert.deepEqual((await send(`${url}/api/vendor/office`, 'GET')).json.data.expenses, [{ id: 'exp-1' }]);
+      // «عملائي» is its own key: saving clients keeps the other screens' lists.
+      const clients = await send(`${url}/api/vendor/office`, 'PATCH', { clients: [{ id: 'cl-1', name: 'أبو فهد' }] });
+      assert.equal(clients.status, 200);
+      assert.deepEqual(clients.json.data.clients, [{ id: 'cl-1', name: 'أبو فهد' }]);
+      assert.deepEqual(clients.json.data.quotations, [{ id: 'q-1' }]);
     } finally {
       await close();
     }

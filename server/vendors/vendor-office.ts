@@ -5,8 +5,8 @@ import { readJsonFile, writeJsonFile } from '../shared/json-file.ts';
 
 /**
  * المكتب الخلفي للمورّد — invoices, crew, expenses, payroll, vouchers,
- * payouts, POS, receivables, brand settings, trackings, work logs and
- * attendance from the vendor console.
+ * payouts, POS, receivables, brand settings, trackings, work logs,
+ * attendance and the vendor's own clients from the vendor console.
  *
  * The server does not interpret these records; it keeps the vendor's copy so
  * it survives a reload or a second device. Each vendor's office is its own
@@ -30,6 +30,8 @@ export const OFFICE_ARRAY_KEYS = [
   'workLogs',
   'attendance',
   'quotations',
+  // «عملائي»: عملاء المورّد من خارج المنصة، يسجّلهم بنفسه
+  'clients',
 ] as const;
 
 export type OfficeArrayKey = (typeof OFFICE_ARRAY_KEYS)[number];
