@@ -33,6 +33,18 @@ export type EarningsOrder = {
   net: number;
   bucket: EarningsBucket;
   refundPending: boolean;
+  /** `link` — an invoice or quotation the vendor's own client paid by link; `id` is its number. */
+  source?: 'store' | 'link';
+};
+
+/** A paid (or refunded) invoice/quotation link — see `vendor-pay-links.ts`. */
+export type LinkPaymentLike = {
+  id: string;
+  docNumber: string;
+  status: string;
+  amount: number;
+  createdAt: string;
+  paidAt?: string;
 };
 
 export type PayoutLike = { status: string; amount: number };
@@ -75,6 +87,7 @@ export function computeVendorEarnings(input: {
   ownListingIds: ReadonlySet<string>;
   bookings: PlatformBooking[];
   payouts: PayoutLike[];
+  linkPayments?: LinkPaymentLike[];
 }): VendorEarnings {
   const { vendorId, ownListingIds } = input;
   let pendingH = 0;
@@ -101,6 +114,29 @@ export function computeVendorEarnings(input: {
       net: toRiyals(netH),
       bucket,
       refundPending: bookingRefundPending(row),
+    });
+  }
+
+  // No event lifecycle to wait on: a link payment is available once Moyasar
+  // confirms it, and leaves the balance if it is refunded.
+  for (const link of input.linkPayments || []) {
+    if (link.status !== 'paid' && link.status !== 'refunded') continue;
+    const grossH = Math.max(0, toHalalas(link.amount));
+    const commissionH = Math.round(grossH * PLATFORM_COMMISSION_RATE);
+    const netH = grossH - commissionH;
+    const bucket: EarningsBucket = link.status === 'paid' ? 'available' : 'excluded';
+    if (bucket === 'available') earnedH += netH;
+    orders.push({
+      id: link.docNumber || link.id,
+      eventDate: (link.paidAt || link.createdAt).slice(0, 10),
+      createdAt: link.paidAt || link.createdAt,
+      status: link.status,
+      gross: toRiyals(grossH),
+      commission: toRiyals(commissionH),
+      net: toRiyals(netH),
+      bucket,
+      refundPending: false,
+      source: 'link',
     });
   }
 

@@ -20,6 +20,7 @@ import {
   verifyMoyasarCheckout,
   type MoyasarFailureCode,
 } from './moyasar.ts';
+import type { PayLinkService } from '../vendors/vendor-pay-link-routes.ts';
 
 type Deps = {
   /** Platform bookings (with their ownership rule), settled when the provider confirms a payment. */
@@ -27,6 +28,8 @@ type Deps = {
   /** Port to fall back on when no public site URL is configured. */
   port: string | number;
   now?: () => Date;
+  /** Invoice and quotation links vendors send their own clients (`vendor-pay-link-routes.ts`). */
+  payLinks?: Pick<PayLinkService, 'settlePaid' | 'settleRefunded'>;
 };
 
 /**
@@ -199,8 +202,24 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     try {
       const payment = await fetchPayment(paymentId);
       const refundEvent = req.body?.type === 'payment_refunded';
+      const invoiceId = payment.invoice_id || payment.invoiceId || undefined;
+      const refundedNow = payment.status === 'refunded' || (refundEvent && Number(payment.refunded) > 0);
+      // A vendor's invoice/quotation link is matched by its Moyasar invoice before any store order.
+      const link = refundedNow
+        ? deps.payLinks?.settleRefunded({ invoiceId })
+        : deps.payLinks?.settlePaid({
+            invoiceId,
+            paymentId: payment.id,
+            status: payment.status,
+            amountHalalas: payment.amount,
+            currency: payment.currency,
+          });
+      if (link) {
+        console.log('[moyasar] pay link', link.status, payment.id, link.id);
+        return res.json({ received: true });
+      }
       // Moyasar's own record decides; the event type only says to look.
-      if (payment.status === 'refunded' || (refundEvent && Number(payment.refunded) > 0)) {
+      if (refundedNow) {
         const refunded = bookings.markRefundedFromMoyasar({
           paymentId: payment.id,
           invoiceId: payment.invoice_id || payment.invoiceId,
@@ -302,6 +321,17 @@ export function registerPaymentRoutes(app: Express, deps: Deps) {
     }
 
     const status = verified.kind === 'payment' ? verified.payment.status : verified.invoice.status;
+    deps.payLinks?.settlePaid(
+      verified.kind === 'payment'
+        ? {
+            invoiceId: verified.payment.invoiceId || verified.payment.invoice_id || undefined,
+            paymentId: verified.payment.id,
+            status,
+            amountHalalas: verified.payment.amount,
+            currency: verified.payment.currency,
+          }
+        : { invoiceId: verified.invoice.id, status, amountHalalas: verified.invoice.amount, currency: verified.invoice.currency },
+    );
     if (verified.kind === 'payment') {
       bookings.markPaidFromMoyasar({
         paymentId: verified.payment.id,

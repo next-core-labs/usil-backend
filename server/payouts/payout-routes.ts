@@ -3,7 +3,7 @@ import type { PlatformBooking } from '../bookings/booking-store.ts';
 import { isVendorSupervisor } from '../auth/roles.ts';
 import { notifyPayoutDecision, notifyPayoutRequested } from '../shared/optional-mail.ts';
 import { pushPayoutDecision, pushStaffPayoutRequested } from '../push/push-notices.ts';
-import { computeVendorEarnings, rawBalanceHalalas, type VendorEarnings } from './earnings.ts';
+import { computeVendorEarnings, rawBalanceHalalas, type LinkPaymentLike, type VendorEarnings } from './earnings.ts';
 import { createPayoutStore, parsePayoutInput, PayoutError, type PayoutRequest } from './payout-store.ts';
 
 type Actor = { id: string; role: string; name?: string; email?: string };
@@ -20,6 +20,8 @@ export type PayoutDeps = {
     listAllListings: () => Array<{ id: string; vendorId: string }>;
     getWorkspace: (vendorId: string) => { profile?: { projectName?: string } };
   };
+  /** Invoices and quotations the vendor's own clients paid by link. */
+  payLinks?: { listForVendor: (vendorId: string) => LinkPaymentLike[] };
   now?: () => Date;
 };
 
@@ -100,6 +102,7 @@ export function registerPayoutRoutes(app: Express, auth: AuthApi, dataDir: strin
       ownListingIds: own,
       bookings: deps.bookings.list(),
       payouts: store.listForVendor(vendorId),
+      linkPayments: deps.payLinks?.listForVendor(vendorId),
     });
   }
 

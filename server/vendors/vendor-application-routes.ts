@@ -13,7 +13,8 @@ import {
 } from './vendor-applications';
 import { APPLICANT_LOGIN_REQUIRED, hashPassword, type PublicUser } from '../auth/auth';
 import { notifyVendorApplicationDecision, notifyVendorApplicationReceived } from '../shared/optional-mail';
-import { pushStaffVendorApplication, pushVendorApplicationDecision } from '../push/push-notices.ts';
+import { pushStaffVendorApplication, pushVendorApplicationDecision, pushVendorBankChanged } from '../push/push-notices.ts';
+import { isVendorSupervisor } from '../auth/roles';
 import { saveUpload, uploadsDir } from '../auth/avatar';
 import { createVendorStore } from './vendor-store';
 import { dataUrlDigest, persistListingImages } from './listing-media';
@@ -106,6 +107,23 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
     return auth.findUserByEmail?.(row.email)?.id || row.id;
   }
 
+  /**
+   * Whose file a request is about: the signed-in account's own, or — for a
+   * supervisor (admin, accounts manager) with `?vendorId=` — that vendor's,
+   * the same rule as `vendorIdFrom` in vendor-routes.ts. Null when the
+   * supervisor names a vendor that has neither an application nor a workspace.
+   */
+  function fileSubject(req: Request, user: PublicUser) {
+    const asked = typeof req.query.vendorId === 'string' ? req.query.vendorId.trim() : '';
+    if (!asked || !isVendorSupervisor(user.role)) {
+      return { vendorId: user.id, application: store.findByEmail(user.email) || null, role: user.role, supervising: false };
+    }
+    const application = store.list().find((row) => row.id === asked || workspaceIdFor(row) === asked) || null;
+    if (!application && !workspaces.hasWorkspace(asked)) return null;
+    const account = application ? auth.findUserByEmail?.(application.email) : null;
+    return { vendorId: asked, application, role: String(account?.role || ''), supervising: true };
+  }
+
   /** Products and linked socials count toward approval wherever the vendor added them. */
   function progressFor(row: VendorApplication) {
     const id = workspaceIdFor(row);
@@ -117,6 +135,61 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
     );
     const listingCount = ws?.listings.length || 0;
     return { listingCount, missing: missingForApproval(row, { listingCount, socialCount: handles.size }) };
+  }
+
+  /**
+   * A supervisor editing a vendor's file from the vendor console: every
+   * detail, at any stage short of rejection — including the bank details the
+   * vendor can no longer change once approved. A bank change is logged and
+   * the vendor is told, so a payout account never moves silently.
+   */
+  function supervisorSave(
+    req: Request,
+    res: Response,
+    actor: PublicUser,
+    vendorId: string,
+    application: VendorApplication | null,
+  ) {
+    if (!application) {
+      return res.status(404).json({ success: false, error: 'هذا المورّد ما عنده ملف انضمام لتعديله.' });
+    }
+    const written: string[] = [];
+    try {
+      const body = { ...(req.body || {}) } as Record<string, unknown>;
+      delete body.logoUrl;
+      if (body.logoDataUrl) {
+        const logoUrl = saveUpload(dataDir, 'vendor-logo', String(body.logoDataUrl));
+        if (!logoUrl) throw new Error('ارفع شعاراً jpg أو png أو webp حتى 2 ميغابايت.');
+        body.logoUrl = logoUrl;
+        written.push(logoUrl);
+      }
+      const before = { iban: application.iban || '', bankName: application.bankName || '', holder: application.accountHolderName || '' };
+      const row = store.updateDetails(application.id, body);
+      if (!row) return res.status(404).json({ success: false, error: 'الطلب غير موجود' });
+      written.length = 0;
+      if (row.status === 'approved') {
+        workspaces.saveVendorWorkspace(vendorId, {
+          profile: {
+            projectName: row.projectName,
+            personName: personNameFromParts(row) || undefined,
+            fulfillment: row.fulfillment,
+            ...(body.logoUrl ? { logoUrl: row.logoUrl } : {}),
+          },
+        });
+      } else {
+        workspaces.seedWorkspaceFromApplication(vendorId, row);
+      }
+      const bankChanged =
+        before.iban !== (row.iban || '') || before.bankName !== (row.bankName || '') || before.holder !== (row.accountHolderName || '');
+      if (bankChanged) {
+        console.info('[vendor-file] bank details changed by supervisor', { vendorId, by: actor.id, role: actor.role });
+        pushVendorBankChanged(vendorId);
+      }
+      res.json({ success: true, application: publicApplication(row), missing: progressFor(row).missing });
+    } catch (error) {
+      removeUploads(dataDir, written);
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'تعذر حفظ البيانات' });
+    }
   }
 
   /**
@@ -182,6 +255,9 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   app.put('/api/vendor/application', (req: Request, res: Response) => {
     const user = auth.userFromRequest(req);
     if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
+    const subject = fileSubject(req, user);
+    if (subject?.supervising) return supervisorSave(req, res, user, subject.vendorId, subject.application);
+    if (!subject) return res.status(404).json({ success: false, error: 'المورّد غير موجود' });
     const own = store.findByEmail(user.email);
     const approved = own?.status === 'approved' && user.role === 'vendor';
     if (!own || (own.status !== 'pending' && !approved)) {
@@ -344,11 +420,13 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
   app.get('/api/me/vendor-file', (req: Request, res: Response) => {
     const user = auth.userFromRequest(req);
     if (!user) return res.status(401).json({ success: false, error: 'يلزم تسجيل الدخول.' });
-    const application = store.findByEmail(user.email);
-    const ws = workspaces.hasWorkspace(user.id) ? workspaces.getWorkspace(user.id) : null;
+    const subject = fileSubject(req, user);
+    if (!subject) return res.status(404).json({ success: false, error: 'المورّد غير موجود' });
+    const { vendorId, application } = subject;
+    const ws = workspaces.hasWorkspace(vendorId) ? workspaces.getWorkspace(vendorId) : null;
     const profile = application
-      ? profileFromApplication(application, user.id, { listingCount: ws?.listings.length || 0 })
-      : workspaces.ownProfile(user.id);
+      ? profileFromApplication(application, vendorId, { listingCount: ws?.listings.length || 0 })
+      : workspaces.ownProfile(vendorId);
     if (!profile) {
       return res.json({
         success: true,
@@ -363,7 +441,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       application: application ? publicApplication(application) : null,
       missing: application && application.status !== 'rejected' ? progressFor(application).missing : [],
       profile,
-      file: application?.status === 'approved' || user.role === 'vendor' ? publicVendorFile({ ...profile, status: 'approved' }) : publicVendorFile(profile),
+      file: application?.status === 'approved' || subject.role === 'vendor' ? publicVendorFile({ ...profile, status: 'approved' }) : publicVendorFile(profile),
       workspace: ws
         ? {
             listings: ws.listings,
