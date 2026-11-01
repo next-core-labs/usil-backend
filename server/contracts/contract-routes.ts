@@ -3,6 +3,7 @@ import { isVendorSupervisor } from '../auth/roles.ts';
 import { publicSiteUrl } from '../auth/email-verification.ts';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards.ts';
 import { notifyContractSigned } from '../shared/optional-mail.ts';
+import { pushContractSigned } from '../push/push-notices.ts';
 import {
   ContractError,
   createContractStore,
@@ -284,6 +285,7 @@ export function registerContractRoutes(app: Express, auth: AuthApi, dataDir: str
         userAgent: String(req.headers['user-agent'] || ''),
       });
       const brand = brandOf(row.vendorId);
+      pushContractSigned(row.vendorId, { number: row.number, signedByName: row.signature?.name || row.client.name });
       const email = String(vendorUser(row.vendorId)?.email || brand.email || '');
       if (email) {
         notifyContractSigned(email, {

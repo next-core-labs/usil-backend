@@ -18,6 +18,7 @@ import { registerMoyasarAdminRoutes } from './payments/moyasar-admin-routes.ts';
 import { applyMoyasarRuntime } from './payments/moyasar-store.ts';
 import { registerPaymentRoutes } from './payments/payment-routes.ts';
 import { registerPayoutRoutes } from './payouts/payout-routes.ts';
+import { registerPushRoutes } from './push/push-routes.ts';
 import { registerSeoRoutes } from './seo/seo-routes.ts';
 import { registerSiteAppearanceRoutes } from './site/site-appearance-routes.ts';
 import { registerSupportRoutes } from './support/support-routes.ts';
@@ -81,6 +82,12 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
   // ─── API ───
   registerAuthRoutes(app, auth, DATA_DIR);
 
+  // Device tokens for push; the notices find their accounts by email or role.
+  const pushStore = registerPushRoutes(app, auth, DATA_DIR, {
+    userIdForEmail: (email) => auth.findUserByEmail(email)?.id || null,
+    staffUserIds: () => [...auth.listUsersByRole('admin'), ...auth.listUsersByRole('accounts_manager')].map((user) => user.id),
+  });
+
   const { ai: aiRouter } = registerIntegrationsRoutes(app, auth, DATA_DIR);
   registerMoyasarAdminRoutes(app, auth, DATA_DIR);
   registerWhatsAppRoutes(app, auth, DATA_DIR);
@@ -110,6 +117,7 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
   auth.onUserDeleted((user) => {
     vendorStore.purgeVendor(user.id);
     chatStore.removeForUser(user.id);
+    pushStore.removeForUser(user.id);
   });
 
   // Bookings must know which listings need vendor approval before checkout.

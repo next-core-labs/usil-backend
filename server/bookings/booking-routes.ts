@@ -43,6 +43,7 @@ import {
 import { isIsoDate, quoteBooking, riyadhToday, type PricedListing } from './booking-pricing.ts';
 import { cityFilterMatches, isSaudiPlaceName } from '../../core/data/saudiPlaces.ts';
 import { notifyBookingApproved, notifyBookingRejected, notifyVendorNewOrder } from '../shared/optional-mail.ts';
+import { pushBookingApproved, pushBookingCancelled, pushStaffNewOrder, pushVendorNewOrder } from '../push/push-notices.ts';
 
 export type BookingActor = { id: string; role: string; email?: string; phone?: string; emailVerified?: boolean };
 
@@ -383,17 +384,19 @@ export function registerBookingRoutes(
     return String(user?.email || '').trim();
   }
 
-  /** Tells every vendor on the order about it, naming only their own lines. */
+  /** Tells every vendor on the order about it, naming only their own lines, and the owner console. */
   function notifyVendorsOfOrder(booking: PlatformBooking, needsApproval: boolean) {
     for (const vendorId of booking.vendorIds || []) {
-      const email = vendorEmail(vendorId);
-      if (!email) continue;
       const own = (Array.isArray(booking.items) ? booking.items : [])
         .filter((line) => (line as { vendorId?: unknown })?.vendorId === vendorId)
         .map((line) => String((line as { title?: unknown })?.title || ''))
         .filter(Boolean);
-      notifyVendorNewOrder(email, booking.id, own.join(' + ') || booking.serviceName, needsApproval);
+      const title = own.join(' + ') || booking.serviceName;
+      pushVendorNewOrder(vendorId, booking.id, title, needsApproval);
+      const email = vendorEmail(vendorId);
+      if (email) notifyVendorNewOrder(email, booking.id, title, needsApproval);
     }
+    pushStaffNewOrder(booking.id, booking.serviceName, Number(booking.totalAmount), !needsApproval);
   }
 
   /**
@@ -850,6 +853,7 @@ export function registerBookingRoutes(
     if (cancellation) {
       cancelUnpaidInvoice(booking);
       notifyBookingRejected(booking.email, booking.id, booking.serviceName);
+      pushBookingCancelled({ userId: booking.userId, email: booking.email }, booking.id, booking.serviceName);
     }
 
     // Approved: now the client can pay. Raise the invoice and tell them; if
@@ -868,6 +872,7 @@ export function registerBookingRoutes(
         if (invoice.ok) booking = store.attachInvoice(booking.id, invoice.invoice) || booking;
       }
       notifyBookingApproved(booking.email, booking.id, booking.serviceName, booking.paymentUrl);
+      pushBookingApproved({ userId: booking.userId, email: booking.email }, booking.id, booking.serviceName);
     }
     res.json({ success: true, booking });
   });
