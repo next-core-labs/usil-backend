@@ -25,6 +25,7 @@ import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerTrendingRoutes } from './catalog/trending-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
 import { registerVendorRoutes } from './vendors/vendor-routes.ts';
+import { registerVendorPayLinkRoutes } from './vendors/vendor-pay-link-routes.ts';
 import { registerWhatsAppRoutes } from './whatsapp/whatsapp-routes.ts';
 import { captureWhatsAppRawBody } from './whatsapp/whatsapp-webhook.ts';
 import { SERVICES as CATALOG_SERVICES } from '../core/data/services.ts';
@@ -126,9 +127,10 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
   });
 
   // Payments settle against platform bookings.
-  registerPaymentRoutes(app, { bookings: bookingStore, port: PORT });
+  const payLinks = registerVendorPayLinkRoutes(app, auth, DATA_DIR, { vendors: vendorStore, port: PORT });
+  registerPaymentRoutes(app, { bookings: bookingStore, port: PORT, payLinks });
   // Vendor earnings (computed from paid orders) and their withdrawal requests.
-  registerPayoutRoutes(app, auth, DATA_DIR, { bookings: bookingStore, vendors: vendorStore });
+  registerPayoutRoutes(app, auth, DATA_DIR, { bookings: bookingStore, vendors: vendorStore, payLinks });
 
   // Electronic contracts: the vendor issues, the client signs on a private /sign/<token> link.
   registerContractRoutes(app, auth, DATA_DIR, {

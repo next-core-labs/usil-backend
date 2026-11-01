@@ -77,6 +77,18 @@ export function pushContractSigned(vendorId: string, input: { number: string; si
   });
 }
 
+export function pushPayLinkPaid(
+  vendorId: string,
+  input: { kind: 'invoice' | 'quotation'; docNumber: string; clientName: string; amount: number },
+): void {
+  const amount = `${input.amount.toFixed(2)} ر.س`;
+  pushToUser(vendorId, {
+    title: input.kind === 'invoice' ? `دُفعت الفاتورة ${input.docNumber}` : `دُفع عربون العرض ${input.docNumber}`,
+    body: `${input.clientName || 'العميل'} دفع ${amount} عبر رابط الدفع، والمبلغ في رصيدك.`,
+    links: vendorConsole(input.kind === 'invoice' ? 'invoices' : 'quotations'),
+  });
+}
+
 export function pushVendorApplicationDecision(email: string, projectName: string, status: 'approved' | 'rejected'): void {
   const name = projectName || 'متجرك';
   pushToEmail(email, {
