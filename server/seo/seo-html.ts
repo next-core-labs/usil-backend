@@ -131,6 +131,24 @@ export function resolvePageSeo(
   };
 }
 
+// صفحات الحساب والدفع بلا محتوى عام، وبدون noindex تُفهرس بعنوان الرئيسية فتنافسها على بحث «يوصل»
+const NOINDEX_PATHS = [
+  '/login',
+  '/cart',
+  '/checkout',
+  '/orders',
+  '/account',
+  '/chat',
+  '/offline',
+  '/payment/success',
+  '/payment/cancelled',
+];
+
+export function isNoIndexPath(pathname: string): boolean {
+  const path = normalizeSeoPath(pathname).toLowerCase();
+  return NOINDEX_PATHS.includes(path) || path.startsWith('/sign/');
+}
+
 function upsertMeta(html: string, attr: 'name' | 'property', key: string, content: string): string {
   const tag = `<meta ${attr}="${key}" content="${escapeAttr(content)}" />`;
   const re = new RegExp(`<meta\\s+${attr}=["']${key}["'][^>]*>`, 'i');
@@ -215,6 +233,9 @@ export function injectSeoIntoHtml(
   next = upsertLink(next, 'apple-touch-icon', '/og/logo-512.png');
   if (page.googleSiteVerification) {
     next = upsertMeta(next, 'name', 'google-site-verification', page.googleSiteVerification);
+  }
+  if (isNoIndexPath(pathname)) {
+    next = upsertMeta(next, 'name', 'robots', 'noindex, follow');
   }
   const blocks = jsonLdForPath({
     baseUrl: settings.canonicalBaseUrl,
