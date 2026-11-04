@@ -155,6 +155,7 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
   // «التصنيفات»: the owner adds and removes storefront categories without a deploy.
   registerCategoryRoutes(app, auth, DATA_DIR, {
     listListingCategories: () => vendorStore.listAllListings().map((listing) => String(listing.category)),
+    onRename: (id, name) => vendorStore.renameCategory(id, name),
   });
 
   // «ترند هالأسبوع»: the public catalog ranked by this week's bookings and product views.

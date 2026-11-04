@@ -647,6 +647,25 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     return removed;
   }
 
+  /** The owner renamed a category: every product saved under it shows the new name. Returns how many changed. */
+  function renameCategory(categoryId: string, name: string): number {
+    const data = readFile();
+    let changed = 0;
+    for (const [vendorId, ws] of Object.entries(data.workspaces)) {
+      const listings = Array.isArray(ws.listings) ? ws.listings : [];
+      let touched = false;
+      const next = listings.map((item) => {
+        if (item?.category !== categoryId || item.categoryName === name) return item;
+        changed += 1;
+        touched = true;
+        return { ...item, categoryName: name };
+      });
+      if (touched) data.workspaces[vendorId] = { ...ws, listings: next, updatedAt: new Date().toISOString() };
+    }
+    if (changed) writeFile(data);
+    return changed;
+  }
+
   /**
    * Trusted write for server code, seeds and tests. Vendor HTTP input goes
    * through `saveVendorWorkspace`, never here.
@@ -1284,6 +1303,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     getPublicFile,
     getPublicSocials,
     stripCatalogClonedListings,
+    renameCategory,
     saveWorkspace,
     saveVendorWorkspace,
     addBooking,

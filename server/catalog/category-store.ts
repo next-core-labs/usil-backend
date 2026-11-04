@@ -143,6 +143,26 @@ export function createCategoryStore(dataDir: string) {
     return { category, all: write([...current, category]) };
   }
 
+  /** Fields left out keep their value; the id never changes, so links and products stay attached. */
+  function update(id: string, input: unknown): { category: SiteCategory; renamed: boolean; all: SiteCategories } {
+    const raw = input && typeof input === 'object' && !Array.isArray(input) ? (input as Record<string, unknown>) : {};
+    const current = list();
+    const before = current.find((row) => row.id === id);
+    if (!before) throw new CategoryStoreError('التصنيف غير موجود.', 404);
+    const name = raw.name === undefined ? before.name : text(raw.name, CATEGORY_NAME_MAX);
+    if (name.length < 2) throw new CategoryStoreError('اكتب اسم التصنيف (حرفان على الأقل).');
+    if (current.some((row) => row.id !== id && row.name === name)) throw new CategoryStoreError('يوجد تصنيف بهذا الاسم.', 409);
+    const category: SiteCategory = {
+      id,
+      name,
+      short: raw.short === undefined ? before.short : text(raw.short, CATEGORY_SHORT_MAX) || name.split(' ')[0],
+      nameEn: raw.nameEn === undefined ? before.nameEn : text(raw.nameEn, CATEGORY_NAME_MAX),
+      icon: raw.icon === undefined ? before.icon : parseIcon(raw.icon),
+    };
+    const all = write(current.map((row) => (row.id === id ? category : row)));
+    return { category, renamed: category.name !== before.name, all };
+  }
+
   function remove(id: string): SiteCategories {
     const current = list();
     if (!current.some((row) => row.id === id)) throw new CategoryStoreError('التصنيف غير موجود.', 404);
@@ -150,7 +170,7 @@ export function createCategoryStore(dataDir: string) {
     return write(current.filter((row) => row.id !== id));
   }
 
-  return { file, load, list, add, remove };
+  return { file, load, list, add, update, remove };
 }
 
 export type CategoryStore = ReturnType<typeof createCategoryStore>;

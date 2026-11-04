@@ -11,6 +11,8 @@ type AuthLike = {
 export type CategoryRouteOptions = {
   /** Every vendor listing's category id — the owner sees how many products each category holds. */
   listListingCategories?: () => string[];
+  /** Products keep a copy of their category's name; a rename rewrites it. */
+  onRename?: (id: string, name: string) => void;
 };
 
 export function registerCategoryRoutes(app: Express, auth: AuthLike, dataDir: string, options: CategoryRouteOptions = {}) {
@@ -46,6 +48,16 @@ export function registerCategoryRoutes(app: Express, auth: AuthLike, dataDir: st
       res.status(201).json({ success: true, data: { category, ...withCounts() } });
     } catch (error) {
       fail(res, error, 'تعذر حفظ التصنيف.');
+    }
+  });
+
+  app.patch('/api/admin/categories/:id', requireOwnerAdmin, (req: Request, res: Response) => {
+    try {
+      const { category, renamed } = store.update(String(req.params.id || ''), req.body);
+      if (renamed) options.onRename?.(category.id, category.name);
+      res.json({ success: true, data: { category, ...withCounts() } });
+    } catch (error) {
+      fail(res, error, 'تعذر تعديل التصنيف.');
     }
   });
 
