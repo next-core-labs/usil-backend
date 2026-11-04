@@ -1,3 +1,7 @@
+/**
+ * The design's categories, plus any the owner adds from the console
+ * (`cat-…` ids, server/catalog/category-store.ts) — hence the open string.
+ */
 export type ServiceCategory =
   | 'all'
   | 'hospitality'
@@ -14,7 +18,8 @@ export type ServiceCategory =
   | 'cakes'
   | 'invitations'
   | 'parking'
-  | 'condolence';
+  | 'condolence'
+  | (string & {});
 
 /** Honest city fulfillment windows — not courier GPS or 15-minute promises. */
 export type FulfillmentLane = 'hour' | 'same_day' | 'tomorrow' | 'instant';

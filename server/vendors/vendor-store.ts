@@ -8,6 +8,7 @@ import type { BookingStatus } from '../../core/types';
 import { normalizeSaudiMobile } from '../shared/booking-guards';
 import { riyadhToday } from '../bookings/booking-pricing.ts';
 import { findSlotConflict } from '../bookings/slot-holds.ts';
+import { createCategoryStore } from '../catalog/category-store.ts';
 import {
   createBookingStore,
   vendorHasBooking,
@@ -333,6 +334,19 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   const IMAGE_INVALID_AR = 'صورة المنتج غير صالحة — ارفع الصورة من جهازك';
   const IMAGE_DUPLICATE_AR = 'أضفت نفس الصورة مرتين — اختر صوراً مختلفة للمنتج';
   const offices = createVendorOfficeStore(dataDir);
+  const categoryStore = createCategoryStore(dataDir);
+
+  /**
+   * The owner's live categories. An existing listing may keep the category it
+   * already has even after the owner removes it — only a new pick must be live.
+   */
+  function allowedCategories(keep?: Pick<VendorListing, 'category' | 'categoryName'>) {
+    const live = categoryStore.list().map(({ id, name }) => ({ id, name }));
+    if (keep && !live.some((row) => row.id === keep.category)) {
+      live.push({ id: keep.category, name: keep.categoryName || keep.category });
+    }
+    return live;
+  }
 
   function readFile(): VendorStoreFile {
     return readJsonFile<VendorStoreFile>(file, { workspaces: {} });
@@ -465,7 +479,13 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
   }
 
   /** The one validation path for a vendor-authored listing (POST, PATCH and PUT /workspace). */
-  function validateListingDraft(vendorId: string, input: VendorListingInput, fallbackName?: string) {
+  function validateListingDraft(
+    vendorId: string,
+    input: VendorListingInput,
+    fallbackName?: string,
+    keep?: Pick<VendorListing, 'category' | 'categoryName'>,
+  ) {
+    const categories = allowedCategories(keep);
     const checked = checkListingImages(input.images, input.image);
     const draft = {
       ...input,
@@ -475,7 +495,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     // Validate with stand-ins first so a bad title never leaves an orphan file behind.
     validateVendorListing(
       { ...draft, images: checked.map((row, i) => (row.kind === 'upload' ? row.value : `/uploads/pending-${i}`)) },
-      { requireImages: true },
+      { requireImages: true, categories },
     );
     const images = checked.map((row) => {
       if (row.kind === 'upload') return row.value;
@@ -483,7 +503,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
       if (!saved) throw new VendorStoreError(IMAGE_INVALID_AR);
       return saved;
     });
-    return validateVendorListing({ ...draft, images }, { requireImages: true });
+    return validateVendorListing({ ...draft, images }, { requireImages: true, categories });
   }
 
   function listingOwners(): Map<string, string> {
@@ -740,7 +760,7 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
           seen.add(existing.id);
           continue;
         }
-        const clean = validateListingDraft(vendorId, input as VendorListingInput, existing?.vendorName || fallbackName);
+        const clean = validateListingDraft(vendorId, input as VendorListingInput, existing?.vendorName || fallbackName, existing);
         const now = new Date().toISOString();
         const id = existing
           ? existing.id
@@ -998,8 +1018,8 @@ export function createVendorStore(dataDir: string, options: VendorStoreOptions =
     // photos; photos the admin does send get the full check.
     const clean =
       options.admin && !imagesGiven
-        ? validateVendorListing({ ...merged, vendorName: current.vendorName })
-        : validateListingDraft(vendorId, merged, current.vendorName);
+        ? validateVendorListing({ ...merged, vendorName: current.vendorName }, { categories: allowedCategories(current) })
+        : validateListingDraft(vendorId, merged, current.vendorName, current);
     const listing: VendorListing = {
       ...current,
       ...clean,

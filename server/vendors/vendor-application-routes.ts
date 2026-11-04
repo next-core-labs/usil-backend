@@ -21,6 +21,7 @@ import { dataUrlDigest, persistListingImages } from './listing-media';
 import { personNameFromParts, profileFromApplication, publicVendorFile } from './vendor-profile';
 import { parseVendorSocials, type VendorSocials } from './vendor-socials';
 import { LISTING_MIN_IMAGES, validateVendorListing } from './vendor-listings';
+import { createCategoryStore } from '../catalog/category-store.ts';
 import { isStockMediaUrl } from '../../core/utils/catalogMedia';
 import { clientIp, createSlidingWindowLimiter } from '../shared/booking-guards';
 
@@ -98,6 +99,8 @@ type AuthApi = {
 export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dataDir: string) {
   const store = createVendorApplicationStore(dataDir);
   const workspaces = createVendorStore(dataDir);
+  const categoryStore = createCategoryStore(dataDir);
+  const liveCategories = () => categoryStore.list().map(({ id, name }) => ({ id, name }));
   const adminOnly = auth.requireRole(['admin']);
   const applyLimiter = createSlidingWindowLimiter(APPLY_LIMIT, APPLY_WINDOW_MS);
   const attemptLimiter = createSlidingWindowLimiter(APPLY_ATTEMPT_LIMIT, APPLY_WINDOW_MS);
@@ -338,7 +341,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
       if (countUsableListingImages(rawImages, listingBody.image) < LISTING_MIN_IMAGES) {
         throw new Error(LISTING_PHOTOS_REQUIRED);
       }
-      validateVendorListing(listingDraft);
+      validateVendorListing(listingDraft, { categories: liveCategories() });
       validateVendorApplication(body);
       parseVendorFulfillment(body.fulfillment);
       parseVendorSocials(body, { requireAtLeastOne: true });
@@ -376,7 +379,7 @@ export function registerVendorApplicationRoutes(app: Express, auth: AuthApi, dat
         throw new Error(LISTING_PHOTOS_REQUIRED);
       }
       listingDraft.images = listingImages;
-      validateVendorListing(listingDraft, { requireImages: true });
+      validateVendorListing(listingDraft, { requireImages: true, categories: liveCategories() });
       const passwordHash = hashPassword(String(req.body?.password || ''));
       const created = store.submit(body, passwordHash);
       written.length = 0;
