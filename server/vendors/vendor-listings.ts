@@ -22,6 +22,9 @@ export const FULFILLMENT_AR_LABEL: Record<ListingFulfillmentLane, string> = {
   instant: 'حجز فوري',
 };
 
+export type ListingCategoryOption = { id: string; name: string };
+
+/** The design's categories — the default until the owner edits them (server/catalog/category-store.ts). */
 export const LISTING_CATEGORIES: { id: Exclude<ServiceCategory, 'all'>; name: string }[] = [
   { id: 'hospitality', name: 'ضيافة وقهوة' },
   { id: 'buffet', name: 'بوفيه ومأكولات' },
@@ -105,6 +108,8 @@ export type VendorListing = {
 export type VendorListingInput = {
   title?: unknown;
   category?: unknown;
+  /** Read only from trusted stored rows, to keep the name of a category the owner has since removed. */
+  categoryName?: unknown;
   shortDesc?: unknown;
   price?: unknown;
   priceUnit?: unknown;
@@ -120,7 +125,29 @@ export type VendorListingInput = {
 export type ValidateListingOptions = {
   /** POST/PATCH from the vendor modal require two images; stored rows are read leniently. */
   requireImages?: boolean;
+  /**
+   * The categories a vendor may pick (the owner's live list). Set on every
+   * vendor- or applicant-authored write. Left out only for trusted stored rows,
+   * which keep whatever category they were saved with — so removing a category
+   * never makes existing products disappear.
+   */
+  categories?: readonly ListingCategoryOption[];
 };
+
+const STORED_CATEGORY_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
+function resolveListingCategory(input: VendorListingInput, allowed?: readonly ListingCategoryOption[]): ListingCategoryOption {
+  const id = String(input.category || '').trim();
+  if (allowed) {
+    const picked = allowed.find((item) => item.id === id);
+    if (!picked) throw new Error('اختر قسماً للمنتج');
+    return picked;
+  }
+  const known = LISTING_CATEGORIES.find((item) => item.id === id);
+  if (known) return known;
+  if (!STORED_CATEGORY_ID.test(id)) throw new Error('اختر قسماً للمنتج');
+  return { id, name: String(input.categoryName || '').trim() || id };
+}
 
 export type CourierProductLine = {
   name: string;
@@ -199,9 +226,8 @@ export function validateVendorListing(
   const title = String(input.title || '').trim();
   if (!title) throw new Error('اكتب اسم المنتج');
 
-  const category = String(input.category || '').trim() as Exclude<ServiceCategory, 'all'>;
-  const cat = LISTING_CATEGORIES.find((item) => item.id === category);
-  if (!cat) throw new Error('اختر قسماً للمنتج');
+  const cat = resolveListingCategory(input, options.categories);
+  const category = cat.id as Exclude<ServiceCategory, 'all'>;
 
   const shortDesc = String(input.shortDesc || '').trim() || title;
   const price = Number(input.price);

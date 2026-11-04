@@ -21,6 +21,7 @@ import { registerPayoutRoutes } from './payouts/payout-routes.ts';
 import { registerPushRoutes } from './push/push-routes.ts';
 import { registerSeoRoutes } from './seo/seo-routes.ts';
 import { registerSiteAppearanceRoutes } from './site/site-appearance-routes.ts';
+import { registerCategoryRoutes } from './catalog/category-routes.ts';
 import { registerSupportRoutes } from './support/support-routes.ts';
 import { registerTrendingRoutes } from './catalog/trending-routes.ts';
 import { registerVendorApplicationRoutes } from './vendors/vendor-application-routes.ts';
@@ -150,6 +151,11 @@ export function createApp({ rootDir, readIndexHtml }: AppOptions) {
 
   // «مظهر الواجهة»: the owner restyles the home hero cards without a deploy.
   registerSiteAppearanceRoutes(app, auth, DATA_DIR);
+
+  // «التصنيفات»: the owner adds and removes storefront categories without a deploy.
+  registerCategoryRoutes(app, auth, DATA_DIR, {
+    listListingCategories: () => vendorStore.listAllListings().map((listing) => String(listing.category)),
+  });
 
   // «ترند هالأسبوع»: the public catalog ranked by this week's bookings and product views.
   registerTrendingRoutes(app, DATA_DIR, {
